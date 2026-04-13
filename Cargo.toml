@@ -9,5 +9,6 @@ keywords = ["ai", "language", "bytecode", "vm", "cubemind"]
 categories = ["compilers", "science"]
 
 [dependencies]
+blake3 = "1"
 
 [dev-dependencies]
