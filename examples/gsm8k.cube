@@ -66,9 +66,14 @@ program GSM8K implements ISolver {
         let search = raw;
 
         while search.contains("<<") {
-            let { expr, result, rest } = extract_annotation(search);
+            let annotation = extract_annotation(search);
+            let expr = annotation.expr;
+            let result = annotation.result;
+            let rest = annotation.rest;
             let label = extract_label(search, steps.length);
-            let { lhs, ops } = parse_expression(expr);
+            let parsed = parse_expression(expr);
+            let lhs = parsed.lhs;
+            let ops = parsed.ops;
 
             steps.push(ArithStep {
                 label: label,
@@ -90,37 +95,33 @@ program GSM8K implements ISolver {
         let prev_result: f64 | null = null;
 
         atomic {
-            for (let i = 0; i < input.steps.length; i++) {
-                let step = input.steps[i];
-
-                create step.label : quantity;
+            for (let step of input.steps) {
+                let reg = step.label;
+                create reg : quantity;
 
                 if (prev_result != null && approx_eq(step.lhs, prev_result)) {
-                    pop step.label;
+                    pop reg;
                 } else {
-                    assign step.label = step.lhs;
+                    assign reg = step.lhs;
                 }
 
                 for (let op of step.ops) {
                     match (op[0]) {
-                        "+" => add step.label, op[1];
-                        "-" => sub step.label, op[1];
-                        "*" => mul step.label, op[1];
-                        "/" => div step.label, op[1];
+                        "+" => add reg, op[1];
+                        "-" => sub reg, op[1];
+                        "*" => mul reg, op[1];
+                        "/" => div reg, op[1];
                     }
                 }
 
-                sum step.label;
+                sum reg;
+                push reg;
 
-                if (i < input.steps.length - 1) {
-                    push step.label;
-                }
-
-                regs[step.label] = eval(step.label);
+                regs[reg] = eval(reg);
                 prev_result = step.result;
             }
 
-            let last = input.steps[input.steps.length - 1].label;
+            let last = input.steps.last().label;
             query last;
             remember last;
 

@@ -141,15 +141,32 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self, span: Span) -> Token {
         let start = self.pos;
-        let mut is_float = false;
 
+        // Hex literal: 0x...
+        if self.peek() == b'0' && self.pos + 1 < self.source.len()
+            && (self.source[self.pos + 1] == b'x' || self.source[self.pos + 1] == b'X')
+        {
+            self.advance(); // 0
+            self.advance(); // x
+            while self.pos < self.source.len() && (self.peek().is_ascii_hexdigit() || self.peek() == b'_') {
+                self.advance();
+            }
+            let text: String = self.source[start + 2..self.pos].iter()
+                .filter(|&&b| b != b'_')
+                .map(|&b| b as char)
+                .collect();
+            let val = i64::from_str_radix(&text, 16).unwrap_or(0);
+            return Token { kind: TokenKind::IntLit(val), span };
+        }
+
+        let mut is_float = false;
         while self.pos < self.source.len() && (self.peek().is_ascii_digit() || self.peek() == b'.' || self.peek() == b'_') {
             if self.peek() == b'.' {
-                if is_float { break; } // second dot — stop
+                if is_float { break; }
                 if self.peek2().is_ascii_digit() {
                     is_float = true;
                 } else {
-                    break; // dot not followed by digit — it's a method call
+                    break;
                 }
             }
             self.advance();
