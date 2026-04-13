@@ -1,0 +1,13 @@
+[package]
+name = "cubelang"
+version = "0.1.0"
+edition = "2021"
+description = "CubeLang — Unified AI Instruction Language. Compiles to CubeMind VM bytecodes."
+license = "MIT"
+authors = ["Grillcheese Research Laboratory <info@grillcheeseai.com>"]
+keywords = ["ai", "language", "bytecode", "vm", "cubemind"]
+categories = ["compilers", "science"]
+
+[dependencies]
+
+[dev-dependencies]
