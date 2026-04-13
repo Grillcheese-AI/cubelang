@@ -279,6 +279,14 @@ impl<'a> Lexer<'a> {
             "exec"         => TokenKind::Exec,
             "codebook"     => TokenKind::Codebook,
 
+            // Encryption / security
+            "encrypt"      => TokenKind::Encrypt,
+            "decrypt"      => TokenKind::Decrypt,
+            "sealed"       => TokenKind::Sealed,
+            "hash"         => TokenKind::CryptoHash,
+            "sign"         => TokenKind::CryptoSign,
+            "verify"       => TokenKind::CryptoVerify,
+
             // Debug / logging
             "log"          => TokenKind::Log,
             "debug"        => TokenKind::Debug,
@@ -350,6 +358,8 @@ impl<'a> Lexer<'a> {
             "url"              => TokenKind::TyUrl,
             "dataset"          => TokenKind::TyDataset,
             "external_program" => TokenKind::TyExternalProgram,
+            "request"          => TokenKind::TyRequest,
+            "response"         => TokenKind::TyResponse,
             "array"            => TokenKind::TyArray,
             "map"              => TokenKind::TyMap,
             "set"              => TokenKind::TySet,

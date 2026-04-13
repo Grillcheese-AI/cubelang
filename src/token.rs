@@ -104,6 +104,14 @@ pub enum TokenKind {
     Exec,           // exec var(params) — run bytecode variable
     Codebook,       // codebook.load("file.bin") / codebook.export("file.bin")
 
+    // ── Keywords: encryption / security ────────────────────────
+    Encrypt,        // encrypt(data, key) — encrypt data at rest or in transit
+    Decrypt,        // decrypt(data, key) — decrypt
+    Sealed,         // sealed { ... } — encrypted storage block, decrypted only at access
+    CryptoHash,     // hash(data) — BLAKE3 hash
+    CryptoSign,     // sign(data, key) — cryptographic signature
+    CryptoVerify,   // verify(data, signature, key) — verify signature
+
     // ── Keywords: debug / logging ──────────────────────────────
     Log,            // log("message") — info level
     Debug,          // debug("message") — debug level, stripped in release
@@ -164,6 +172,8 @@ pub enum TokenKind {
     TyAgent, TyClonedAgent,
     TyFile, TyUrl, TyDataset,
     TyExternalProgram,
+    TyRequest,          // incoming request (headers, body, method, params)
+    TyResponse,         // outgoing response (status, headers, body)
     TyArray,        // array<T>
     TyMap,          // map<K,V>
     TySet,          // set<T>
