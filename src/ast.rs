@@ -333,6 +333,22 @@ pub enum Stmt {
     Emit(EmitStmt),
     Opcode(OpcodeStmt),
     Expr(Expr),
+
+    // Error handling
+    TryCatch(TryCatchStmt),
+    Assert(AssertStmt),
+
+    // Transactions / ACID
+    Atomic(AtomicStmt),
+    Rollback,
+    Commit,
+    Gate(GateStmt),
+
+    // Bytecode / low-level
+    BytecodeBlock(BytecodeBlock),
+    Import(ImportStmt),
+    Export(ExportStmt),
+    Exec(ExecStmt),
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +410,122 @@ pub struct MatchArm {
 pub struct EmitStmt {
     pub event_name: String,
     pub fields: Vec<(String, Expr)>,
+    pub span: Span,
+}
+
+// ── Error handling ──────────────────────────────────────────────────────────
+
+/// try { ... } catch (e: Error) { ... } finally { ... }
+#[derive(Debug, Clone)]
+pub struct TryCatchStmt {
+    pub try_body: Vec<Stmt>,
+    pub catch_binding: Option<String>,    // the `e` in catch(e)
+    pub catch_body: Vec<Stmt>,
+    pub finally_body: Option<Vec<Stmt>>,
+    pub span: Span,
+}
+
+/// assert condition, "message";
+#[derive(Debug, Clone)]
+pub struct AssertStmt {
+    pub condition: Expr,
+    pub message: Option<Expr>,
+    pub span: Span,
+}
+
+// ── Transactions / ACID ─────────────────────────────────────────────────────
+
+/// atomic { ... } — all-or-nothing. Snapshots ctx before, restores on failure.
+///
+/// ```cubelang
+/// atomic {
+///     assign x = 12;
+///     sub x, 4;
+///     sub x, 3;
+///     commit;       # finalize — changes are permanent
+/// }
+/// # if anything throws inside, ctx rolls back to before the atomic block
+/// ```
+#[derive(Debug, Clone)]
+pub struct AtomicStmt {
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// gate("reason") { ... } — sensitive operation fence.
+/// Requires explicit approval or elevated permissions to execute.
+///
+/// ```cubelang
+/// gate("destructive_operation") {
+///     destroy all_registers;
+///     self.storage.clear();
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct GateStmt {
+    pub reason: Expr,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+// ── Bytecode / low-level ────────────────────────────────────────────────────
+
+/// bytecode { ... } — inline VM assembly or raw bytecode.
+///
+/// Three forms:
+/// 1. Inline asm:     `bytecode { 0x00 0x02 0x01 0xf8 0x3c ... }`
+/// 2. WASM import:    `bytecode wasm import "file.wasm";`
+/// 3. Codebook I/O:   `bytecode codebook.load("vsa_codebook.bin");`
+///                    `bytecode codebook.export("output.bin");`
+#[derive(Debug, Clone)]
+pub struct BytecodeBlock {
+    pub kind: BytecodeKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum BytecodeKind {
+    /// Inline raw bytes: bytecode { 0x00 0x02 ... }
+    Inline(Vec<u8>),
+    /// WASM import: bytecode wasm import "file.wasm"
+    WasmImport(String),
+    /// Codebook load: bytecode codebook.load("file.bin")
+    CodebookLoad(String),
+    /// Codebook export: bytecode codebook.export("file.bin")
+    CodebookExport(String),
+    /// Raw CubeLang asm: bytecode { create x : quantity; assign x = 16; }
+    Asm(Vec<OpcodeStmt>),
+}
+
+/// import "module" or import { x, y } from "module"
+#[derive(Debug, Clone)]
+pub struct ImportStmt {
+    pub path: String,
+    pub names: Option<Vec<String>>,    // None = import whole module
+    pub alias: Option<String>,          // import "x" as y
+    pub span: Span,
+}
+
+/// export codebook "file.bin" or export bytecode "file.bin"
+#[derive(Debug, Clone)]
+pub struct ExportStmt {
+    pub what: ExportKind,
+    pub path: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExportKind {
+    Codebook,
+    Bytecode,
+    Program(String),
+}
+
+/// exec var(params) — run a bytecode variable
+#[derive(Debug, Clone)]
+pub struct ExecStmt {
+    pub target: Expr,
+    pub args: Vec<Expr>,
     pub span: Span,
 }
 
