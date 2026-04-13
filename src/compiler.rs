@@ -57,13 +57,160 @@ fn name_hash(s: &str) -> [u8; 2] {
 
 // ── Compiled output ─────────────────────────────────────────────────────────
 
-/// A compiled CubeLang program.
+/// Magic bytes for .cubebin files.
+pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
+/// Current .cubebin format version.
+pub const CUBEBIN_VERSION: u8 = 1;
+
+/// A compiled CubeLang program — serializable to `.cubebin` format.
+///
+/// ## .cubebin binary format
+///
+/// ```text
+/// [4 bytes]  magic: "CUBE"
+/// [1 byte]   version: 0x01
+/// [1 byte]   n_programs: u8
+/// For each program:
+///   [1 byte]   name_len: u8
+///   [N bytes]  name: utf-8
+///   [1 byte]   n_implements: u8
+///   For each implements:
+///     [1 byte]   iface_name_len: u8
+///     [N bytes]  iface_name: utf-8
+///   [1 byte]   n_storage_fields: u8
+///   For each storage field:
+///     [1 byte]   field_name_len: u8
+///     [N bytes]  field_name: utf-8
+///   [1 byte]   n_functions: u8
+///   For each function:
+///     [1 byte]   fn_name_len: u8
+///     [N bytes]  fn_name: utf-8
+///     [4 bytes]  bytecode_len: u32 LE
+///     [N bytes]  bytecode
+/// ```
 #[derive(Debug, Clone)]
 pub struct CompiledProgram {
     pub name: String,
     pub implements: Vec<String>,
     pub functions: Vec<CompiledFunction>,
     pub storage_fields: Vec<String>,
+}
+
+impl CompiledProgram {
+    /// Serialize to `.cubebin` binary format.
+    pub fn to_cubebin(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(CUBEBIN_MAGIC);
+        buf.push(CUBEBIN_VERSION);
+        buf.push(1); // n_programs (single program per file for now)
+
+        // Program name
+        buf.push(self.name.len() as u8);
+        buf.extend_from_slice(self.name.as_bytes());
+
+        // Implements
+        buf.push(self.implements.len() as u8);
+        for iface in &self.implements {
+            buf.push(iface.len() as u8);
+            buf.extend_from_slice(iface.as_bytes());
+        }
+
+        // Storage fields
+        buf.push(self.storage_fields.len() as u8);
+        for field in &self.storage_fields {
+            buf.push(field.len() as u8);
+            buf.extend_from_slice(field.as_bytes());
+        }
+
+        // Functions
+        buf.push(self.functions.len() as u8);
+        for func in &self.functions {
+            buf.push(func.name.len() as u8);
+            buf.extend_from_slice(func.name.as_bytes());
+            let bc_len = func.bytecode.len() as u32;
+            buf.extend_from_slice(&bc_len.to_le_bytes());
+            buf.extend_from_slice(&func.bytecode);
+        }
+
+        buf
+    }
+
+    /// Deserialize from `.cubebin` binary format.
+    pub fn from_cubebin(data: &[u8]) -> Result<Self, String> {
+        let mut pos = 0;
+
+        // Magic
+        if data.len() < 6 || &data[0..4] != CUBEBIN_MAGIC {
+            return Err("invalid .cubebin: bad magic".into());
+        }
+        pos = 4;
+
+        // Version
+        let version = data[pos]; pos += 1;
+        if version != CUBEBIN_VERSION {
+            return Err(format!("unsupported .cubebin version: {}", version));
+        }
+
+        // n_programs (we read 1)
+        let _n_programs = data[pos]; pos += 1;
+
+        // Program name
+        let name_len = data[pos] as usize; pos += 1;
+        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
+        pos += name_len;
+
+        // Implements
+        let n_impl = data[pos] as usize; pos += 1;
+        let mut implements = Vec::new();
+        for _ in 0..n_impl {
+            let len = data[pos] as usize; pos += 1;
+            implements.push(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+            pos += len;
+        }
+
+        // Storage fields
+        let n_storage = data[pos] as usize; pos += 1;
+        let mut storage_fields = Vec::new();
+        for _ in 0..n_storage {
+            let len = data[pos] as usize; pos += 1;
+            storage_fields.push(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+            pos += len;
+        }
+
+        // Functions
+        let n_funcs = data[pos] as usize; pos += 1;
+        let mut functions = Vec::new();
+        for _ in 0..n_funcs {
+            let fn_name_len = data[pos] as usize; pos += 1;
+            let fn_name = String::from_utf8_lossy(&data[pos..pos + fn_name_len]).to_string();
+            pos += fn_name_len;
+
+            let bc_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            pos += 4;
+            let bytecode = data[pos..pos + bc_len].to_vec();
+            pos += bc_len;
+
+            functions.push(CompiledFunction {
+                name: fn_name,
+                bytecode,
+                labels: Vec::new(),
+                debug_lines: Vec::new(),
+            });
+        }
+
+        Ok(CompiledProgram { name, implements, functions, storage_fields })
+    }
+
+    /// Save to a `.cubebin` file.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_cubebin())
+    }
+
+    /// Load from a `.cubebin` file.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        Self::from_cubebin(&data)
+    }
 }
 
 /// A compiled function.
@@ -780,5 +927,105 @@ mod tests {
         assert_eq!(func.debug_lines.len(), 4);
         assert_eq!(func.debug_lines[0].opcode, op::CREATE);
         assert!(func.debug_lines[0].description.contains("create x"));
+    }
+
+    #[test]
+    fn test_cubebin_roundtrip() {
+        let programs = compile(r#"
+            program GSM8K implements ISolver {
+                storage {
+                    patterns: mutable map<str, function>;
+                    count: mutable u64 = 0;
+                }
+
+                public function constructor() {
+                    self.count = 0;
+                }
+
+                @external
+                public function solve(input: Input): Output {
+                    create x : quantity;
+                    assign x = 16;
+                    sub x, 3;
+                    sub x, 4;
+                    sum x;
+                    query x;
+                    remember x;
+                    return Output { result: 9 };
+                }
+            }
+        "#).unwrap();
+
+        let prog = &programs[0];
+
+        // Serialize
+        let bin = prog.to_cubebin();
+        assert_eq!(&bin[0..4], b"CUBE");
+        assert_eq!(bin[4], 1); // version
+
+        // Deserialize
+        let loaded = CompiledProgram::from_cubebin(&bin).unwrap();
+        assert_eq!(loaded.name, "GSM8K");
+        assert_eq!(loaded.implements, vec!["ISolver"]);
+        assert_eq!(loaded.storage_fields, vec!["patterns", "count"]);
+        assert_eq!(loaded.functions.len(), 2);
+        assert_eq!(loaded.functions[0].name, "constructor");
+        assert_eq!(loaded.functions[1].name, "solve");
+
+        // Bytecode should match exactly
+        assert_eq!(loaded.functions[1].bytecode, prog.functions[1].bytecode);
+    }
+
+    #[test]
+    fn test_cubebin_file_roundtrip() {
+        let programs = compile(r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    create x : quantity;
+                    assign x = 42;
+                    sum x;
+                }
+            }
+        "#).unwrap();
+
+        let prog = &programs[0];
+        let path = std::env::temp_dir().join("test_cubelang.cubebin");
+
+        // Save
+        prog.save(&path).unwrap();
+
+        // Load
+        let loaded = CompiledProgram::load(&path).unwrap();
+        assert_eq!(loaded.name, "Test");
+        assert_eq!(loaded.functions[0].bytecode, prog.functions[0].bytecode);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cubebin_gsm8k_full() {
+        let source = include_str!("../examples/gsm8k.cube");
+        let programs = compile(source).unwrap();
+        let prog = &programs[0];
+
+        let bin = prog.to_cubebin();
+        println!(".cubebin size: {} bytes", bin.len());
+        println!("  magic: {:?}", std::str::from_utf8(&bin[0..4]).unwrap());
+        println!("  version: {}", bin[4]);
+        println!("  program: {}", prog.name);
+        println!("  functions: {}", prog.functions.len());
+        for f in &prog.functions {
+            println!("    {}(): {} bytes bytecode", f.name, f.bytecode.len());
+        }
+
+        // Roundtrip
+        let loaded = CompiledProgram::from_cubebin(&bin).unwrap();
+        assert_eq!(loaded.name, prog.name);
+        assert_eq!(loaded.functions.len(), prog.functions.len());
+        for (a, b) in loaded.functions.iter().zip(prog.functions.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.bytecode, b.bytecode, "bytecode mismatch for {}", a.name);
+        }
     }
 }
