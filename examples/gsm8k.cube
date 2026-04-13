@@ -1,0 +1,166 @@
+# gsm8k.cube
+# cubelang v0.1.0
+# license: mit
+# author: grillcheese research laboratory
+
+interface ISolver {
+    type Input;
+    type Output;
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+    optional public function learn(input: Input, expected: Output, actual: Output): void;
+}
+
+struct ArithStep {
+    label: str;
+    lhs: f64;
+    ops: array<tuple<str, f64>>;
+    result: f64;
+}
+
+struct Problem {
+    question: str;
+    steps: array<ArithStep>;
+    answer: f64;
+}
+
+struct Solution {
+    result: f64;
+    registers: map<str, f64>;
+    bytecode: array<byte>;
+    confidence: f64;
+}
+
+program GSM8K implements ISolver {
+
+    type Input = Problem;
+    type Output = Solution;
+
+    storage {
+        patterns: mutable map<str, function>;
+        success_count: mutable u64 = 0;
+        fail_count: mutable u64 = 0;
+    }
+
+    io {
+        inputs {
+            raw: str;
+        }
+        outputs {
+            solution: Solution;
+            bytecode: array<byte>;
+        }
+    }
+
+    @system @once
+    public function constructor() {
+        self.patterns = {};
+        self.success_count = 0;
+        self.fail_count = 0;
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        let steps: array<ArithStep> = [];
+        let search = raw;
+
+        while search.contains("<<") {
+            let { expr, result, rest } = extract_annotation(search);
+            let label = extract_label(search, steps.length);
+            let { lhs, ops } = parse_expression(expr);
+
+            steps.push(ArithStep {
+                label: label,
+                lhs: lhs,
+                ops: ops,
+                result: result,
+            });
+
+            search = rest;
+        }
+
+        let answer = parse_final_answer(raw);
+        return Problem { question: raw, steps: steps, answer: answer };
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        let regs: map<str, f64> = {};
+        let prev_result: f64 | null = null;
+
+        atomic {
+            for (let i = 0; i < input.steps.length; i++) {
+                let step = input.steps[i];
+
+                create step.label : quantity;
+
+                if (prev_result != null && approx_eq(step.lhs, prev_result)) {
+                    pop step.label;
+                } else {
+                    assign step.label = step.lhs;
+                }
+
+                for (let op of step.ops) {
+                    match (op[0]) {
+                        "+" => add step.label, op[1];
+                        "-" => sub step.label, op[1];
+                        "*" => mul step.label, op[1];
+                        "/" => div step.label, op[1];
+                    }
+                }
+
+                sum step.label;
+
+                if (i < input.steps.length - 1) {
+                    push step.label;
+                }
+
+                regs[step.label] = eval(step.label);
+                prev_result = step.result;
+            }
+
+            let last = input.steps[input.steps.length - 1].label;
+            query last;
+            remember last;
+
+            commit;
+        }
+
+        self.success_count += 1;
+
+        return Solution {
+            result: regs[input.steps[input.steps.length - 1].label],
+            registers: regs,
+            bytecode: emit_bytecode(),
+            confidence: 1.0,
+        };
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return approx_eq(output.result, input.answer, 0.01);
+    }
+
+    @internal
+    public mutable function learn(input: Input, expected: Output, actual: Output): void {
+        self.fail_count += 1;
+
+        let diff = expected.result - actual.result;
+        let key = classify_error(input, diff);
+
+        if (self.patterns.has(key)) {
+            self.patterns[key](input);
+            return;
+        }
+
+        let handler = derive_handler(input, expected, actual);
+        self.patterns[key] = handler;
+
+        emit PatternLearned {
+            program: "GSM8K",
+            pattern: key,
+            total: self.patterns.size,
+        };
+    }
+}

@@ -260,6 +260,31 @@ impl<'a> Lexer<'a> {
             "override"     => TokenKind::Override,
             "constructor"  => TokenKind::Constructor,
 
+            // Error handling
+            "try"          => TokenKind::Try,
+            "catch"        => TokenKind::Catch,
+            "finally"      => TokenKind::Finally,
+            "assert"       => TokenKind::Assert,
+
+            // Transactions / ACID
+            "atomic"       => TokenKind::Atomic,
+            "rollback"     => TokenKind::Rollback,
+            "commit"       => TokenKind::Commit,
+            "gate"         => TokenKind::Gate,
+
+            // Bytecode / low-level
+            "bytecode"     => TokenKind::BytecodeKw,
+            "import"       => TokenKind::Import,
+            "export"       => TokenKind::Export,
+            "exec"         => TokenKind::Exec,
+            "codebook"     => TokenKind::Codebook,
+
+            // Debug / logging
+            "log"          => TokenKind::Log,
+            "debug"        => TokenKind::Debug,
+            "warn"         => TokenKind::Warn,
+            "error"        => TokenKind::Error,
+
             // Modifiers
             "public"       => TokenKind::Public,
             "private"      => TokenKind::Private,
@@ -602,7 +627,7 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::WorldKw);
         assert_eq!(tokens[1].kind, TokenKind::Ident("MathClassroom".into()));
         assert_eq!(tokens[2].kind, TokenKind::Extends);
-        assert_eq!(tokens[3].kind, TokenKind::Container);
+        assert_eq!(tokens[3].kind, TokenKind::Ident("Container".into())); // uppercase = ident, not keyword
         assert_eq!(tokens[4].kind, TokenKind::Implements);
     }
 
@@ -627,5 +652,109 @@ mod tests {
         assert_eq!(tokens[3].kind, TokenKind::Comma);
         assert_eq!(tokens[4].kind, TokenKind::TyF64);
         assert_eq!(tokens[5].kind, TokenKind::RAngle);
+    }
+
+    #[test]
+    fn test_lex_error_handling() {
+        let tokens = Lexer::new("try catch finally assert").tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Try);
+        assert_eq!(tokens[1].kind, TokenKind::Catch);
+        assert_eq!(tokens[2].kind, TokenKind::Finally);
+        assert_eq!(tokens[3].kind, TokenKind::Assert);
+    }
+
+    #[test]
+    fn test_lex_acid_keywords() {
+        let tokens = Lexer::new("atomic rollback commit gate").tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Atomic);
+        assert_eq!(tokens[1].kind, TokenKind::Rollback);
+        assert_eq!(tokens[2].kind, TokenKind::Commit);
+        assert_eq!(tokens[3].kind, TokenKind::Gate);
+    }
+
+    #[test]
+    fn test_lex_bytecode_keywords() {
+        let tokens = Lexer::new("bytecode import export exec codebook").tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
+        assert_eq!(tokens[1].kind, TokenKind::Import);
+        assert_eq!(tokens[2].kind, TokenKind::Export);
+        assert_eq!(tokens[3].kind, TokenKind::Exec);
+        assert_eq!(tokens[4].kind, TokenKind::Codebook);
+    }
+
+    #[test]
+    fn test_lex_atomic_block() {
+        let src = r#"atomic {
+            assign x = 12;
+            sub x, 4;
+            commit;
+        }"#;
+        let tokens = Lexer::new(src).tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Atomic);
+        assert_eq!(tokens[1].kind, TokenKind::LBrace);
+    }
+
+    #[test]
+    fn test_lex_try_catch() {
+        let src = r#"try { solve(input); } catch (e) { rollback; }"#;
+        let tokens = Lexer::new(src).tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Try);
+        assert_eq!(tokens[1].kind, TokenKind::LBrace);
+    }
+
+    #[test]
+    fn test_lex_bytecode_wasm_import() {
+        let src = r#"bytecode import "solver.wasm";"#;
+        let tokens = Lexer::new(src).tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
+        assert_eq!(tokens[1].kind, TokenKind::Import);
+        assert_eq!(tokens[2].kind, TokenKind::StringLit("solver.wasm".into()));
+        assert_eq!(tokens[3].kind, TokenKind::Semicolon);
+    }
+
+    #[test]
+    fn test_lex_assert() {
+        let src = r#"assert output.result == 18, "wrong answer";"#;
+        let tokens = Lexer::new(src).tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Assert);
+        assert_eq!(tokens[1].kind, TokenKind::Ident("output".into()));
+        assert_eq!(tokens[2].kind, TokenKind::Dot);
+        assert_eq!(tokens[3].kind, TokenKind::Ident("result".into()));
+        assert_eq!(tokens[4].kind, TokenKind::EqEq);
+        assert_eq!(tokens[5].kind, TokenKind::IntLit(18));
+        assert_eq!(tokens[6].kind, TokenKind::Comma);
+        assert_eq!(tokens[7].kind, TokenKind::StringLit("wrong answer".into()));
+    }
+
+    #[test]
+    fn test_lex_full_program() {
+        let src = r#"
+            program GSM8K implements ISolver {
+                storage {
+                    patterns: mutable map<str, function>;
+                }
+
+                @external
+                public function solve(input: Input): Output {
+                    atomic {
+                        create x : quantity;
+                        assign x = 16;
+                        sub x, 3;
+                        sum x;
+                        commit;
+                    }
+                    assert eval(x) == 13, "step failed";
+                    return Output { result: eval(x) };
+                }
+            }
+        "#;
+        let tokens = Lexer::new(src).tokenize();
+        // Should tokenize without errors — just check it doesn't panic
+        // and has reasonable token count
+        let non_newline: Vec<_> = tokens.iter()
+            .filter(|t| t.kind != TokenKind::Newline && t.kind != TokenKind::Eof)
+            .collect();
+        assert!(non_newline.len() > 30, "expected 30+ tokens, got {}", non_newline.len());
+        assert_eq!(non_newline[0].kind, TokenKind::Program);
     }
 }

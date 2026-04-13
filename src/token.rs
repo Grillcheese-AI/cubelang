@@ -85,6 +85,31 @@ pub enum TokenKind {
     Override,
     Constructor,
 
+    // ── Keywords: error handling ─────────────────────────────
+    Try,            // try { ... } catch (e) { ... } finally { ... }
+    Catch,
+    Finally,
+    Assert,         // assert condition, "message";
+
+    // ── Keywords: transactions / ACID ────────────────────────
+    Atomic,         // atomic { ... } — all-or-nothing execution
+    Rollback,       // rollback; — undo current atomic block
+    Commit,         // commit; — finalize atomic block
+    Gate,           // gate("reason") { ... } — sensitive operation fence
+
+    // ── Keywords: bytecode / low-level ───────────────────────
+    BytecodeKw,     // bytecode { asm } — inline VM assembly
+    Import,         // import "file" or bytecode wasm import "file.wasm"
+    Export,         // export codebook / export bytecode
+    Exec,           // exec var(params) — run bytecode variable
+    Codebook,       // codebook.load("file.bin") / codebook.export("file.bin")
+
+    // ── Keywords: debug / logging ──────────────────────────────
+    Log,            // log("message") — info level
+    Debug,          // debug("message") — debug level, stripped in release
+    Warn,           // warn("message") — warning level
+    Error,          // error("message") — error level
+
     // ── Keywords: modifiers ──────────────────────────────────
     Public,
     Private,
