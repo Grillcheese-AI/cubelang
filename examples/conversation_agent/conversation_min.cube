@@ -1,0 +1,64 @@
+# examples/conversation_min.cube
+# cubelang v0.1.0
+
+interface ISolver {
+    type Input;
+    type Output;
+
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+}
+
+program ConversationMin implements ISolver {
+    type Input = str;
+    type Output = quantity;
+
+    storage {
+        last_intent: mutable str = "";
+        last_reply_kind: mutable str = "";
+        success_count: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign last_intent = "boot";
+        assign last_reply_kind = "idle";
+        assign success_count = 0;
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return raw;
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        create score : quantity;
+        assign score = 0;
+
+        create mode : symbol;
+        assign mode = 1;
+        store mode, "parsed_input";
+        query mode;
+        remember mode;
+
+        add score, 10;
+        store score, "base_score";
+
+        assign last_intent = "generic";
+        assign last_reply_kind = "answer";
+
+        query score;
+        remember score;
+        sum score;
+
+        add success_count, 1;
+        return score;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}
