@@ -831,7 +831,8 @@ impl Parser {
             tok if matches!(tok, TokenKind::OpAssign | TokenKind::OpAdd | TokenKind::OpSub |
                 TokenKind::OpMul | TokenKind::OpDiv | TokenKind::OpSum | TokenKind::OpPush |
                 TokenKind::OpPop | TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
-                TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify) => self.parse_opcode_stmt(),
+                TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
+                TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare) => self.parse_opcode_stmt(),
 
             // Logging
             TokenKind::Log | TokenKind::Debug | TokenKind::Warn | TokenKind::Error => {
@@ -1107,6 +1108,29 @@ impl Parser {
                 self.expect(&TokenKind::Comma)?;
                 let b = self.expect_ident()?;
                 OpcodeStmt::Unify { a, b }
+            }
+            TokenKind::OpBindRole => {
+                // bind_role reg, ROLE  (2-arg; filler defaults to the register itself)
+                let reg = self.expect_ident()?;
+                self.expect(&TokenKind::Comma)?;
+                let role = self.expect_ident()?;
+                OpcodeStmt::BindRole { reg, role }
+            }
+            TokenKind::OpTransfer => {
+                // transfer src, dst, amount
+                let src = self.expect_ident()?;
+                self.expect(&TokenKind::Comma)?;
+                let dst = self.expect_ident()?;
+                self.expect(&TokenKind::Comma)?;
+                let amount = self.parse_expr()?;
+                OpcodeStmt::Transfer { src, dst, amount }
+            }
+            TokenKind::OpCompare => {
+                // compare a, b
+                let a = self.expect_ident()?;
+                self.expect(&TokenKind::Comma)?;
+                let b = self.expect_ident()?;
+                OpcodeStmt::Compare { a, b }
             }
             _ => return Err(self.err(format!("unknown opcode: {:?}", op))),
         };

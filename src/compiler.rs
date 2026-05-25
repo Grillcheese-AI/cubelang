@@ -503,6 +503,31 @@ impl Compiler {
                 self.emit_named(a);
                 self.emit_named(b);
             }
+            OpcodeStmt::BindRole { reg, role } => {
+                // bind_role reg, ROLE : 2-arg surface form. Filler defaults to
+                // the register itself (self-binding the register into the role).
+                self.emit_debug(op::BIND_ROLE, &format!("bind_role {} {}", reg, role));
+                self.emit_byte(op::BIND_ROLE);
+                self.emit_byte(3);
+                self.emit_named(reg);
+                self.emit_role(role);
+                self.emit_named(reg);
+            }
+            OpcodeStmt::Transfer { src, dst, amount } => {
+                self.emit_debug(op::TRANSFER, &format!("transfer {} {} ...", src, dst));
+                self.emit_byte(op::TRANSFER);
+                self.emit_byte(3);
+                self.emit_named(src);
+                self.emit_named(dst);
+                self.compile_expr_operand(amount);
+            }
+            OpcodeStmt::Compare { a, b } => {
+                self.emit_debug(op::COMPARE, &format!("compare {} {}", a, b));
+                self.emit_byte(op::COMPARE);
+                self.emit_byte(2);
+                self.emit_named(a);
+                self.emit_named(b);
+            }
         }
     }
 

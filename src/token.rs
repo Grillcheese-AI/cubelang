@@ -161,6 +161,9 @@ pub enum TokenKind {
     OpRecall,
     OpBind,
     OpUnify,
+    OpBindRole,
+    OpTransfer,
+    OpCompare,
 
     // ── Keywords: types ──────────────────────────────────────
     TyU8, TyU16, TyU32, TyU64,
@@ -258,7 +261,8 @@ impl TokenKind {
             TokenKind::OpSub | TokenKind::OpMul | TokenKind::OpDiv |
             TokenKind::OpSum | TokenKind::OpPush | TokenKind::OpPop |
             TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
-            TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify
+            TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
+            TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare
         )
     }
 }

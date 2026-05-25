@@ -345,6 +345,9 @@ impl<'a> Lexer<'a> {
             "recall"       => TokenKind::OpRecall,
             "bind"         => TokenKind::OpBind,
             "unify"        => TokenKind::OpUnify,
+            "bind_role"    => TokenKind::OpBindRole,
+            "transfer"     => TokenKind::OpTransfer,
+            "compare"      => TokenKind::OpCompare,
 
             // Built-in types
             "u8"               => TokenKind::TyU8,

@@ -547,6 +547,9 @@ pub enum OpcodeStmt {
     Recall { key: Expr },                        // recall "key"
     Bind { reg: String, role: String, val: Expr }, // bind x, AGENT, val
     Unify { a: String, b: String },             // unify a, b
+    BindRole { reg: String, role: String },     // bind_role x, AGENT (self-fill)
+    Transfer { src: String, dst: String, amount: Expr }, // transfer a, b, 1
+    Compare { a: String, b: String },           // compare a, b
 }
 
 // ── Expressions ─────────────────────────────────────────────────────────────
