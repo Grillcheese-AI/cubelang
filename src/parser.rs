@@ -828,6 +828,8 @@ impl Parser {
             TokenKind::Assert => self.parse_assert_stmt(),
             TokenKind::Try => self.parse_try_catch_stmt(),
 
+            TokenKind::OpCond => self.parse_cond_stmt(),
+            TokenKind::OpLoop => self.parse_loop_stmt(),
             // Opcode statements
             tok if TokenKind::OpCreate == tok => self.parse_opcode_stmt(),
             tok if matches!(tok, TokenKind::OpAssign | TokenKind::OpAdd | TokenKind::OpSub |
@@ -1051,6 +1053,44 @@ impl Parser {
     }
 
     // ── Opcode statements ───────────────────────────────────────────────
+
+    fn parse_cond_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.span();
+        self.expect(&TokenKind::OpCond)?;
+        let reg = self.parse_reg_ref()?;
+        self.expect(&TokenKind::Comma)?;
+        let val = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        self.expect(&TokenKind::LBrace)?;
+        let then_body = self.parse_stmt_block()?;
+        self.expect(&TokenKind::RBrace)?;
+        let else_body = if self.eat(&TokenKind::Else) {
+            self.expect(&TokenKind::LBrace)?;
+            let b = self.parse_stmt_block()?;
+            self.expect(&TokenKind::RBrace)?;
+            Some(b)
+        } else { None };
+        self.eat(&TokenKind::Semicolon);
+        let condition = Expr::BinOp(Box::new(Expr::Ident(reg)), BinOp::Eq, Box::new(val));
+        Ok(Stmt::If(IfStmt { condition, then_body, else_body, span }))
+    }
+
+    fn parse_loop_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.span();
+        self.expect(&TokenKind::OpLoop)?;
+        let reg = self.parse_reg_ref()?;
+        self.expect(&TokenKind::Comma)?;
+        let _target = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let _cond = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        self.expect(&TokenKind::LBrace)?;
+        let body = self.parse_stmt_block()?;
+        self.expect(&TokenKind::RBrace)?;
+        self.eat(&TokenKind::Semicolon);
+        let condition = Expr::Ident(reg);
+        Ok(Stmt::While(WhileStmt { condition, body, span }))
+    }
 
     fn parse_opcode_stmt(&mut self) -> PResult<Stmt> {
         let op = self.peek().clone();

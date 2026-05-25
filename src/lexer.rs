@@ -366,6 +366,8 @@ impl<'a> Lexer<'a> {
             "specialise"    => TokenKind::OpSpecialize,
             "reward"        => TokenKind::OpReward,
             "temporal_bind" => TokenKind::OpTemporalBind,
+            "cond"          => TokenKind::OpCond,
+            "loop"          => TokenKind::OpLoop,
 
             // Built-in types
             "u8"               => TokenKind::TyU8,

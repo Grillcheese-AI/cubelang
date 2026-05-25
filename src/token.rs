@@ -182,6 +182,8 @@ pub enum TokenKind {
     OpSpecialize,
     OpReward,
     OpTemporalBind,
+    OpCond,
+    OpLoop,
 
     // ── Keywords: types ──────────────────────────────────────
     TyU8, TyU16, TyU32, TyU64,
@@ -281,7 +283,8 @@ impl TokenKind {
             TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
             TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
             TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare |
-            TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward | TokenKind::OpTemporalBind
+            TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward | TokenKind::OpTemporalBind |
+            TokenKind::OpCond | TokenKind::OpLoop
         )
     }
 }
