@@ -837,7 +837,7 @@ impl Parser {
                 TokenKind::OpPop | TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
                 TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
                 TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare |
-                TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward) => self.parse_opcode_stmt(),
+                TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward | TokenKind::OpTemporalBind | TokenKind::OpAnalogy | TokenKind::OpGen | TokenKind::OpInst | TokenKind::OpBroadcast | TokenKind::OpExplore | TokenKind::OpForge | TokenKind::OpAsk | TokenKind::OpSync | TokenKind::OpForget) => self.parse_opcode_stmt(),
 
             // Logging
             TokenKind::Log | TokenKind::Debug | TokenKind::Warn | TokenKind::Error => {
@@ -1288,6 +1288,42 @@ impl Parser {
             TokenKind::OpTemporalBind => {
                 let args = self.parse_ext_args()?;
                 OpcodeStmt::Extended { op: ExtOp::TemporalBind, args }
+            }
+            TokenKind::OpAnalogy => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Analogy, args }
+            }
+            TokenKind::OpGen => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Gen, args }
+            }
+            TokenKind::OpInst => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Inst, args }
+            }
+            TokenKind::OpBroadcast => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Broadcast, args }
+            }
+            TokenKind::OpExplore => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Explore, args }
+            }
+            TokenKind::OpForge => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Forge, args }
+            }
+            TokenKind::OpAsk => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Ask, args }
+            }
+            TokenKind::OpSync => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Sync, args }
+            }
+            TokenKind::OpForget => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Forget, args }
             }
             _ => return Err(self.err(format!("unknown opcode: {:?}", op))),
         };

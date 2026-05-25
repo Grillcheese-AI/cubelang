@@ -58,6 +58,13 @@ pub mod op {
     pub const MAP_ROLES: u8      = 0x30;
     pub const REDUCE: u8         = 0x31;
     pub const TEMPORAL_BIND: u8  = 0x32;
+    pub const ANALOGY: u8     = 0x33;
+    pub const BROADCAST: u8   = 0x2B;
+    pub const EXPLORE: u8     = 0x26;
+    pub const FORGE: u8       = 0x28;
+    pub const ASK: u8         = 0x1D;
+    pub const SYNC: u8        = 0x2C;
+    pub const FORGET: u8      = 0x22;
 }
 
 // ── Operand encoding ────────────────────────────────────────────────────────
@@ -99,6 +106,15 @@ fn ext_bytecode(o: ExtOp) -> u8 {
         ExtOp::Sum           => op::SUM,
         ExtOp::Compare       => op::COMPARE,
         ExtOp::TemporalBind  => op::TEMPORAL_BIND,
+        ExtOp::Analogy      => op::ANALOGY,
+        ExtOp::Gen          => op::GEN,
+        ExtOp::Inst         => op::INST,
+        ExtOp::Broadcast    => op::BROADCAST,
+        ExtOp::Explore      => op::EXPLORE,
+        ExtOp::Forge        => op::FORGE,
+        ExtOp::Ask          => op::ASK,
+        ExtOp::Sync         => op::SYNC,
+        ExtOp::Forget       => op::FORGET,
     }
 }
 

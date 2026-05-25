@@ -368,6 +368,15 @@ impl<'a> Lexer<'a> {
             "temporal_bind" => TokenKind::OpTemporalBind,
             "cond"          => TokenKind::OpCond,
             "loop"          => TokenKind::OpLoop,
+            "analogy"        => TokenKind::OpAnalogy,
+            "gen"            => TokenKind::OpGen,
+            "inst"           => TokenKind::OpInst,
+            "broadcast"      => TokenKind::OpBroadcast,
+            "explore"        => TokenKind::OpExplore,
+            "forge"          => TokenKind::OpForge,
+            "ask"            => TokenKind::OpAsk,
+            "sync"           => TokenKind::OpSync,
+            "forget"         => TokenKind::OpForget,
 
             // Built-in types
             "u8"               => TokenKind::TyU8,

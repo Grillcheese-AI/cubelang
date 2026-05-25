@@ -569,6 +569,7 @@ pub enum ExtOp {
     Infer, MapRoles, Filter, Score, DetectPattern, Decode, Reduce, Merge,
     Split, Debate, Predict, Discover, Diff, Seq, Specialize, Reward,
     Match, Push, Sum, Compare, TemporalBind,
+    Analogy, Gen, Inst, Broadcast, Explore, Forge, Ask, Sync, Forget,
 }
 
 // ── Expressions ─────────────────────────────────────────────────────────────

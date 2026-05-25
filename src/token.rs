@@ -184,6 +184,15 @@ pub enum TokenKind {
     OpTemporalBind,
     OpCond,
     OpLoop,
+    OpAnalogy,
+    OpGen,
+    OpInst,
+    OpBroadcast,
+    OpExplore,
+    OpForge,
+    OpAsk,
+    OpSync,
+    OpForget,
 
     // ── Keywords: types ──────────────────────────────────────
     TyU8, TyU16, TyU32, TyU64,
@@ -284,7 +293,8 @@ impl TokenKind {
             TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
             TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare |
             TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward | TokenKind::OpTemporalBind |
-            TokenKind::OpCond | TokenKind::OpLoop
+            TokenKind::OpCond | TokenKind::OpLoop |
+            TokenKind::OpAnalogy | TokenKind::OpGen | TokenKind::OpInst | TokenKind::OpBroadcast | TokenKind::OpExplore | TokenKind::OpForge | TokenKind::OpAsk | TokenKind::OpSync | TokenKind::OpForget
         )
     }
 }
