@@ -1047,7 +1047,10 @@ impl Parser {
             TokenKind::OpCreate => {
                 let reg = self.expect_ident()?;
                 self.expect(&TokenKind::Colon)?;
-                let ty = self.expect_ident()?;
+                // Accept full type exprs (array<str>, map<k,v>, tuple<...>), not
+                // just bare idents. Stringify to the canonical name for emit_type.
+                let ty_expr = self.parse_type()?;
+                let ty = type_expr_to_string(&ty_expr);
                 OpcodeStmt::Create { reg, ty }
             }
             TokenKind::OpAssign => {
@@ -1252,6 +1255,13 @@ impl Parser {
             match self.peek() {
                 TokenKind::Dot => {
                     self.advance();
+                    // Tuple/positional field access: expr.0, expr.1 (the int lexes
+                    // as IntLit after the dot). Otherwise a normal named field.
+                    if let TokenKind::IntLit(n) = self.peek().clone() {
+                        self.advance();
+                        expr = Expr::Field(Box::new(expr), n.to_string());
+                        continue;
+                    }
                     let field = self.expect_ident()?;
                     // Check for method call: expr.method(args)
                     if self.at(&TokenKind::LParen) {
@@ -1453,6 +1463,33 @@ impl Parser {
                 _ => {}
             }
             self.pos += 1;
+        }
+    }
+}
+
+/// Render a TypeExpr to its canonical name string (for opcode type operands,
+/// which are stored as String and hashed at compile time).
+fn type_expr_to_string(ty: &TypeExpr) -> String {
+    match ty {
+        TypeExpr::Named(n) => n.clone(),
+        TypeExpr::Void => "void".into(),
+        TypeExpr::Array(inner) => format!("array<{}>", type_expr_to_string(inner)),
+        TypeExpr::Set(inner) => format!("set<{}>", type_expr_to_string(inner)),
+        TypeExpr::Promise(inner) => format!("promise<{}>", type_expr_to_string(inner)),
+        TypeExpr::Channel(inner) => format!("channel<{}>", type_expr_to_string(inner)),
+        TypeExpr::Nullable(inner) => format!("{}?", type_expr_to_string(inner)),
+        TypeExpr::Map(k, v) => format!("map<{},{}>", type_expr_to_string(k), type_expr_to_string(v)),
+        TypeExpr::Tuple(ts) => {
+            let parts: Vec<String> = ts.iter().map(type_expr_to_string).collect();
+            format!("tuple<{}>", parts.join(","))
+        }
+        TypeExpr::Union(ts) => {
+            let parts: Vec<String> = ts.iter().map(type_expr_to_string).collect();
+            parts.join("|")
+        }
+        TypeExpr::Fn(args, ret) => {
+            let parts: Vec<String> = args.iter().map(type_expr_to_string).collect();
+            format!("({})->{}", parts.join(","), type_expr_to_string(ret))
         }
     }
 }
