@@ -2635,7 +2635,7 @@ Every CubeLang construct compiles to CubeMind bytecodes:
 | `pop x` | `POP x` | `0x0A` |
 | `query x` | `QUERY x` | `0x0C` |
 | `store x, "key"` | `STORE x key` | `0x0D` |
-| `recall "key"` | `RECALL key` | `0x0E` |
+| `recall "key"` / `recall x, "key"` | `RECALL [x] key` | `0x0E` |
 | `bind x, ROLE, val` | `BIND_ROLE x ROLE val` | `0x0F` |
 | `if (cond) { ... }` | `COND var target ...` | `0x11` |
 | `for ... { ... }` | `LOOP var target ...` | `0x12` |
@@ -2647,6 +2647,37 @@ Every CubeLang construct compiles to CubeMind bytecodes:
 | `emit Event { }` | `BROADCAST reg` | `0x2B` |
 | `await joined arr` | `SYNC [regs]` | `0x2C` |
 | `async fn()` | `FORGE reg` | `0x28` |
+| `transfer a, b, n` | `TRANSFER a b n` | `0x07` |
+| `compare a, b` | `COMPARE a b` | `0x0B` |
+| `bind_role x, ROLE` | `BIND_ROLE x ROLE x` | `0x0F` |
+| `seq expr` | `SEQ ...` | `0x16` |
+| `diff a, b` | `DIFF ...` | `0x18` |
+| `detect_pattern x, expr` | `DETECT_PATTERN ...` | `0x19` |
+| `predict x` | `PREDICT ...` | `0x1A` |
+| `match a, b` | `MATCH ...` | `0x1B` |
+| `debate a, b` | `DEBATE ...` | `0x1C` |
+| `discover a, b` | `DISCOVER ...` | `0x1E` |
+| `decode x, expr` | `DECODE ...` | `0x23` |
+| `score x, expr` | `SCORE ...` | `0x24` |
+| `specialize x, expr` | `SPECIALIZE ...` | `0x25` |
+| `reward x` | `REWARD ...` | `0x27` |
+| `infer a, b` | `INFER ...` | `0x2A` |
+| `merge a, b` | `MERGE ...` | `0x2D` |
+| `split x, expr` | `SPLIT ...` | `0x2E` |
+| `filter x, expr` | `FILTER ...` | `0x2F` |
+| `map_roles x, ROLE` | `MAP_ROLES ...` | `0x30` |
+| `reduce x, expr` | `REDUCE ...` | `0x31` |
+| `temporal_bind a, b` | `TEMPORAL_BIND ...` | `0x32` |
+| `analogy a, b` | `ANALOGY ...` | `0x33` |
+| `inst x, expr` | `INST ...` | `0x36` |
+| `gen x, expr` | `GEN ...` | `0x37` |
+| `explore x, expr` | `EXPLORE ...` | `0x26` |
+| `forge a, b` | `FORGE ...` | `0x28` |
+| `ask a, b` | `ASK ...` | `0x1D` |
+| `sync a, b` | `SYNC ...` | `0x2C` |
+| `forget x` | `FORGET ...` | `0x22` |
+| `cond x, val, { ... } [else { ... }]` | `COND var target ...` | `0x11` |
+| `loop x, target, cond, { ... }` | `LOOP var target ...` | `0x12` |
 
 ---
 
@@ -2740,6 +2771,22 @@ opcode_stmt = "create" IDENT ":" IDENT
             | "remember" IDENT
             | "store" IDENT "," expr
             | "recall" expr
+            | "recall" IDENT "," expr
             | "bind" IDENT "," ROLE "," expr
+            | "bind_role" IDENT "," ROLE
             | "unify" IDENT "," IDENT
+            | "transfer" IDENT "," IDENT "," expr
+            | "compare" IDENT "," IDENT
+            | ext_opcode ext_args
+            | block_opcode
+ext_opcode  = "seq" | "diff" | "detect_pattern" | "predict" | "match"
+            | "debate" | "discover" | "decode" | "score" | "specialize"
+            | "reward" | "infer" | "merge" | "split" | "filter"
+            | "map_roles" | "reduce" | "temporal_bind" | "analogy"
+            | "gen" | "inst" | "explore" | "forge" | "ask" | "sync" | "forget"
+block_opcode = "cond" IDENT "," expr "," block ("else" block)?
+            | "loop" IDENT "," expr "," expr "," block
+block       = "{" stmt* "}"
+ext_args    = (ext_arg ("," ext_arg)*)?      # 0+ comma-separated args
+ext_arg     = IDENT | expr                   # bare IDENT → register/role, else value
 ```
