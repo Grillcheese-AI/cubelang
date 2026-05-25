@@ -164,6 +164,23 @@ pub enum TokenKind {
     OpBindRole,
     OpTransfer,
     OpCompare,
+    // extended reasoning opcodes
+    OpInfer,
+    OpMapRoles,
+    OpFilter,
+    OpScore,
+    OpDetectPattern,
+    OpDecode,
+    OpReduce,
+    OpMerge,
+    OpSplit,
+    OpDebate,
+    OpPredict,
+    OpDiscover,
+    OpDiff,
+    OpSeq,
+    OpSpecialize,
+    OpReward,
 
     // ── Keywords: types ──────────────────────────────────────
     TyU8, TyU16, TyU32, TyU64,
@@ -262,7 +279,8 @@ impl TokenKind {
             TokenKind::OpSum | TokenKind::OpPush | TokenKind::OpPop |
             TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
             TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
-            TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare
+            TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare |
+            TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward
         )
     }
 }

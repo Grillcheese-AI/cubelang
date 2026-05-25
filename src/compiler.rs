@@ -38,6 +38,25 @@ pub mod op {
     pub const GEN: u8       = 0x37;
     pub const NEWVAR: u8    = 0x38;
     pub const SKIP: u8      = 0xFF;
+
+    // Extended reasoning opcodes (canonical values from opcode-vsa-rs ir.rs).
+    pub const SEQ: u8            = 0x16;
+    pub const DIFF: u8           = 0x18;
+    pub const DETECT_PATTERN: u8 = 0x19;
+    pub const PREDICT: u8        = 0x1A;
+    pub const MATCH: u8          = 0x1B;
+    pub const DEBATE: u8         = 0x1C;
+    pub const DISCOVER: u8       = 0x1E;
+    pub const DECODE: u8         = 0x23;
+    pub const SCORE: u8          = 0x24;
+    pub const SPECIALIZE: u8     = 0x25;
+    pub const REWARD: u8         = 0x27;
+    pub const INFER: u8          = 0x2A;
+    pub const MERGE: u8          = 0x2D;
+    pub const SPLIT: u8          = 0x2E;
+    pub const FILTER: u8         = 0x2F;
+    pub const MAP_ROLES: u8      = 0x30;
+    pub const REDUCE: u8         = 0x31;
 }
 
 // ── Operand encoding ────────────────────────────────────────────────────────
@@ -53,6 +72,29 @@ const OP_NONE: u8   = 0x00;
 fn name_hash(s: &str) -> [u8; 2] {
     let h = blake3::hash(s.as_bytes());
     [h.as_bytes()[0], h.as_bytes()[1]]
+}
+
+/// Map an extended reasoning opcode to its canonical bytecode (opcode-vsa-rs ir.rs).
+fn ext_bytecode(o: ExtOp) -> u8 {
+    match o {
+        ExtOp::Seq           => op::SEQ,
+        ExtOp::Diff          => op::DIFF,
+        ExtOp::DetectPattern => op::DETECT_PATTERN,
+        ExtOp::Predict       => op::PREDICT,
+        ExtOp::Match         => op::MATCH,
+        ExtOp::Debate        => op::DEBATE,
+        ExtOp::Discover      => op::DISCOVER,
+        ExtOp::Decode        => op::DECODE,
+        ExtOp::Score         => op::SCORE,
+        ExtOp::Specialize    => op::SPECIALIZE,
+        ExtOp::Reward        => op::REWARD,
+        ExtOp::Infer         => op::INFER,
+        ExtOp::Merge         => op::MERGE,
+        ExtOp::Split         => op::SPLIT,
+        ExtOp::Filter        => op::FILTER,
+        ExtOp::MapRoles      => op::MAP_ROLES,
+        ExtOp::Reduce        => op::REDUCE,
+    }
 }
 
 // ── Compiled output ─────────────────────────────────────────────────────────
@@ -482,11 +524,20 @@ impl Compiler {
                 self.emit_named(reg);
                 self.compile_expr_operand(key);
             }
-            OpcodeStmt::Recall { key } => {
+            OpcodeStmt::Recall { reg, key } => {
                 self.emit_debug(op::RECALL, "recall ...");
                 self.emit_byte(op::RECALL);
-                self.emit_byte(1);
-                self.compile_expr_operand(key);
+                match reg {
+                    Some(r) => {
+                        self.emit_byte(2);
+                        self.emit_named(r);
+                        self.compile_expr_operand(key);
+                    }
+                    None => {
+                        self.emit_byte(1);
+                        self.compile_expr_operand(key);
+                    }
+                }
             }
             OpcodeStmt::Bind { reg, role, val } => {
                 self.emit_debug(op::BIND_ROLE, &format!("bind {} {} ...", reg, role));
@@ -527,6 +578,18 @@ impl Compiler {
                 self.emit_byte(2);
                 self.emit_named(a);
                 self.emit_named(b);
+            }
+            OpcodeStmt::Extended { op: ext, args } => {
+                let code = ext_bytecode(*ext);
+                self.emit_debug(code, &format!("{:?} ({} args)", ext, args.len()));
+                self.emit_byte(code);
+                self.emit_byte(args.len() as u8);
+                for arg in args {
+                    match arg {
+                        ExtArg::Reg(name) => self.emit_named(name),
+                        ExtArg::Val(expr) => self.compile_expr_operand(expr),
+                    }
+                }
             }
         }
     }

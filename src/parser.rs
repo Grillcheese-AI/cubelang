@@ -832,7 +832,8 @@ impl Parser {
                 TokenKind::OpMul | TokenKind::OpDiv | TokenKind::OpSum | TokenKind::OpPush |
                 TokenKind::OpPop | TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
                 TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
-                TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare) => self.parse_opcode_stmt(),
+                TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare |
+                TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward) => self.parse_opcode_stmt(),
 
             // Logging
             TokenKind::Log | TokenKind::Debug | TokenKind::Warn | TokenKind::Error => {
@@ -938,6 +939,16 @@ impl Parser {
     fn parse_match_stmt(&mut self) -> PResult<Stmt> {
         let span = self.span();
         self.expect(&TokenKind::Match)?;
+        // Opcode form: `match a, b` (no parens) ? MATCH target candidates (0x1B).
+        // Distinct from the statement form `match (expr) { arms }`.
+        if !self.at(&TokenKind::LParen) {
+            let args = self.parse_ext_args()?;
+            self.eat(&TokenKind::Semicolon);
+            return Ok(Stmt::Opcode(OpcodeStmt::Extended {
+                op: ExtOp::Match,
+                args,
+            }));
+        }
         self.expect(&TokenKind::LParen)?;
         let expr = self.parse_expr()?;
         self.expect(&TokenKind::RParen)?;
@@ -1095,8 +1106,20 @@ impl Parser {
                 OpcodeStmt::Store { reg, key }
             }
             TokenKind::OpRecall => {
+                // recall "key"  |  recall reg, "key"
+                let mut reg = None;
+                if let TokenKind::Ident(name) = self.peek().clone() {
+                    let save = self.pos;
+                    self.advance(); // consume the ident
+                    if self.at(&TokenKind::Comma) {
+                        self.advance(); // consume the comma → 2-arg form
+                        reg = Some(name);
+                    } else {
+                        self.pos = save; // single-arg form; ident is the key expr
+                    }
+                }
                 let key = self.parse_expr()?;
-                OpcodeStmt::Recall { key }
+                OpcodeStmt::Recall { reg, key }
             }
             TokenKind::OpBind => {
                 let reg = self.expect_ident()?;
@@ -1135,10 +1158,111 @@ impl Parser {
                 let b = self.expect_ident()?;
                 OpcodeStmt::Compare { a, b }
             }
+            TokenKind::OpInfer => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Infer, args }
+            }
+            TokenKind::OpMapRoles => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::MapRoles, args }
+            }
+            TokenKind::OpFilter => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Filter, args }
+            }
+            TokenKind::OpScore => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Score, args }
+            }
+            TokenKind::OpDetectPattern => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::DetectPattern, args }
+            }
+            TokenKind::OpDecode => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Decode, args }
+            }
+            TokenKind::OpReduce => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Reduce, args }
+            }
+            TokenKind::OpMerge => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Merge, args }
+            }
+            TokenKind::OpSplit => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Split, args }
+            }
+            TokenKind::OpDebate => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Debate, args }
+            }
+            TokenKind::OpPredict => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Predict, args }
+            }
+            TokenKind::OpDiscover => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Discover, args }
+            }
+            TokenKind::OpDiff => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Diff, args }
+            }
+            TokenKind::OpSeq => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Seq, args }
+            }
+            TokenKind::OpSpecialize => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Specialize, args }
+            }
+            TokenKind::OpReward => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Reward, args }
+            }
             _ => return Err(self.err(format!("unknown opcode: {:?}", op))),
         };
         self.eat(&TokenKind::Semicolon);
         Ok(Stmt::Opcode(stmt))
+    }
+
+    /// Parse comma-separated arguments for an extended opcode statement.
+    /// Each argument is a bare identifier (treated as a register/role name) or
+    /// a value expression (string, int, array, field access, etc.). Stops at
+    /// the statement terminator (`;`) or end of the enclosing block.
+    fn parse_ext_args(&mut self) -> PResult<Vec<ExtArg>> {
+        let mut args = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RBrace)
+                || self.at(&TokenKind::Eof) {
+                break;
+            }
+            // A bare identifier (not followed by an operator/index/dot/call) is a
+            // register name; anything else is a value expression.
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                // Look one token past the ident to decide reg vs expr.
+                let save = self.pos;
+                self.advance(); // consume ident
+                let next_is_arg_boundary = self.at(&TokenKind::Comma)
+                    || self.at(&TokenKind::Semicolon)
+                    || self.at(&TokenKind::RBrace)
+                    || self.at(&TokenKind::Eof);
+                if next_is_arg_boundary {
+                    args.push(ExtArg::Reg(name));
+                } else {
+                    // Not a plain register ? rewind and parse as a full expression.
+                    self.pos = save;
+                    args.push(ExtArg::Val(self.parse_expr()?));
+                }
+            } else {
+                args.push(ExtArg::Val(self.parse_expr()?));
+            }
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        Ok(args)
     }
 
     // ── Expressions ─────────────────────────────────────────────────────
