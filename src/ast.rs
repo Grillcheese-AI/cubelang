@@ -568,7 +568,7 @@ pub enum ExtArg {
 pub enum ExtOp {
     Infer, MapRoles, Filter, Score, DetectPattern, Decode, Reduce, Merge,
     Split, Debate, Predict, Discover, Diff, Seq, Specialize, Reward,
-    Match,
+    Match, Push, Sum, Compare, TemporalBind,
 }
 
 // ── Expressions ─────────────────────────────────────────────────────────────

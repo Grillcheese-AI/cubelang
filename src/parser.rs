@@ -168,6 +168,8 @@ impl Parser {
             TokenKind::Return       => "return".into(),
             TokenKind::Match        => "match".into(),
             TokenKind::Async        => "async".into(),
+            TokenKind::TyResponse   => "response".into(),
+            TokenKind::TyRequest    => "request".into(),
             _ => return Err(self.err(format!("expected identifier, got {:?}", self.tokens[self.pos].kind))),
         };
         self.pos += 1;
@@ -1096,9 +1098,9 @@ impl Parser {
             }
             TokenKind::OpSum      => OpcodeStmt::Sum { reg: self.expect_ident()? },
             TokenKind::OpPush     => OpcodeStmt::Push { reg: self.expect_ident()? },
-            TokenKind::OpPop      => OpcodeStmt::Pop { reg: self.expect_ident()? },
-            TokenKind::OpQuery    => OpcodeStmt::Query { reg: self.expect_ident()? },
-            TokenKind::OpRemember => OpcodeStmt::Remember { reg: self.expect_ident()? },
+            TokenKind::OpPop      => OpcodeStmt::Pop { reg: self.parse_reg_ref()? },
+            TokenKind::OpQuery    => OpcodeStmt::Query { reg: self.parse_reg_ref()? },
+            TokenKind::OpRemember => OpcodeStmt::Remember { reg: self.parse_reg_ref()? },
             TokenKind::OpStore => {
                 let reg = self.expect_ident()?;
                 self.expect(&TokenKind::Comma)?;
@@ -1137,26 +1139,47 @@ impl Parser {
             }
             TokenKind::OpBindRole => {
                 // bind_role reg, ROLE  (2-arg; filler defaults to the register itself)
-                let reg = self.expect_ident()?;
+                let reg = self.parse_reg_ref()?;
                 self.expect(&TokenKind::Comma)?;
                 let role = self.expect_ident()?;
                 OpcodeStmt::BindRole { reg, role }
             }
             TokenKind::OpTransfer => {
                 // transfer src, dst, amount
-                let src = self.expect_ident()?;
+                let src = self.parse_reg_ref()?;
                 self.expect(&TokenKind::Comma)?;
-                let dst = self.expect_ident()?;
+                let dst = self.parse_reg_ref()?;
                 self.expect(&TokenKind::Comma)?;
                 let amount = self.parse_expr()?;
                 OpcodeStmt::Transfer { src, dst, amount }
             }
             TokenKind::OpCompare => {
-                // compare a, b
-                let a = self.expect_ident()?;
+                // compare a, b  (b may be a register or a value expression)
+                let a = self.parse_reg_ref()?;
                 self.expect(&TokenKind::Comma)?;
-                let b = self.expect_ident()?;
-                OpcodeStmt::Compare { a, b }
+                let save = self.pos;
+                if let Some(b) = self.try_parse_reg_ref() {
+                    if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RBrace)
+                        || self.at(&TokenKind::Eof) || self.at(&TokenKind::Comma) {
+                        if self.at(&TokenKind::Comma) {
+                            // 3+ args -> Extended
+                            self.advance();
+                            let mut args = vec![ExtArg::Reg(a), ExtArg::Reg(b)];
+                            args.extend(self.parse_ext_args()?);
+                            OpcodeStmt::Extended { op: ExtOp::Compare, args }
+                        } else {
+                            OpcodeStmt::Compare { a, b }
+                        }
+                    } else {
+                        self.pos = save;
+                        let v = self.parse_expr()?;
+                        OpcodeStmt::Extended { op: ExtOp::Compare, args: vec![ExtArg::Reg(a), ExtArg::Val(v)] }
+                    }
+                } else {
+                    self.pos = save;
+                    let v = self.parse_expr()?;
+                    OpcodeStmt::Extended { op: ExtOp::Compare, args: vec![ExtArg::Reg(a), ExtArg::Val(v)] }
+                }
             }
             TokenKind::OpInfer => {
                 let args = self.parse_ext_args()?;
@@ -1222,10 +1245,47 @@ impl Parser {
                 let args = self.parse_ext_args()?;
                 OpcodeStmt::Extended { op: ExtOp::Reward, args }
             }
+            TokenKind::OpTemporalBind => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::TemporalBind, args }
+            }
             _ => return Err(self.err(format!("unknown opcode: {:?}", op))),
         };
         self.eat(&TokenKind::Semicolon);
         Ok(Stmt::Opcode(stmt))
+    }
+
+    /// Parse a register reference: a name (identifier or contextual keyword)
+    /// optionally followed by positional/field access (`input.0`, `obj.field`).
+    /// Returns the rendered dotted name. Used for opcode register operands so
+    /// reserved words (event, response) and tuple access work as register names.
+    fn parse_reg_ref(&mut self) -> PResult<String> {
+        let mut name = self.expect_ident()?;
+        loop {
+            if self.at(&TokenKind::Dot) {
+                self.advance();
+                if let TokenKind::IntLit(n) = self.peek().clone() {
+                    self.advance();
+                    name = format!("{}.{}", name, n);
+                } else {
+                    let field = self.expect_ident()?;
+                    name = format!("{}.{}", name, field);
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(name)
+    }
+
+    /// Like parse_reg_ref but returns None instead of erroring (no rewind side
+    /// effects beyond what the caller saves/restores).
+    fn try_parse_reg_ref(&mut self) -> Option<String> {
+        let save = self.pos;
+        match self.parse_reg_ref() {
+            Ok(n) => Some(n),
+            Err(_) => { self.pos = save; None }
+        }
     }
 
     /// Parse comma-separated arguments for an extended opcode statement.
@@ -1240,25 +1300,22 @@ impl Parser {
                 || self.at(&TokenKind::Eof) {
                 break;
             }
-            // A bare identifier (not followed by an operator/index/dot/call) is a
-            // register name; anything else is a value expression.
-            if let TokenKind::Ident(name) = self.peek().clone() {
-                // Look one token past the ident to decide reg vs expr.
-                let save = self.pos;
-                self.advance(); // consume ident
-                let next_is_arg_boundary = self.at(&TokenKind::Comma)
+            // A register reference (name, possibly with .field/.0 access) is a
+            // Reg arg when it is immediately followed by an argument boundary;
+            // anything else (operators, literals, arrays, calls) is a Val expr.
+            let save = self.pos;
+            let reg = self.try_parse_reg_ref();
+            match reg {
+                Some(name) if self.at(&TokenKind::Comma)
                     || self.at(&TokenKind::Semicolon)
                     || self.at(&TokenKind::RBrace)
-                    || self.at(&TokenKind::Eof);
-                if next_is_arg_boundary {
+                    || self.at(&TokenKind::Eof) => {
                     args.push(ExtArg::Reg(name));
-                } else {
-                    // Not a plain register ? rewind and parse as a full expression.
+                }
+                _ => {
                     self.pos = save;
                     args.push(ExtArg::Val(self.parse_expr()?));
                 }
-            } else {
-                args.push(ExtArg::Val(self.parse_expr()?));
             }
             if !self.eat(&TokenKind::Comma) { break; }
         }

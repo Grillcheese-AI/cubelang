@@ -57,6 +57,7 @@ pub mod op {
     pub const FILTER: u8         = 0x2F;
     pub const MAP_ROLES: u8      = 0x30;
     pub const REDUCE: u8         = 0x31;
+    pub const TEMPORAL_BIND: u8  = 0x32;
 }
 
 // ── Operand encoding ────────────────────────────────────────────────────────
@@ -94,6 +95,10 @@ fn ext_bytecode(o: ExtOp) -> u8 {
         ExtOp::Filter        => op::FILTER,
         ExtOp::MapRoles      => op::MAP_ROLES,
         ExtOp::Reduce        => op::REDUCE,
+        ExtOp::Push          => op::PUSH,
+        ExtOp::Sum           => op::SUM,
+        ExtOp::Compare       => op::COMPARE,
+        ExtOp::TemporalBind  => op::TEMPORAL_BIND,
     }
 }
 
