@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use cubelang::compiler::{self, CompiledProgram, op};
+use cubelang::vm::{VM, ExecResult};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -26,6 +27,7 @@ fn main() {
         "inspect" | "i" => cmd_inspect(&args[2..]),
         "disasm"  | "d" => cmd_disasm(&args[2..]),
         "check"   | "k" => cmd_check(&args[2..]),
+        "run"     | "r" => cmd_run(&args[2..]),
         "version" | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
@@ -314,6 +316,76 @@ fn cmd_check(args: &[String]) {
         }
         Err(e) => {
             eprintln!("  {} error: {}", args[0], e);
+            process::exit(1);
+        }
+    }
+}
+
+// ── run ─────────────────────────────────────────────────────────────────────
+
+fn cmd_run(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: cubelang run <file.cube|file.cubebin> [--fn name] [--trace]");
+        process::exit(1);
+    }
+
+    let input = &args[0];
+    let mut target_fn = "solve".to_string();
+    let mut trace = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--fn" | "-f" => { if i + 1 < args.len() { target_fn = args[i + 1].clone(); i += 1; } }
+            "--trace" | "-t" => trace = true,
+            other => { eprintln!("warning: ignoring unknown option {}", other); }
+        }
+        i += 1;
+    }
+
+    // Load: compile .cube in-memory, or load a .cubebin directly.
+    let mut vm = VM::new();
+    vm.trace_enabled = trace;
+    let prog_name: String = if input.ends_with(".cubebin") {
+        match vm.load_file(Path::new(input)) {
+            Ok(name) => name,
+            Err(e) => { eprintln!("error: cannot load {}: {}", input, e); process::exit(1); }
+        }
+    } else {
+        let source = match std::fs::read_to_string(input) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("error: cannot read {}: {}", input, e); process::exit(1); }
+        };
+        let programs = match compiler::compile(&source) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+        };
+        if programs.is_empty() {
+            eprintln!("error: no programs in {}", input);
+            process::exit(1);
+        }
+        let name = programs[0].name.clone();
+        for p in programs { vm.load(p); }
+        name
+    };
+
+    // Run the constructor first if the program defines one (sets up storage).
+    let _ = vm.call(&prog_name, "constructor", Vec::new());
+
+    // Run the target function.
+    let result = vm.call(&prog_name, &target_fn, Vec::new());
+
+    if trace {
+        println!("# trace ({} ops):", vm.trace.len());
+        for line in &vm.trace { println!("  {}", line); }
+        println!();
+    }
+
+    match result {
+        ExecResult::Ok(val) | ExecResult::Return(val) => {
+            println!("  {}.{}() -> {}", prog_name, target_fn, val);
+        }
+        ExecResult::Error(e) => {
+            eprintln!("  {}.{}() runtime error: {}", prog_name, target_fn, e);
             process::exit(1);
         }
     }

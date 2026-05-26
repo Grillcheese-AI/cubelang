@@ -170,10 +170,53 @@ impl Parser {
             TokenKind::Async        => "async".into(),
             TokenKind::TyResponse   => "response".into(),
             TokenKind::TyRequest    => "request".into(),
+            // Extended reasoning opcodes — usable as identifiers everywhere
+            // except statement-leading position (where parse_stmt routes them
+            // to opcode parsing). This keeps natural names like `diff`, `score`,
+            // `match`, `filter`, `split` available as variables/types/fields.
+            TokenKind::OpSeq           => "seq".into(),
+            TokenKind::OpDiff          => "diff".into(),
+            TokenKind::OpDetectPattern => "detect_pattern".into(),
+            TokenKind::OpPredict       => "predict".into(),
+            TokenKind::OpDebate        => "debate".into(),
+            TokenKind::OpDiscover      => "discover".into(),
+            TokenKind::OpDecode        => "decode".into(),
+            TokenKind::OpScore         => "score".into(),
+            TokenKind::OpSpecialize    => "specialize".into(),
+            TokenKind::OpReward        => "reward".into(),
+            TokenKind::OpInfer         => "infer".into(),
+            TokenKind::OpMerge         => "merge".into(),
+            TokenKind::OpSplit         => "split".into(),
+            TokenKind::OpFilter        => "filter".into(),
+            TokenKind::OpMapRoles      => "map_roles".into(),
+            TokenKind::OpReduce        => "reduce".into(),
+            TokenKind::OpTemporalBind  => "temporal_bind".into(),
+            TokenKind::OpAnalogy       => "analogy".into(),
+            TokenKind::OpGen           => "gen".into(),
+            TokenKind::OpInst          => "inst".into(),
+            TokenKind::OpBroadcast     => "broadcast".into(),
+            TokenKind::OpExplore       => "explore".into(),
+            TokenKind::OpForge         => "forge".into(),
+            TokenKind::OpAsk           => "ask".into(),
+            TokenKind::OpSync          => "sync".into(),
+            TokenKind::OpForget        => "forget".into(),
+            TokenKind::OpCond          => "cond".into(),
+            TokenKind::OpLoop          => "loop".into(),
+            TokenKind::OpTransfer      => "transfer".into(),
+            TokenKind::OpCompare       => "compare".into(),
+            TokenKind::OpBindRole      => "bind_role".into(),
             _ => return Err(self.err(format!("expected identifier, got {:?}", self.tokens[self.pos].kind))),
         };
         self.pos += 1;
         Ok(name)
+    }
+
+    /// True if `kind` can stand in as an identifier in expression / name
+    /// position — i.e. any opcode keyword. These are contextual: opcode at a
+    /// statement start parses as an opcode (via parse_stmt's dispatch), but as
+    /// a value/name elsewhere it is an ordinary identifier.
+    fn kind_is_ident_like(&self, kind: &TokenKind) -> bool {
+        kind.is_opcode()
     }
 
     fn expect_string(&mut self) -> PResult<String> {
@@ -1644,6 +1687,14 @@ impl Parser {
                 let args = self.parse_args()?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(Expr::Call(Box::new(Expr::Ident(name)), args))
+            }
+
+            // Opcode keywords (and other contextual keywords) used as a value
+            // in expression position — treat as an identifier reference, then
+            // allow normal postfix (.field / call / index) via the caller.
+            tok if self.kind_is_ident_like(&tok) => {
+                let name = self.expect_ident()?;
+                Ok(Expr::Ident(name))
             }
 
             _ => Err(self.err(format!("unexpected token in expression: {:?}", self.peek()))),
