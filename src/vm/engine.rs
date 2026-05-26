@@ -666,16 +666,26 @@ fn num_binop(a: &Value, b: &Value, op: char) -> Value {
             Value::Float(r)
         }
     } else {
+        // Integer operands. Division uses TRUE division (matching GSM8K's
+        // `<<60/100=0.6>>` semantics): if the quotient is non-integral, promote
+        // to Float; otherwise stay Int. +,-,* stay integer.
         let x = a.as_i64();
         let y = b.as_i64();
-        let r = match op {
-            '+' => x + y,
-            '-' => x - y,
-            '*' => x * y,
-            '/' => if y != 0 { x / y } else { 0 },
-            _ => 0,
-        };
-        Value::Int(r)
+        match op {
+            '+' => Value::Int(x + y),
+            '-' => Value::Int(x - y),
+            '*' => Value::Int(x * y),
+            '/' => {
+                if y != 0 && x % y == 0 {
+                    Value::Int(x / y)
+                } else if y != 0 {
+                    Value::Float(x as f64 / y as f64)
+                } else {
+                    Value::Int(0)
+                }
+            }
+            _ => Value::Int(0),
+        }
     }
 }
 
@@ -1088,6 +1098,44 @@ mod tests {
         "#);
         match vm.call("T", "run", Vec::new()) {
             ExecResult::Ok(v) => assert!((v.as_f64() - 3.5).abs() < 1e-9, "got {}", v.as_f64()),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vm_true_division_int_operands() {
+        // 60 / 100 = 0.6 (true division on integer operands, not floor → 0).
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create v : quantity;
+                    assign v = 60;
+                    div v, 100;
+                    sum v;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert!((v.as_f64() - 0.6).abs() < 1e-9, "got {}", v.as_f64()),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vm_exact_int_division_stays_int() {
+        // 16 / 2 = 8 stays integer.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create v : quantity;
+                    assign v = 16;
+                    div v, 2;
+                    sum v;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 8),
             other => panic!("unexpected: {:?}", other),
         }
     }
