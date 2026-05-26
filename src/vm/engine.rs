@@ -233,37 +233,42 @@ impl VM {
 
                 op::ADD => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = self.resolve_i64(operands.get(1));
-                    self.trace_op(pc, &format!("ADD {} {}", name, n));
-                    let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
-                    self.registers.insert(name, Value::Int(cur + n));
+                    let rhs = self.resolve_value(operands.get(1));
+                    let cur = self.registers.get(&name).cloned().unwrap_or(Value::Int(0));
+                    let out = num_binop(&cur, &rhs, '+');
+                    self.trace_op(pc, &format!("ADD {} {} → {}", name, rhs, out));
+                    self.registers.insert(name, out);
                 }
 
                 op::SUB => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = self.resolve_i64(operands.get(1));
-                    self.trace_op(pc, &format!("SUB {} {}", name, n));
-                    let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
-                    self.registers.insert(name, Value::Int(cur - n));
+                    let rhs = self.resolve_value(operands.get(1));
+                    let cur = self.registers.get(&name).cloned().unwrap_or(Value::Int(0));
+                    let out = num_binop(&cur, &rhs, '-');
+                    self.trace_op(pc, &format!("SUB {} {} → {}", name, rhs, out));
+                    self.registers.insert(name, out);
                 }
 
                 op::MUL => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = self.resolve_i64(operands.get(1));
-                    self.trace_op(pc, &format!("MUL {} {}", name, n));
-                    let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
-                    self.registers.insert(name, Value::Int(cur * n));
+                    let rhs = self.resolve_value(operands.get(1));
+                    let cur = self.registers.get(&name).cloned().unwrap_or(Value::Int(0));
+                    let out = num_binop(&cur, &rhs, '*');
+                    self.trace_op(pc, &format!("MUL {} {} → {}", name, rhs, out));
+                    self.registers.insert(name, out);
                 }
 
                 op::DIV => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = self.resolve_i64(operands.get(1));
-                    self.trace_op(pc, &format!("DIV {} {}", name, n));
-                    if n == 0 {
+                    let rhs = self.resolve_value(operands.get(1));
+                    // Division by zero (int or float) is an error.
+                    if rhs.as_f64() == 0.0 {
                         return ExecResult::Error("division by zero".into());
                     }
-                    let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
-                    self.registers.insert(name, Value::Int(cur / n));
+                    let cur = self.registers.get(&name).cloned().unwrap_or(Value::Int(0));
+                    let out = num_binop(&cur, &rhs, '/');
+                    self.trace_op(pc, &format!("DIV {} {} → {}", name, rhs, out));
+                    self.registers.insert(name, out);
                 }
 
                 op::SUM => {
@@ -548,8 +553,22 @@ impl VM {
     fn resolve_i64(&self, op: Option<&Operand>) -> i64 {
         match op {
             Some(Operand::Imm(n)) => *n,
+            Some(Operand::FloatImm(f)) => *f as i64,
             Some(o) => self.registers.get(&o.as_name()).map(|v| v.as_i64()).unwrap_or(0),
             None => 0,
+        }
+    }
+
+    /// Resolve an operand to a Value, preserving int vs float so arithmetic
+    /// can promote correctly. Named operands resolve to the register's value.
+    fn resolve_value(&self, op: Option<&Operand>) -> Value {
+        match op {
+            Some(Operand::Imm(n)) => Value::Int(*n),
+            Some(Operand::FloatImm(f)) => Value::Float(*f),
+            Some(o @ Operand::Named(_)) => {
+                self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Int(0))
+            }
+            _ => Value::Int(0),
         }
     }
 
@@ -584,6 +603,7 @@ impl VM {
 enum Operand {
     Named([u8; 2]),
     Imm(i64),
+    FloatImm(f64),
     Type([u8; 2]),
     Role([u8; 2]),
     Global([u8; 2]),
@@ -598,6 +618,7 @@ impl Operand {
             Operand::Type(h) => format!("t_{:02x}{:02x}", h[0], h[1]),
             Operand::Role(h) => format!("role_{:02x}{:02x}", h[0], h[1]),
             Operand::Imm(n) => format!("imm_{}", n),
+            Operand::FloatImm(f) => format!("fimm_{}", f),
             Operand::None => "_".into(),
         }
     }
@@ -605,6 +626,7 @@ impl Operand {
     fn to_value(&self) -> Value {
         match self {
             Operand::Imm(n) => Value::Int(*n),
+            Operand::FloatImm(f) => Value::Float(*f),
             Operand::Named(h) => Value::Str(format!("r_{:02x}{:02x}", h[0], h[1])),
             Operand::Global(h) => Value::Str(format!("g_{:02x}{:02x}", h[0], h[1])),
             _ => Value::Null,
@@ -618,6 +640,42 @@ impl Operand {
             Operand::Global(h) | Operand::Named(h) => Some(*h),
             _ => None,
         }
+    }
+}
+
+/// Numeric binary operation with int/float promotion. If either operand is a
+/// float, compute in f64 and return a Float (collapsing to Int when the result
+/// is integral, so whole-valued results print cleanly). Otherwise integer math.
+fn num_binop(a: &Value, b: &Value, op: char) -> Value {
+    let a_is_float = matches!(a, Value::Float(_));
+    let b_is_float = matches!(b, Value::Float(_));
+    if a_is_float || b_is_float {
+        let x = a.as_f64();
+        let y = b.as_f64();
+        let r = match op {
+            '+' => x + y,
+            '-' => x - y,
+            '*' => x * y,
+            '/' => x / y,
+            _ => 0.0,
+        };
+        // Collapse integral floats back to Int for clean output / comparison.
+        if r.fract() == 0.0 && r.is_finite() {
+            Value::Int(r as i64)
+        } else {
+            Value::Float(r)
+        }
+    } else {
+        let x = a.as_i64();
+        let y = b.as_i64();
+        let r = match op {
+            '+' => x + y,
+            '-' => x - y,
+            '*' => x * y,
+            '/' => if y != 0 { x / y } else { 0 },
+            _ => 0,
+        };
+        Value::Int(r)
     }
 }
 
@@ -694,6 +752,17 @@ fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
         0x05 => { // Global
             if bytes.len() >= 3 {
                 (Operand::Global([bytes[1], bytes[2]]), 3)
+            } else {
+                (Operand::None, 1)
+            }
+        }
+        0x06 => { // FloatImm (f64 LE)
+            if bytes.len() >= 9 {
+                let val = f64::from_le_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4],
+                    bytes[5], bytes[6], bytes[7], bytes[8],
+                ]);
+                (Operand::FloatImm(val), 9)
             } else {
                 (Operand::None, 1)
             }
@@ -983,6 +1052,44 @@ mod tests {
         "#);
         vm.call("T", "run", Vec::new());
         assert_eq!(vm.get("__cmp").map(|v| v.as_str()), Some("equal".to_string()));
+    }
+
+    #[test]
+    fn test_vm_float_arithmetic() {
+        // 80000 * 1.5 = 120000 (real fractional multiply, integral result).
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create v : quantity;
+                    assign v = 80000;
+                    mul v, 1.5;
+                    sum v;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 120000),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vm_float_nonintegral_result() {
+        // 7 / 2 = 3.5 — non-integral float preserved.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create v : quantity;
+                    assign v = 7;
+                    div v, 2.0;
+                    sum v;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert!((v.as_f64() - 3.5).abs() < 1e-9, "got {}", v.as_f64()),
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 
     #[test]

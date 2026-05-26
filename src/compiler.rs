@@ -74,6 +74,7 @@ const OP_IMM: u8    = 0x02;
 const OP_TYPE: u8   = 0x03;
 const OP_ROLE: u8   = 0x04;
 const OP_GLOBAL: u8 = 0x05;
+const OP_FLOAT: u8  = 0x06;
 const OP_NONE: u8   = 0x00;
 
 /// BLAKE3 2-byte prefix of a string (deterministic hash).
@@ -720,7 +721,7 @@ impl Compiler {
     fn compile_expr_operand(&mut self, expr: &Expr) {
         match expr {
             Expr::IntLit(n) => self.emit_imm(*n),
-            Expr::FloatLit(f) => self.emit_imm(*f as i64),
+            Expr::FloatLit(f) => self.emit_float_imm(*f),
             Expr::StringLit(s) => self.emit_global(s),
             Expr::BoolLit(b) => self.emit_imm(if *b { 1 } else { 0 }),
             Expr::Null => self.emit_imm(0),
@@ -786,6 +787,13 @@ impl Compiler {
 
     fn emit_imm(&mut self, val: i64) {
         self.emit_byte(OP_IMM);
+        for b in val.to_le_bytes() {
+            self.emit_byte(b);
+        }
+    }
+
+    fn emit_float_imm(&mut self, val: f64) {
+        self.emit_byte(OP_FLOAT);
         for b in val.to_le_bytes() {
             self.emit_byte(b);
         }
