@@ -46,6 +46,7 @@ USAGE:
 
 COMMANDS:
     compile, c    Compile .cube to .cubebin
+    run,     r    Compile (or load .cubebin) and execute a program
     inspect, i    Show .cubebin program info
     disasm,  d    Disassemble .cubebin to readable opcodes
     check,   k    Parse and check .cube without compiling
@@ -57,6 +58,7 @@ EXAMPLES:
     cubelang inspect build/gsm8k.cubebin
     cubelang disasm build/gsm8k.cubebin
     cubelang check examples/gsm8k.cube
+    cubelang run examples/fibonacci.cube --trace
 "#);
 }
 

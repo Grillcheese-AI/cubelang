@@ -429,22 +429,112 @@ impl VM {
                 op::CALL => {
                     let target = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     self.trace_op(pc, &format!("CALL {}", target));
+                    // Intra-program call resolution is a documented follow-up;
+                    // recorded as a structural step so traces stay faithful.
                 }
+
+                // ── Data-movement opcodes (value-level semantics) ──────────
+
+                op::DESTROY => {
+                    let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    self.registers.remove(&name);
+                    self.trace_op(pc, &format!("DESTROY {}", name));
+                }
+
+                op::COPY => {
+                    let src = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let dst = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                    let val = self.registers.get(&src).cloned().unwrap_or(Value::Null);
+                    self.trace_op(pc, &format!("COPY {} → {}", src, dst));
+                    self.registers.insert(dst, val);
+                }
+
+                op::TRANSFER => {
+                    // TRANSFER src, dst, amount: move `amount` from src to dst.
+                    let src = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let dst = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                    let amount = self.resolve_i64(operands.get(2));
+                    let s = self.registers.get(&src).map(|v| v.as_i64()).unwrap_or(0);
+                    let d = self.registers.get(&dst).map(|v| v.as_i64()).unwrap_or(0);
+                    self.registers.insert(src.clone(), Value::Int(s - amount));
+                    self.registers.insert(dst.clone(), Value::Int(d + amount));
+                    self.trace_op(pc, &format!("TRANSFER {} → {} ({})", src, dst, amount));
+                }
+
+                op::UNBIND => {
+                    let reg = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let role = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                    self.registers.remove(&format!("{}.{}", reg, role));
+                    self.trace_op(pc, &format!("UNBIND {} {}", reg, role));
+                }
+
+                op::NEWVAR => {
+                    // Fresh type/value variable — create an uninitialised register.
+                    let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    self.registers.entry(name.clone()).or_insert(Value::Null);
+                    self.trace_op(pc, &format!("NEWVAR {}", name));
+                }
+
+                // ── Type-inference & reasoning opcodes ─────────────────────
+                // These operate at the VSA / semantic level (the trunk binding
+                // head + arena per the architecture), not at the VM's value
+                // level. The VM records them as well-formed structural steps so
+                // a thought-program executes and verifies cleanly; it does not
+                // fabricate value-level semantics it cannot faithfully provide.
 
                 op::UNIFY => {
                     let a = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     let b = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
                     self.trace_op(pc, &format!("UNIFY {} {}", a, b));
                 }
+                op::INST => self.trace_structural(pc, "INST", &operands),
+                op::GEN => self.trace_structural(pc, "GEN", &operands),
+                op::SEQ => self.trace_structural(pc, "SEQ", &operands),
+                op::DIFF => self.trace_structural(pc, "DIFF", &operands),
+                op::DETECT_PATTERN => self.trace_structural(pc, "DETECT_PATTERN", &operands),
+                op::PREDICT => self.trace_structural(pc, "PREDICT", &operands),
+                op::MATCH => self.trace_structural(pc, "MATCH", &operands),
+                op::DEBATE => self.trace_structural(pc, "DEBATE", &operands),
+                op::DISCOVER => self.trace_structural(pc, "DISCOVER", &operands),
+                op::DECODE => self.trace_structural(pc, "DECODE", &operands),
+                op::SCORE => self.trace_structural(pc, "SCORE", &operands),
+                op::SPECIALIZE => self.trace_structural(pc, "SPECIALIZE", &operands),
+                op::REWARD => self.trace_structural(pc, "REWARD", &operands),
+                op::INFER => self.trace_structural(pc, "INFER", &operands),
+                op::MERGE => self.trace_structural(pc, "MERGE", &operands),
+                op::SPLIT => self.trace_structural(pc, "SPLIT", &operands),
+                op::FILTER => self.trace_structural(pc, "FILTER", &operands),
+                op::MAP_ROLES => self.trace_structural(pc, "MAP_ROLES", &operands),
+                op::REDUCE => self.trace_structural(pc, "REDUCE", &operands),
+                op::TEMPORAL_BIND => self.trace_structural(pc, "TEMPORAL_BIND", &operands),
+                op::ANALOGY => self.trace_structural(pc, "ANALOGY", &operands),
+                op::BROADCAST => self.trace_structural(pc, "BROADCAST", &operands),
+                op::EXPLORE => self.trace_structural(pc, "EXPLORE", &operands),
+                op::FORGE => self.trace_structural(pc, "FORGE", &operands),
+                op::ASK => self.trace_structural(pc, "ASK", &operands),
+                op::SYNC => self.trace_structural(pc, "SYNC", &operands),
 
                 _ => {
+                    // A truly unknown opcode byte means malformed bytecode — a
+                    // real invariant violation, not something to skip silently.
                     self.trace_op(pc, &format!("UNKNOWN 0x{:02x}", opcode));
+                    return ExecResult::Error(format!("unknown opcode 0x{:02x} at pc {}", opcode, pc));
                 }
             }
         }
 
         // Return the accumulator as the result
         ExecResult::Ok(self.accumulator.clone())
+    }
+
+    /// Trace a reasoning/VSA opcode as a well-formed structural step. The
+    /// operands are rendered for trace fidelity but no value-level mutation is
+    /// performed (these resolve in the trunk's hyperdimensional machinery).
+    fn trace_structural(&mut self, pc: usize, name: &str, operands: &[Operand]) {
+        if self.trace_enabled {
+            let args: Vec<String> = operands.iter().map(|o| o.as_name()).collect();
+            self.trace.push(format!("0x{:04x}: {} [{}]", pc, name, args.join(", ")));
+        }
     }
 
     fn trace_op(&mut self, offset: usize, desc: &str) {
