@@ -1,0 +1,78 @@
+# decision_min.cube - A-tier reasoning kernel: threshold decision.
+# Compositional pattern: parse -> store observation -> recall threshold ->
+# COMPARE -> branch (approve/reject) -> score -> verify.
+# Exercises BOTH halves of the VM: hippocampal memory (store/recall/remember)
+# AND control flow (if/else on a comparison). This is genuine stateful
+# reasoning, not a flat snippet.
+
+interface ISolver {
+    type Input;
+    type Output;
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+}
+
+program DecisionMin implements ISolver {
+    type Input = quantity;
+    type Output = quantity;
+
+    storage {
+        threshold: mutable u64 = 0;
+        decisions_made: mutable u64 = 0;
+        last_decision: mutable str = "";
+    }
+
+    @system @once
+    public function constructor() {
+        assign threshold = 50;
+        assign decisions_made = 0;
+        assign last_decision = "none";
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return raw;
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        # observation under evaluation
+        create observation : quantity;
+        assign observation = 72;
+        store observation, "current_observation";
+
+        # the decision threshold (recall the gating value)
+        create gate_value : quantity;
+        assign gate_value = 50;
+        store gate_value, "gate_threshold";
+
+        # confidence score accumulator
+        create confidence : quantity;
+        assign confidence = 0;
+
+        # DECISION: if observation exceeds the gate_value, approve; else reject.
+        if (observation > gate_value) {
+            add confidence, 80;
+            assign last_decision = "approve";
+            store confidence, "approve_confidence";
+        } else {
+            add confidence, 20;
+            assign last_decision = "reject";
+            store confidence, "reject_confidence";
+        }
+
+        # commit the decision to memory
+        query confidence;
+        remember confidence;
+        add decisions_made, 1;
+
+        sum confidence;
+        return confidence;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}
