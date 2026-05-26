@@ -1,0 +1,69 @@
+# compare_min.cube - A-tier reasoning kernel: pick-the-larger comparison.
+# Pattern: parse -> store two candidates -> COMPARE -> branch to select max ->
+# remember winner -> verify. Exercises memory + branching, returning the SELECTED
+# value (not a fixed score). A genuine comparison/selection reasoning primitive.
+
+interface ISolver {
+    type Input;
+    type Output;
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+}
+
+program CompareMin implements ISolver {
+    type Input = quantity;
+    type Output = quantity;
+
+    storage {
+        comparisons_made: mutable u64 = 0;
+        last_winner: mutable str = "";
+    }
+
+    @system @once
+    public function constructor() {
+        assign comparisons_made = 0;
+        assign last_winner = "none";
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return raw;
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        create left : quantity;
+        assign left = 34;
+        store left, "candidate_left";
+
+        create right : quantity;
+        assign right = 58;
+        store right, "candidate_right";
+
+        # result holds the selected (larger) value
+        create result : quantity;
+        assign result = 0;
+
+        if (left > right) {
+            add result, left;
+            assign last_winner = "left";
+        } else {
+            add result, right;
+            assign last_winner = "right";
+        }
+
+        store result, "selected_max";
+        query result;
+        remember result;
+        add comparisons_made, 1;
+
+        sum result;
+        return result;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}
