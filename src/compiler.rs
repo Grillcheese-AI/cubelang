@@ -621,10 +621,10 @@ impl Compiler {
         let else_label = self.fresh_label("else");
         let end_label = self.fresh_label("endif");
 
-        // Condition → COND jump to else
-        self.emit_debug(op::COND, "if");
-        self.compile_expr_discard(&if_stmt.condition);
-        self.emit_jmp(&else_label);
+        // Evaluate condition → sets the VM comparison flag.
+        self.compile_condition(&if_stmt.condition);
+        // COND: jump to else_label if the flag is FALSE (skip the then-body).
+        self.emit_cond_jump(&else_label);
 
         // Then body
         for s in &if_stmt.then_body {
@@ -641,24 +641,26 @@ impl Compiler {
                 self.compile_stmt(s);
             }
         }
-
-        if if_stmt.else_body.is_some() {
-            self.emit_label(&end_label);
-        }
+        self.emit_label(&end_label);
     }
 
     fn compile_for(&mut self, for_stmt: &ForStmt) {
+        // Note: for-each iteration source is not yet value-level in the VM;
+        // we emit the body once under a LOOP marker with proper labels so the
+        // control-flow structure is well-formed and executable (single pass).
         let loop_label = self.fresh_label("for");
         let end_label = self.fresh_label("endfor");
 
         self.emit_label(&loop_label);
         self.emit_debug(op::LOOP, &format!("for {} of ...", for_stmt.binding));
+        self.emit_byte(op::LOOP);
+        self.emit_byte(1);
+        self.emit_global(&end_label); // LOOP carries its exit label
 
         for s in &for_stmt.body {
             self.compile_stmt(s);
         }
 
-        self.emit_jmp(&loop_label);
         self.emit_label(&end_label);
     }
 
@@ -666,14 +668,18 @@ impl Compiler {
         let loop_label = self.fresh_label("while");
         let end_label = self.fresh_label("endwhile");
 
+        // loop_top:
         self.emit_label(&loop_label);
-        self.emit_debug(op::LOOP, "while");
-        self.compile_expr_discard(&while_stmt.condition);
+        // Evaluate condition → flag; COND jumps to end_label if false.
+        self.compile_condition(&while_stmt.condition);
+        self.emit_cond_jump(&end_label);
 
+        // body
         for s in &while_stmt.body {
             self.compile_stmt(s);
         }
 
+        // jump back to re-test the condition
         self.emit_jmp(&loop_label);
         self.emit_label(&end_label);
     }
@@ -819,6 +825,51 @@ impl Compiler {
         self.emit_byte(op::JMP);
         self.emit_byte(1);
         self.emit_global(label);
+    }
+
+    /// Emit a conditional jump: COND <label>. At runtime the VM jumps to
+    /// `label` if the comparison flag is FALSE (i.e. skip-if-false).
+    fn emit_cond_jump(&mut self, label: &str) {
+        self.emit_debug(op::COND, &format!("cond -> {}", label));
+        self.emit_byte(op::COND);
+        self.emit_byte(1);
+        self.emit_global(label);
+    }
+
+    /// Lower a boolean condition expression so it leaves a result in the VM's
+    /// comparison flag. Comparisons (`a > b`, `a == b`, ...) lower to a COMPARE
+    /// carrying the two operands plus a comparison-kind immediate. Any other
+    /// expression is compared against truthiness (`expr != 0`).
+    ///
+    /// COMPARE operand layout: [lhs, rhs, kind_imm] where kind ∈
+    /// 0=eq 1=ne 2=lt 3=le 4=gt 5=ge 6=truthy.
+    fn compile_condition(&mut self, cond: &Expr) {
+        if let Expr::BinOp(lhs, bop, rhs) = cond {
+            let kind: Option<i64> = match bop {
+                BinOp::Eq => Some(0),
+                BinOp::NotEq => Some(1),
+                BinOp::Lt => Some(2),
+                BinOp::LtEq => Some(3),
+                BinOp::Gt => Some(4),
+                BinOp::GtEq => Some(5),
+                _ => None, // And/Or/arithmetic: fall through to truthy below
+            };
+            if let Some(k) = kind {
+                self.emit_debug(op::COMPARE, &format!("cond {:?}", bop));
+                self.emit_byte(op::COMPARE);
+                self.emit_byte(3);
+                self.compile_expr_operand(lhs);
+                self.compile_expr_operand(rhs);
+                self.emit_imm(k);
+                return;
+            }
+        }
+        // Fallback: truthiness test of a single expression (kind = 6).
+        self.emit_debug(op::COMPARE, "cond truthy");
+        self.emit_byte(op::COMPARE);
+        self.emit_byte(2);
+        self.compile_expr_operand(cond);
+        self.emit_imm(6);
     }
 
     fn emit_debug(&mut self, opcode: u8, description: &str) {

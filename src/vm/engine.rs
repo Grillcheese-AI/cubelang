@@ -184,6 +184,15 @@ impl VM {
         let bc = &func.bytecode;
         let mut pc: usize = 0;
 
+        // Pre-scan pass: resolve LABEL hashes → bytecode offsets so JMP/COND
+        // can jump. We record the offset of the LABEL instruction itself
+        // (jumping there re-reads the LABEL as a no-op and continues).
+        let label_map = scan_labels(bc);
+        // Comparison flag set by COMPARE, tested by COND.
+        let mut flag: bool = false;
+        // Loop-iteration guard: bound total back-edges to prevent infinite
+        // loops from a malformed / non-terminating program reaching the VM.
+        let mut jump_budget: u64 = 1_000_000;
         while pc < bc.len() {
             let opcode = bc[pc]; pc += 1;
 
@@ -224,7 +233,7 @@ impl VM {
 
                 op::ADD => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = operands.get(1).map(|o| o.to_value().as_i64()).unwrap_or(0);
+                    let n = self.resolve_i64(operands.get(1));
                     self.trace_op(pc, &format!("ADD {} {}", name, n));
                     let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
                     self.registers.insert(name, Value::Int(cur + n));
@@ -232,7 +241,7 @@ impl VM {
 
                 op::SUB => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = operands.get(1).map(|o| o.to_value().as_i64()).unwrap_or(0);
+                    let n = self.resolve_i64(operands.get(1));
                     self.trace_op(pc, &format!("SUB {} {}", name, n));
                     let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
                     self.registers.insert(name, Value::Int(cur - n));
@@ -240,7 +249,7 @@ impl VM {
 
                 op::MUL => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = operands.get(1).map(|o| o.to_value().as_i64()).unwrap_or(1);
+                    let n = self.resolve_i64(operands.get(1));
                     self.trace_op(pc, &format!("MUL {} {}", name, n));
                     let cur = self.registers.get(&name).map(|v| v.as_i64()).unwrap_or(0);
                     self.registers.insert(name, Value::Int(cur * n));
@@ -248,7 +257,7 @@ impl VM {
 
                 op::DIV => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let n = operands.get(1).map(|o| o.to_value().as_i64()).unwrap_or(1);
+                    let n = self.resolve_i64(operands.get(1));
                     self.trace_op(pc, &format!("DIV {} {}", name, n));
                     if n == 0 {
                         return ExecResult::Error("division by zero".into());
@@ -335,26 +344,86 @@ impl VM {
                 }
 
                 op::COMPARE => {
-                    self.trace_op(pc, "COMPARE");
+                    // Operands: [a, b, kind_imm] (3-arg from a condition) or
+                    // [a, b] (2-arg statement-level compare, defaults to eq).
+                    let a = self.resolve_i64(operands.get(0));
+                    let kind = match operands.get(2) {
+                        Some(Operand::Imm(k)) => *k,
+                        _ => 0, // statement-level `compare a, b` → equality test
+                    };
+                    let b = if kind == 6 { 0 } else { self.resolve_i64(operands.get(1)) };
+                    flag = match kind {
+                        0 => a == b,
+                        1 => a != b,
+                        2 => a < b,
+                        3 => a <= b,
+                        4 => a > b,
+                        5 => a >= b,
+                        6 => a != 0, // truthiness
+                        _ => false,
+                    };
+                    // Expose the comparison result in a conventional register too.
+                    let cmp_word = match kind {
+                        0 | 1 => if a == b { "equal" } else if a < b { "less" } else { "greater" },
+                        _ => if flag { "true" } else { "false" },
+                    };
+                    self.registers.insert("__cmp".into(), Value::Str(cmp_word.into()));
+                    self.accumulator = Value::Bool(flag);
+                    self.trace_op(pc, &format!("COMPARE {} ? {} (kind {}) → {}", a, b, kind, flag));
                 }
 
                 op::LABEL => {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     self.trace_op(pc, &format!("LABEL {}", name));
+                    // Runtime no-op; targets were resolved in the pre-scan.
                 }
 
                 op::JMP => {
-                    let target = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    self.trace_op(pc, &format!("JMP {}", target));
-                    // For now, skip jumps (proper implementation needs label→offset resolution)
+                    let key = operands.get(0).and_then(|o| o.label_key());
+                    match key.and_then(|k| label_map.get(&k)) {
+                        Some(&target) => {
+                            self.trace_op(pc, &format!("JMP → 0x{:04x}", target));
+                            if jump_budget == 0 {
+                                return ExecResult::Error("jump budget exhausted (possible infinite loop)".into());
+                            }
+                            jump_budget -= 1;
+                            pc = target;
+                        }
+                        None => {
+                            self.trace_op(pc, "JMP (unresolved label, falling through)");
+                        }
+                    }
                 }
 
                 op::COND => {
-                    self.trace_op(pc, "COND");
+                    // Conditional jump: if the comparison flag is FALSE, jump to
+                    // the target label (skip the then-body / exit the loop).
+                    let key = operands.get(0).and_then(|o| o.label_key());
+                    if !flag {
+                        match key.and_then(|k| label_map.get(&k)) {
+                            Some(&target) => {
+                                self.trace_op(pc, &format!("COND false → jump 0x{:04x}", target));
+                                if jump_budget == 0 {
+                                    return ExecResult::Error("jump budget exhausted (possible infinite loop)".into());
+                                }
+                                jump_budget -= 1;
+                                pc = target;
+                            }
+                            None => {
+                                self.trace_op(pc, "COND false (unresolved label)");
+                            }
+                        }
+                    } else {
+                        self.trace_op(pc, "COND true → fall through");
+                    }
                 }
 
                 op::LOOP => {
-                    self.trace_op(pc, "LOOP");
+                    // Structural loop marker (for-each). The VM executes the body
+                    // as a single structured pass; the exit label is carried for
+                    // well-formedness. (Iterating a value-level collection source
+                    // is a documented follow-up.)
+                    self.trace_op(pc, "LOOP (structural marker)");
                 }
 
                 op::CALL => {
@@ -381,6 +450,16 @@ impl VM {
     fn trace_op(&mut self, offset: usize, desc: &str) {
         if self.trace_enabled {
             self.trace.push(format!("0x{:04x}: {}", offset, desc));
+        }
+    }
+
+    /// Resolve an operand to an i64 value: immediates pass through; named
+    /// registers are looked up in the register file (0 if unset).
+    fn resolve_i64(&self, op: Option<&Operand>) -> i64 {
+        match op {
+            Some(Operand::Imm(n)) => *n,
+            Some(o) => self.registers.get(&o.as_name()).map(|v| v.as_i64()).unwrap_or(0),
+            None => 0,
         }
     }
 
@@ -441,13 +520,54 @@ impl Operand {
             _ => Value::Null,
         }
     }
+
+    /// The raw 2-byte hash key for a Global/Named operand (used as a label /
+    /// jump-target identifier). `None` for immediates and absent operands.
+    fn label_key(&self) -> Option<[u8; 2]> {
+        match self {
+            Operand::Global(h) | Operand::Named(h) => Some(*h),
+            _ => None,
+        }
+    }
+}
+
+/// Pre-scan the bytecode for LABEL opcodes, mapping each label's 2-byte hash
+/// to the byte offset of the LABEL instruction itself. JMP/COND resolve their
+/// target label through this map. Mirrors the main loop's opcode/operand
+/// stride so offsets line up exactly.
+fn scan_labels(bc: &[u8]) -> std::collections::HashMap<[u8; 2], usize> {
+    let mut map = std::collections::HashMap::new();
+    let mut pc = 0usize;
+    while pc < bc.len() {
+        let here = pc;
+        let opcode = bc[pc]; pc += 1;
+        if opcode == op::SKIP {
+            continue;
+        }
+        if pc >= bc.len() { break; }
+        let n_ops = bc[pc] as usize; pc += 1;
+        let mut first_key: Option<[u8; 2]> = None;
+        for i in 0..n_ops {
+            if pc >= bc.len() { break; }
+            let (operand, consumed) = decode_operand(&bc[pc..]);
+            if i == 0 {
+                first_key = operand.label_key();
+            }
+            pc += consumed;
+        }
+        if opcode == op::LABEL {
+            if let Some(k) = first_key {
+                map.insert(k, here);
+            }
+        }
+    }
+    map
 }
 
 fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
     if bytes.is_empty() {
         return (Operand::None, 0);
     }
-
     match bytes[0] {
         0x01 => { // Named
             if bytes.len() >= 3 {
@@ -700,6 +820,79 @@ mod tests {
         assert!(vm.trace.iter().any(|t| t.contains("ASSIGN")));
         assert!(vm.trace.iter().any(|t| t.contains("ADD")));
         assert!(vm.trace.iter().any(|t| t.contains("SUM")));
+    }
+
+    #[test]
+    fn test_vm_if_then_branch() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create x : quantity;
+                    assign x = 5;
+                    if (x > 3) { assign x = 100; } else { assign x = 200; }
+                    sum x;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 100, "x=5, x>3 true → then-branch → 100"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vm_if_else_branch() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create x : quantity;
+                    assign x = 2;
+                    if (x > 3) { assign x = 100; } else { assign x = 200; }
+                    sum x;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 200, "x=2, x>3 false → else-branch → 200"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vm_while_loop_terminates_and_accumulates() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create total : quantity;
+                    assign total = 0;
+                    create i : quantity;
+                    assign i = 5;
+                    while (i > 0) { add total, 10; sub i, 1; }
+                    sum total;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 50, "5 iterations × 10 = 50"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vm_compare_sets_cmp_register() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create a : quantity;
+                    assign a = 7;
+                    create b : quantity;
+                    assign b = 7;
+                    compare a, b;
+                }
+            }
+        "#);
+        vm.call("T", "run", Vec::new());
+        assert_eq!(vm.get("__cmp").map(|v| v.as_str()), Some("equal".to_string()));
     }
 
     #[test]

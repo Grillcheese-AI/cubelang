@@ -1,0 +1,41 @@
+# fibonacci.cube - iterative Fibonacci via while-loop control flow.
+# Exercises: COMPARE / COND / JMP back-edge, register-to-register ADD, accumulator.
+# fib(10) = 55.  Sequence: 0 1 1 2 3 5 8 13 21 34 55
+
+program Fibonacci implements ISolver {
+    type Input = quantity;
+    type Output = quantity;
+
+    @external
+    public function solve(input: Input): Output {
+        # a = fib(0), b = fib(1)
+        create a : quantity;
+        assign a = 0;
+        create b : quantity;
+        assign b = 1;
+
+        # n = number of iterations (compute fib(n))
+        create n : quantity;
+        assign n = 10;
+
+        # while (n > 0): (a, b) <- (b, a + b); n <- n - 1
+        while (n > 0) {
+            create tmp : quantity;
+            assign tmp = 0;
+            add tmp, a;
+            add tmp, b;
+
+            assign a = 0;
+            add a, b;
+
+            assign b = 0;
+            add b, tmp;
+
+            sub n, 1;
+        }
+
+        sum a;
+        query a;
+        return a;
+    }
+}
