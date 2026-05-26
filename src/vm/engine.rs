@@ -5,6 +5,14 @@
 
 use std::collections::HashMap;
 use crate::compiler::{CompiledProgram, CompiledFunction, op};
+use crate::vm::memory::HippocampalMemory;
+
+/// Hypervector dimension for the VM's hippocampal memory. 4096 matches the
+/// codebook/index defaults ported from opcode-vsa-rs; quasi-orthogonality of
+/// distinct keys holds comfortably at this width.
+const MEM_DIM: usize = 4096;
+/// Fixed codebook seed so memory addresses are reproducible across runs.
+const MEM_SEED: u64 = 0xC0DEB00C;
 
 /// Runtime value.
 #[derive(Debug, Clone)]
@@ -88,8 +96,10 @@ pub struct VM {
     pub registers: HashMap<String, Value>,
     /// Stack for PUSH/POP chaining.
     pub stack: Vec<Value>,
-    /// Persistent storage (STORE/RECALL).
+    /// Persistent storage (STORE/RECALL) — exact-key fast path.
     pub storage: HashMap<String, Value>,
+    /// Hippocampal associative memory (VSA cleanup) for STORE/RECALL/REMEMBER/FORGET.
+    pub memory: HippocampalMemory,
     /// Accumulator (SUM results).
     pub accumulator: Value,
     /// Event log.
@@ -110,6 +120,7 @@ impl VM {
             registers: HashMap::new(),
             stack: Vec::new(),
             storage: HashMap::new(),
+            memory: HippocampalMemory::new(MEM_DIM, MEM_SEED),
             accumulator: Value::Null,
             events: Vec::new(),
             programs: HashMap::new(),
@@ -277,6 +288,8 @@ impl VM {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     let val = self.registers.get(&name).cloned().unwrap_or(Value::Null);
                     self.trace_op(pc, &format!("REMEMBER {} ({})", name, val));
+                    // Hippocampal store under the register's own name.
+                    self.memory.store(&name, val.clone());
                     self.storage.insert(name.clone(), val);
                 }
 
@@ -285,14 +298,31 @@ impl VM {
                     let key = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
                     let val = self.registers.get(&reg).cloned().unwrap_or(Value::Null);
                     self.trace_op(pc, &format!("STORE {} → {}", reg, key));
+                    // Associative store: key-hypervector addresses the payload.
+                    self.memory.store(&key, val.clone());
                     self.storage.insert(key, val);
                 }
 
                 op::RECALL => {
                     let key = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let val = self.storage.get(&key).cloned().unwrap_or(Value::Null);
-                    self.trace_op(pc, &format!("RECALL {} → {}", key, val));
-                    self.registers.insert(key, val);
+                    // Associative cleanup: nearest stored key by cosine similarity.
+                    match self.memory.recall(&key) {
+                        Some((matched, val, sim)) => {
+                            self.trace_op(pc, &format!("RECALL {} → {} (sim {:.3}) = {}", key, matched, sim, val));
+                            self.registers.insert(key, val);
+                        }
+                        None => {
+                            self.trace_op(pc, &format!("RECALL {} → (empty)", key));
+                            self.registers.insert(key, Value::Null);
+                        }
+                    }
+                }
+
+                op::FORGET => {
+                    let key = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let dropped = self.memory.forget(&key);
+                    self.storage.remove(&key);
+                    self.trace_op(pc, &format!("FORGET {} ({})", key, if dropped { "dropped" } else { "absent" }));
                 }
 
                 op::BIND_ROLE => {

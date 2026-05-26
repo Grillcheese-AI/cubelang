@@ -12,6 +12,7 @@
 pub mod hypervec;
 pub mod codebook;
 pub mod index;
+pub mod memory;
 pub mod engine;
 
 // Re-export the engine's public surface so existing `use cubelang::vm::{VM, ...}`
