@@ -1,0 +1,69 @@
+# loop_min.cube - A-tier reasoning kernel: bounded loop-accumulation.
+# Compositional pattern: parse -> init accumulator + counter -> WHILE (counter
+# > 0) { accumulate; decrement } -> store result -> verify.
+# Exercises the while-loop control flow (COMPARE + COND exit + JMP back-edge +
+# termination) plus hippocampal memory. A genuine iterative reasoning pattern:
+# "apply a step N times, accumulating a running total."
+
+interface ISolver {
+    type Input;
+    type Output;
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+}
+
+program LoopMin implements ISolver {
+    type Input = quantity;
+    type Output = quantity;
+
+    storage {
+        iterations_run: mutable u64 = 0;
+        last_total: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign iterations_run = 0;
+        assign last_total = 0;
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return raw;
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        # accumulate `step` per iteration over `count` iterations
+        create total : quantity;
+        assign total = 0;
+
+        create count : quantity;
+        assign count = 6;
+        store count, "loop_count";
+
+        create step : quantity;
+        assign step = 7;
+
+        # ITERATE: while count > 0, add step to total and decrement count
+        while (count > 0) {
+            add total, step;
+            sub count, 1;
+            add iterations_run, 1;
+        }
+
+        # commit the accumulated result to memory
+        store total, "accumulated_total";
+        query total;
+        remember total;
+
+        sum total;
+        return total;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}
