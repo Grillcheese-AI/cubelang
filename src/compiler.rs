@@ -37,7 +37,18 @@ pub mod op {
     pub const INST: u8      = 0x36;
     pub const GEN: u8       = 0x37;
     pub const NEWVAR: u8    = 0x38;
-    pub const SKIP: u8      = 0xFF;
+    /// Early-return opcode (Plan-1). 0 operands: `RETURN` yields the current
+    /// accumulator. 1 operand: `RETURN <v>` resolves v (Imm/Float/Named) and
+    /// sets the accumulator before exiting. Lifts `Stmt::Return` out of
+    /// the SKIP-fallback that lets execution silently run past it.
+    pub const RETURN: u8    = 0x39;
+    /// Plan-3 array opcodes. MAKE_ARRAY builds a Value::Array in `dst` from N
+    /// element operands; LEN/INDEX inspect/extract from it. Pre-requisites for
+    /// real for-each lowering (Plan-4).
+    pub const MAKE_ARRAY: u8 = 0x3A;
+    pub const LEN: u8        = 0x3B;
+    pub const INDEX: u8      = 0x3C;
+    pub const SKIP: u8       = 0xFF;
 
     // Extended reasoning opcodes (canonical values from opcode-vsa-rs ir.rs).
     pub const SEQ: u8            = 0x16;
@@ -311,6 +322,12 @@ pub struct Compiler {
     labels: Vec<(String, usize)>,
     debug_lines: Vec<DebugLine>,
     label_counter: u32,
+    /// Strict mode: rejects non-executing constructs (P0-1). Errors accumulate
+    /// in `strict_errors`; the public `compile_strict` API surfaces them.
+    strict: bool,
+    strict_errors: Vec<String>,
+    current_program: String,
+    current_function: String,
 }
 
 impl Compiler {
@@ -320,7 +337,28 @@ impl Compiler {
             labels: Vec::new(),
             debug_lines: Vec::new(),
             label_counter: 0,
+            strict: false,
+            strict_errors: Vec::new(),
+            current_program: String::new(),
+            current_function: String::new(),
         }
+    }
+
+    pub fn new_strict() -> Self {
+        let mut c = Self::new();
+        c.strict = true;
+        c
+    }
+
+    fn strict_violation(&mut self, construct: &str, line: Option<u32>) {
+        let where_ = format!("{}::{}", self.current_program, self.current_function);
+        let msg = match line {
+            Some(l) => format!("strict: {} at line {} in {} (non-executing in safe-subset VM)",
+                construct, l, where_),
+            None => format!("strict: {} in {} (non-executing in safe-subset VM)",
+                construct, where_),
+        };
+        self.strict_errors.push(msg);
     }
 
     /// Compile a full source file.
@@ -337,6 +375,7 @@ impl Compiler {
     fn compile_program(&mut self, prog: &ProgramDecl) -> CompiledProgram {
         let mut functions = Vec::new();
         let mut storage_fields = Vec::new();
+        self.current_program = prog.name.clone();
 
         for item in &prog.body {
             match item {
@@ -364,6 +403,7 @@ impl Compiler {
         self.bytecode.clear();
         self.labels.clear();
         self.debug_lines.clear();
+        self.current_function = func.sig.name.clone();
 
         for stmt in &func.body {
             self.compile_stmt(stmt);
@@ -377,9 +417,36 @@ impl Compiler {
         }
     }
 
+    // ── Strict-mode safety check (P0-1) ─────────────────────────────────
+
+    fn strict_check_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            // Plan-4 lowered `for` to a real while+index loop, so it no longer
+            // counts as non-executing under strict mode.
+            Stmt::Match(m) => {
+                self.strict_violation("match (no arm selection at runtime)",
+                    Some(m.span.line));
+            }
+            // Plan-2: intra-program CALL now executes (snapshot/restore +
+            // stack-delivered return), so calls no longer trip strict mode.
+            Stmt::Opcode(OpcodeStmt::Extended { op: ext, .. }) => {
+                if is_trace_only_ext_op(*ext) {
+                    self.strict_violation(&format!("opcode {} (trace-only)", ext_name(*ext)), None);
+                }
+            }
+            Stmt::Opcode(OpcodeStmt::Unify { .. }) => {
+                self.strict_violation("opcode unify (trace-only)", None);
+            }
+            _ => {}
+        }
+    }
+
     // ── Statement compilation ───────────────────────────────────────────
 
     fn compile_stmt(&mut self, stmt: &Stmt) {
+        if self.strict {
+            self.strict_check_stmt(stmt);
+        }
         match stmt {
             Stmt::Opcode(op) => self.compile_opcode(op),
             Stmt::Let(l) => self.compile_let(l),
@@ -387,10 +454,22 @@ impl Compiler {
             Stmt::For(f) => self.compile_for(f),
             Stmt::While(w) => self.compile_while(w),
             Stmt::Match(m) => self.compile_match(m),
-            Stmt::Return(_) => {
-                // Return is handled by the VM runtime, emit SKIP as placeholder
-                self.emit_debug(op::SKIP, "return");
-                self.emit_byte(op::SKIP);
+            Stmt::Return(value) => {
+                // Plan-1: real early return. Bare `return;` → 0 operands.
+                // `return <expr>;` → 1 operand resolved at runtime.
+                match value {
+                    Some(expr) => {
+                        self.emit_debug(op::RETURN, "return value");
+                        self.emit_byte(op::RETURN);
+                        self.emit_byte(1);
+                        self.compile_expr_operand(expr);
+                    }
+                    None => {
+                        self.emit_debug(op::RETURN, "return");
+                        self.emit_byte(op::RETURN);
+                        self.emit_byte(0);
+                    }
+                }
             }
             Stmt::Atomic(a) => {
                 // Atomic block: snapshot ctx before, rollback on error
@@ -646,22 +725,86 @@ impl Compiler {
     }
 
     fn compile_for(&mut self, for_stmt: &ForStmt) {
-        // Note: for-each iteration source is not yet value-level in the VM;
-        // we emit the body once under a LOOP marker with proper labels so the
-        // control-flow structure is well-formed and executable (single pass).
-        let loop_label = self.fresh_label("for");
-        let end_label = self.fresh_label("endfor");
+        // Plan-4. Lower `for (let x of arr) { body }` to an index-based while:
+        //
+        //   ASSIGN __i = 0
+        //   LEN __n, arr_reg
+        //   LABEL loop_top
+        //   COMPARE __i, __n, kind=2(lt) ; COND -> loop_end
+        //   INDEX <binding>, arr_reg, __i
+        //   <body>
+        //   ADD __i, 1
+        //   JMP loop_top
+        //   LABEL loop_end
+        //
+        // The iteration source must be available as a register: if it's already
+        // an Ident we name it directly; otherwise we materialise it into a
+        // fresh temp (handles `for (let x of [1,2,3])` and similar) via a
+        // recursive compile_let.
+        let n_id = { self.label_counter += 1; self.label_counter };
+        let i_var   = format!("__for_i_{}",   n_id);
+        let n_var   = format!("__for_n_{}",   n_id);
+        let arr_var = format!("__for_arr_{}", n_id);
+        let loop_top = self.fresh_label("for_top");
+        let end_label = self.fresh_label("for_end");
 
-        self.emit_label(&loop_label);
-        self.emit_debug(op::LOOP, &format!("for {} of ...", for_stmt.binding));
-        self.emit_byte(op::LOOP);
-        self.emit_byte(1);
-        self.emit_global(&end_label); // LOOP carries its exit label
+        let arr_name: String = match &for_stmt.iter {
+            Expr::Ident(n) => n.clone(),
+            other => {
+                // Materialise into __for_arr_<n> via the same lowering used
+                // for any other `let`. Picks up ArrayLit -> MAKE_ARRAY.
+                let tmp_let = LetStmt {
+                    name: arr_var.clone(),
+                    ty: None,
+                    value: other.clone(),
+                    span: for_stmt.span,
+                };
+                self.compile_let(&tmp_let);
+                arr_var.clone()
+            }
+        };
 
+        // __i = 0
+        self.emit_byte(op::CREATE);  self.emit_byte(2);
+        self.emit_named(&i_var);     self.emit_type("auto");
+        self.emit_byte(op::ASSIGN);  self.emit_byte(2);
+        self.emit_named(&i_var);     self.emit_imm(0);
+
+        // LEN __n, arr_name
+        self.emit_debug(op::LEN, &format!("for: len {}", arr_name));
+        self.emit_byte(op::LEN);     self.emit_byte(2);
+        self.emit_named(&n_var);     self.emit_named(&arr_name);
+
+        // loop_top:
+        self.emit_label(&loop_top);
+
+        // COMPARE __i, __n, kind=2(lt) ; COND -> end
+        self.emit_debug(op::COMPARE, "for: i < n");
+        self.emit_byte(op::COMPARE); self.emit_byte(3);
+        self.emit_named(&i_var);     self.emit_named(&n_var);
+        self.emit_imm(2);
+        self.emit_cond_jump(&end_label);
+
+        // INDEX <binding>, arr_name, __i
+        self.emit_byte(op::CREATE);  self.emit_byte(2);
+        self.emit_named(&for_stmt.binding); self.emit_type("auto");
+        self.emit_debug(op::INDEX, &format!("for: {} = {}[i]", for_stmt.binding, arr_name));
+        self.emit_byte(op::INDEX);   self.emit_byte(3);
+        self.emit_named(&for_stmt.binding);
+        self.emit_named(&arr_name);
+        self.emit_named(&i_var);
+
+        // body
         for s in &for_stmt.body {
             self.compile_stmt(s);
         }
 
+        // ADD __i, 1
+        self.emit_byte(op::ADD);     self.emit_byte(2);
+        self.emit_named(&i_var);     self.emit_imm(1);
+
+        // JMP loop_top ; LABEL loop_end
+        self.emit_jmp(&loop_top);
         self.emit_label(&end_label);
     }
 
@@ -710,10 +853,87 @@ impl Compiler {
             self.emit_type("auto");
         }
 
+        // Plan-2: `let x = foo(args)` lowers to CALL + POP x so the callee's
+        // return value (stack-delivered) lands in x. Other RHS forms keep the
+        // existing ASSIGN path.
+        if let Expr::Call(callee, args) = &let_stmt.value {
+            self.emit_call(callee, args);
+            self.emit_debug(op::POP, &format!("pop {}", let_stmt.name));
+            self.emit_byte(op::POP);
+            self.emit_byte(1);
+            self.emit_named(&let_stmt.name);
+            return;
+        }
+
+        // Plan-3 array RHS lowerings.
+        match &let_stmt.value {
+            // let xs = [a, b, c] → MAKE_ARRAY xs, n, a, b, c
+            Expr::ArrayLit(elems) => {
+                self.emit_debug(op::MAKE_ARRAY,
+                    &format!("make_array {} (n={})", let_stmt.name, elems.len()));
+                self.emit_byte(op::MAKE_ARRAY);
+                self.emit_byte((elems.len() as u8).saturating_add(2));
+                self.emit_named(&let_stmt.name);
+                self.emit_imm(elems.len() as i64);
+                for e in elems { self.compile_expr_operand(e); }
+                return;
+            }
+            // let n = arr.len() → LEN n, arr (special-case the built-in;
+            // any other method falls through to the CALL path above).
+            Expr::MethodCall(obj, method, args) if method == "len" && args.is_empty() => {
+                if let Expr::Ident(arr) = obj.as_ref() {
+                    self.emit_debug(op::LEN, &format!("len {} = {}.len()", let_stmt.name, arr));
+                    self.emit_byte(op::LEN);
+                    self.emit_byte(2);
+                    self.emit_named(&let_stmt.name);
+                    self.emit_named(arr);
+                    return;
+                }
+            }
+            // let x = arr[i] → INDEX x, arr, i
+            Expr::Index(arr_expr, idx_expr) => {
+                if let Expr::Ident(arr) = arr_expr.as_ref() {
+                    self.emit_debug(op::INDEX,
+                        &format!("index {} = {}[...]", let_stmt.name, arr));
+                    self.emit_byte(op::INDEX);
+                    self.emit_byte(3);
+                    self.emit_named(&let_stmt.name);
+                    self.emit_named(arr);
+                    self.compile_expr_operand(idx_expr);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
         self.emit_byte(op::ASSIGN);
         self.emit_byte(2);
         self.emit_named(&let_stmt.name);
         self.compile_expr_operand(&let_stmt.value);
+    }
+
+    /// Plan-2: emit `CALL <fn_name>, arg0, ..., argN` with all args resolved
+    /// at call time. Method calls fall back to `CALL <method>, <receiver>` —
+    /// the receiver becomes arg0; full method dispatch is a later refinement.
+    fn emit_call(&mut self, callee: &Expr, args: &[Expr]) {
+        match callee {
+            Expr::Ident(name) => {
+                self.emit_debug(op::CALL, &format!("call {}({})", name, args.len()));
+                self.emit_byte(op::CALL);
+                self.emit_byte((args.len() + 1) as u8);
+                self.emit_global(name);
+                for a in args { self.compile_expr_operand(a); }
+            }
+            _ => {
+                self.emit_debug(op::CALL, "call <expr>");
+                self.emit_byte(op::CALL);
+                self.emit_byte((args.len() + 1) as u8);
+                self.emit_byte(OP_NONE);
+                self.emit_byte(0x00);
+                self.emit_byte(0x00);
+                for a in args { self.compile_expr_operand(a); }
+            }
+        }
     }
 
     // ── Expression compilation (to operand bytes) ───────────────────────
@@ -748,22 +968,25 @@ impl Compiler {
     fn compile_expr_discard(&mut self, expr: &Expr) {
         match expr {
             Expr::Call(callee, args) => {
-                self.emit_debug(op::CALL, "call");
-                self.emit_byte(op::CALL);
+                // Plan-2: emit CALL with args, then POP into __discard so the
+                // callee's return value (always pushed by CALL) doesn't leak
+                // onto the caller's value stack across the next statement.
+                self.emit_call(callee, args);
+                self.emit_byte(op::POP);
                 self.emit_byte(1);
-                if let Expr::Ident(name) = callee.as_ref() {
-                    self.emit_global(name);
-                } else {
-                    self.emit_byte(OP_NONE);
-                    self.emit_byte(0x00);
-                    self.emit_byte(0x00);
-                }
+                self.emit_named("__call_discard");
             }
-            Expr::MethodCall(obj, method, args) => {
+            Expr::MethodCall(_obj, method, args) => {
+                // v1: method becomes the fn name; receiver becomes arg0.
+                // (Full method dispatch is a later refinement.)
                 self.emit_debug(op::CALL, &format!(".{}()", method));
                 self.emit_byte(op::CALL);
-                self.emit_byte(1);
+                self.emit_byte((args.len() + 1) as u8);
                 self.emit_global(method);
+                for a in args { self.compile_expr_operand(a); }
+                self.emit_byte(op::POP);
+                self.emit_byte(1);
+                self.emit_named("__call_discard");
             }
             _ => {
                 // Side-effect-free expression — emit SKIP
@@ -906,6 +1129,46 @@ fn type_name(ty: &TypeExpr) -> String {
     }
 }
 
+/// True when this extended opcode does NOT execute value-level semantics in
+/// the current VM (it only emits a structural trace line). The strict-mode
+/// blocklist (P0-1) uses this; it is also the authoritative list for the
+/// `validate` subcommand (P0-3). The list mirrors `trace_structural` in
+/// `src/vm/engine.rs` — keep in sync as P2 opcodes start executing.
+pub fn is_trace_only_ext_op(o: ExtOp) -> bool {
+    matches!(o,
+        ExtOp::Infer | ExtOp::MapRoles | ExtOp::Filter | ExtOp::Score
+        | ExtOp::DetectPattern | ExtOp::Decode | ExtOp::Reduce | ExtOp::Merge
+        | ExtOp::Split | ExtOp::Debate | ExtOp::Predict | ExtOp::Discover
+        | ExtOp::Diff | ExtOp::Seq | ExtOp::Specialize | ExtOp::Reward
+        | ExtOp::Match | ExtOp::TemporalBind | ExtOp::Analogy | ExtOp::Gen
+        | ExtOp::Inst | ExtOp::Broadcast | ExtOp::Explore | ExtOp::Forge
+        | ExtOp::Ask | ExtOp::Sync
+    )
+}
+
+/// Canonical lowercase mnemonic for an extended opcode (matches the surface
+/// keyword in source).
+pub fn ext_name(o: ExtOp) -> &'static str {
+    match o {
+        ExtOp::Infer => "infer",            ExtOp::MapRoles => "map_roles",
+        ExtOp::Filter => "filter",          ExtOp::Score => "score",
+        ExtOp::DetectPattern => "detect_pattern",
+        ExtOp::Decode => "decode",          ExtOp::Reduce => "reduce",
+        ExtOp::Merge => "merge",            ExtOp::Split => "split",
+        ExtOp::Debate => "debate",          ExtOp::Predict => "predict",
+        ExtOp::Discover => "discover",      ExtOp::Diff => "diff",
+        ExtOp::Seq => "seq",                ExtOp::Specialize => "specialize",
+        ExtOp::Reward => "reward",          ExtOp::Match => "match",
+        ExtOp::Push => "push",              ExtOp::Sum => "sum",
+        ExtOp::Compare => "compare",        ExtOp::TemporalBind => "temporal_bind",
+        ExtOp::Analogy => "analogy",        ExtOp::Gen => "gen",
+        ExtOp::Inst => "inst",              ExtOp::Broadcast => "broadcast",
+        ExtOp::Explore => "explore",        ExtOp::Forge => "forge",
+        ExtOp::Ask => "ask",                ExtOp::Sync => "sync",
+        ExtOp::Forget => "forget",
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Compile CubeLang source to bytecode programs.
@@ -913,6 +1176,20 @@ pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::Pars
     let ast = crate::parser::parse(source)?;
     let mut compiler = Compiler::new();
     Ok(compiler.compile(&ast))
+}
+
+/// Compile in strict mode (P0-1): rejects any construct that compiles but does
+/// not execute under the safe-subset VM — extended trace-only opcodes,
+/// `for`, `match`, intra-program `call`. Returns one combined error string
+/// listing every violation (named construct + source line when available).
+pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
+    let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
+    let mut compiler = Compiler::new_strict();
+    let programs = compiler.compile(&ast);
+    if !compiler.strict_errors.is_empty() {
+        return Err(compiler.strict_errors.join("\n"));
+    }
+    Ok(programs)
 }
 
 #[cfg(test)]
@@ -1169,6 +1446,135 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── P0-1: --strict compile mode ──────────────────────────────────
+
+    #[test]
+    fn strict_qc_decision_compiles() {
+        let source = include_str!("../examples/qc_decision.cube");
+        let result = compile_strict(source);
+        assert!(result.is_ok(),
+            "qc_decision.cube (safe-subset reference) must compile under --strict: {:?}",
+            result.err());
+    }
+
+    #[test]
+    fn strict_accepts_for_now_that_it_executes() {
+        // Plan-4: `for` lowers to while+index; it executes for real and is
+        // no longer a strict-mode violation.
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    let xs = [1, 2, 3];
+                    create total : quantity;
+                    assign total = 0;
+                    for (let x of xs) {
+                        add total, x;
+                    }
+                    sum total;
+                }
+            }
+        "#;
+        compile_strict(source).expect("for must be accepted under --strict now");
+    }
+
+    #[test]
+    fn strict_rejects_match() {
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    match (x) {
+                        1 => { sum x; }
+                        _ => { query x; }
+                    }
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("match must be rejected in --strict");
+        let low = err.to_lowercase();
+        assert!(low.contains("match"), "error must name 'match': got: {}", err);
+        assert!(err.contains("line"), "error must include source line: got: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_trace_only_predict() {
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    predict x;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("predict must be rejected in --strict");
+        assert!(err.to_lowercase().contains("predict"),
+            "error must name 'predict': got: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_trace_only_infer() {
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    infer x;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("infer must be rejected in --strict");
+        assert!(err.to_lowercase().contains("infer"));
+    }
+
+    #[test]
+    fn strict_accepts_call_now_that_it_executes() {
+        // Plan-2: CALL is real. A program whose only "stub" risk is a call
+        // should now compile under --strict.
+        let source = r#"
+            program Test implements ISolver {
+                public function helper(): quantity {
+                    return 1;
+                }
+                public function run(): void {
+                    let r = helper();
+                    sum r;
+                }
+            }
+        "#;
+        compile_strict(source).expect("CALL must be accepted under --strict now");
+    }
+
+    #[test]
+    fn strict_reports_all_violations_not_just_first() {
+        // Two distinct violations on different lines — both should be reported.
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    predict x;
+                    infer y;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("both violations should be rejected");
+        let low = err.to_lowercase();
+        assert!(low.contains("predict"), "error must mention predict: {}", err);
+        assert!(low.contains("infer"),   "error must mention infer: {}", err);
+    }
+
+    #[test]
+    fn non_strict_compile_still_allows_trace_only() {
+        // Non-strict path must keep accepting these (regression guard).
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    predict x;
+                    infer y;
+                }
+            }
+        "#;
+        let programs = compile(source).expect("non-strict compile must accept trace-only ops");
+        assert_eq!(programs.len(), 1);
+        let func = &programs[0].functions[0];
+        assert!(func.bytecode.contains(&op::PREDICT));
+        assert!(func.bytecode.contains(&op::INFER));
     }
 
     #[test]

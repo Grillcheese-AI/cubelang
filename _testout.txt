@@ -1,0 +1,194 @@
+﻿cargo : warning: value assigned to `pos` is never read
+At C:\Users\grill\Documents\GitHub\cubelang\_verify.ps1:4 char:1
++ cargo test --release *>&1 | Out-File -Encoding utf8 _testout.txt
++ ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: value ...` is never read:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+   --> src\compiler.rs:215:23
+    |
+215 |         let mut pos = 0;
+    |                       ^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `zeroed` and `as_slice_mut` are never used
+   --> src\vm\hypervec.rs:93:19
+    |
+ 65 | impl Hypervec {
+    | ------------- associated items in this implementation
+...
+ 93 |     pub(crate) fn zeroed(dim: usize) -> Self {
+    |                   ^^^^^^
+...
+300 |     pub(crate) fn as_slice_mut(&mut self) -> &mut [i8] {
+    |                   ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `dim` is never read
+  --> src\vm\memory.rs:34:5
+   |
+29 | pub struct HippocampalMemory {
+   |            ----------------- field in this struct
+...
+34 |     dim: usize,
+   |     ^^^
+
+warning: `cubelang` (lib) generated 3 warnings
+warning: `cubelang` (lib test) generated 3 warnings (3 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running unittests src\lib.rs (target\release\deps\cubelang-82a2df269a9d5da1.exe)
+
+running 126 tests
+test compiler::tests::strict_accepts_call_now_that_it_executes ... ok
+test compiler::tests::non_strict_compile_still_allows_trace_only ... ok
+test compiler::tests::strict_rejects_match ... ok
+test compiler::tests::strict_rejects_trace_only_infer ... ok
+test compiler::tests::strict_accepts_for_now_that_it_executes ... ok
+test compiler::tests::strict_rejects_trace_only_predict ... ok
+test compiler::tests::strict_qc_decision_compiles ... ok
+test compiler::tests::strict_reports_all_violations_not_just_first ... ok
+test compiler::tests::test_compile_empty_program ... ok
+test compiler::tests::test_compile_bytecode_format ... ok
+test compiler::tests::test_compile_atomic_block ... ok
+test compiler::tests::test_compile_debug_lines ... ok
+test compiler::tests::test_compile_let_stmt ... ok
+test compiler::tests::test_compile_opcodes ... ok
+test compiler::tests::test_compile_gsm8k ... ok
+test compiler::tests::test_compile_with_control_flow ... ok
+test compiler::tests::test_cubebin_roundtrip ... ok
+test lexer::tests::test_lex_acid_keywords ... ok
+test compiler::tests::test_cubebin_gsm8k_full ... ok
+test lexer::tests::test_lex_assert ... ok
+test lexer::tests::test_lex_atomic_block ... ok
+test lexer::tests::test_lex_bytecode_keywords ... ok
+test lexer::tests::test_lex_bytecode_wasm_import ... ok
+test lexer::tests::test_lex_comments_skipped ... ok
+test lexer::tests::test_lex_container_declaration ... ok
+test lexer::tests::test_lex_empty ... ok
+test lexer::tests::test_lex_error_handling ... ok
+test lexer::tests::test_lex_full_program ... ok
+test lexer::tests::test_lex_function_decl ... ok
+test compiler::tests::test_cubebin_file_roundtrip ... ok
+test lexer::tests::test_lex_generic_type ... ok
+test lexer::tests::test_lex_keywords ... ok
+test lexer::tests::test_lex_literals ... ok
+test lexer::tests::test_lex_modifiers ... ok
+test lexer::tests::test_lex_opcode_statement ... ok
+test lexer::tests::test_lex_opcodes ... ok
+test lexer::tests::test_lex_operators ... ok
+test lexer::tests::test_lex_permissions ... ok
+test lexer::tests::test_lex_program_header ... ok
+test lexer::tests::test_lex_try_catch ... ok
+test lexer::tests::test_lex_types ... ok
+test lexer::tests::test_lex_world_extends ... ok
+test parser::tests::test_parse_atomic_try_assert ... ok
+test parser::tests::test_parse_container ... ok
+test parser::tests::test_parse_emit ... ok
+test parser::tests::test_parse_empty ... ok
+test parser::tests::test_parse_enum ... ok
+test parser::tests::test_parse_expressions ... ok
+test parser::tests::test_parse_if_for_match ... ok
+test parser::tests::test_parse_interface ... ok
+test parser::tests::test_parse_opcodes ... ok
+test parser::tests::test_parse_program_minimal ... ok
+test parser::tests::test_parse_storage_block ... ok
+test parser::tests::test_parse_struct ... ok
+test parser::tests::test_parse_world_extends ... ok
+test validate::tests::validate_call_is_not_flagged ... ok
+test validate::tests::validate_flags_match_with_line ... ok
+test validate::tests::validate_flags_predict_with_name ... ok
+test validate::tests::validate_for_is_not_flagged ... ok
+test validate::tests::validate_return_is_never_flagged ... ok
+test validate::tests::validate_qc_decision_is_clean ... ok
+test vm::codebook::tests::test_cache_consistency ... ok
+test vm::codebook::tests::test_determinism ... ok
+test vm::codebook::tests::test_different_seeds_give_different_vectors ... ok
+test vm::codebook::tests::test_different_symbols_orthogonal ... ok
+test vm::engine::tests::array_index_out_of_range_is_null ... ok
+test vm::engine::tests::array_index_returns_element ... ok
+test vm::engine::tests::array_literal_len_is_three ... ok
+test vm::engine::tests::assign_literal_int_unchanged ... ok
+test vm::engine::tests::assign_register_to_register_copies_value ... ok
+test vm::engine::tests::assign_register_to_register_then_arithmetic ... ok
+test vm::engine::tests::call_caller_locals_isolated ... ok
+test vm::engine::tests::call_depth_guard_returns_clean_error ... ok
+test vm::engine::tests::call_returns_value_via_stack ... ok
+test vm::engine::tests::call_recursion_factorial ... ok
+test vm::engine::tests::for_each_empty_array_runs_zero_iterations ... ok
+test vm::engine::tests::for_each_nested_loops_visit_every_pair ... ok
+test vm::engine::tests::for_each_sums_three_elements ... ok
+test vm::engine::tests::return_bare_yields_current_accumulator ... ok
+test vm::engine::tests::return_early_halts_with_value ... ok
+test vm::engine::tests::return_early_inside_if_skips_rest ... ok
+test vm::engine::tests::test_vm_basic_arithmetic ... ok
+test vm::engine::tests::test_vm_compare_sets_cmp_register ... ok
+test vm::engine::tests::test_vm_division_by_zero ... ok
+test vm::engine::tests::test_vm_exact_int_division_stays_int ... ok
+test vm::engine::tests::test_vm_float_arithmetic ... ok
+test vm::engine::tests::test_vm_float_nonintegral_result ... ok
+test vm::engine::tests::test_vm_if_else_branch ... ok
+test vm::engine::tests::test_vm_if_then_branch ... ok
+test vm::engine::tests::test_vm_multiple_functions ... ok
+test vm::engine::tests::test_vm_trace ... ok
+test vm::engine::tests::test_vm_store_recall ... ok
+test vm::engine::tests::test_vm_push_pop_chain ... ok
+test vm::engine::tests::test_vm_true_division_int_operands ... ok
+test vm::engine::tests::test_vm_while_loop_terminates_and_accumulates ... ok
+test vm::hypervec::tests::test_bind_associativity ... ok
+test vm::hypervec::tests::test_bind_commutativity ... ok
+test vm::hypervec::tests::test_bind_quasi_orthogonal_to_inputs ... ok
+test vm::hypervec::tests::test_bind_self_inverse ... ok
+test vm::hypervec::tests::test_bundle_chunked_matches_naive ... ok
+test vm::hypervec::tests::test_bundle_majority_vote ... ok
+test vm::hypervec::tests::test_cosine_sim_identical ... ok
+test vm::hypervec::tests::test_bundle_similar_to_inputs ... ok
+test vm::engine::tests::test_vm_load_cubebin ... ok
+test vm::engine::tests::test_vm_gsm8k_cubebin ... ok
+test vm::hypervec::tests::test_cosine_sim_packed_agrees_with_dot ... ok
+test vm::hypervec::tests::test_determinism ... ok
+test vm::hypervec::tests::test_cosine_sim_random_near_zero ... ok
+test vm::hypervec::tests::test_different_seeds_orthogonal ... ok
+test vm::hypervec::tests::test_hamming_dist_packed_agrees_with_naive ... ok
+test vm::hypervec::tests::test_pack_round_trip ... ok
+test vm::hypervec::tests::test_packed_self_dist_is_zero ... ok
+test vm::hypervec::tests::test_permute_changes_vector ... ok
+test vm::hypervec::tests::test_permute_invertible ... ok
+test vm::hypervec::tests::test_serde_bincode_roundtrip ... ok
+test vm::hypervec::tests::test_serde_json_roundtrip ... ok
+test vm::hypervec::tests::test_unbind_recovers_value ... ok
+test vm::hypervec::tests::test_weighted_bundle ... ok
+test vm::memory::tests::test_empty_recall_is_none ... ok
+test vm::memory::tests::test_forget ... ok
+test vm::memory::tests::test_overwrite_same_key ... ok
+test vm::memory::tests::test_recall_is_associative ... ok
+test vm::memory::tests::test_store_and_exact_recall ... ok
+test vm::hypervec::tests::test_save_load_json ... ok
+test vm::hypervec::tests::test_save_load_bin ... ok
+test vm::codebook::tests::test_many_symbols_quasi_orthogonal ... ok
+
+test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\main.rs (target\release\deps\cubelang-e1783aef4a7ed43a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\opcode_sync.rs (target\release\deps\opcode_sync-b0c3fbd551cb75f4.exe)
+
+running 1 test
+test opcode_bytes_match_opcode_vsa_rs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cubelang
+
+running 2 tests
+test src\vm\index.rs - vm::index (line 14) ... ignored
+test src\vm\index.rs - vm::index (line 35) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

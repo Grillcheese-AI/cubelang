@@ -23,12 +23,13 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "compile" | "c" => cmd_compile(&args[2..]),
-        "inspect" | "i" => cmd_inspect(&args[2..]),
-        "disasm"  | "d" => cmd_disasm(&args[2..]),
-        "check"   | "k" => cmd_check(&args[2..]),
-        "run"     | "r" => cmd_run(&args[2..]),
-        "version" | "v" | "--version" | "-v" => cmd_version(),
+        "compile"  | "c" => cmd_compile(&args[2..]),
+        "inspect"  | "i" => cmd_inspect(&args[2..]),
+        "disasm"   | "d" => cmd_disasm(&args[2..]),
+        "check"    | "k" => cmd_check(&args[2..]),
+        "validate" | "vd" => cmd_validate(&args[2..]),
+        "run"      | "r" => cmd_run(&args[2..]),
+        "version"  | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
             eprintln!("unknown command: {}", args[1]);
@@ -45,15 +46,17 @@ USAGE:
     cubelang <command> [options] <file>
 
 COMMANDS:
-    compile, c    Compile .cube to .cubebin
-    run,     r    Compile (or load .cubebin) and execute a program
-    inspect, i    Show .cubebin program info
-    disasm,  d    Disassemble .cubebin to readable opcodes
-    check,   k    Parse and check .cube without compiling
-    version, v    Print version
+    compile,  c    Compile .cube to .cubebin (use --strict to reject stubs)
+    run,      r    Compile (or load .cubebin) and execute a program
+    inspect,  i    Show .cubebin program info
+    disasm,   d    Disassemble .cubebin to readable opcodes
+    check,    k    Parse and check .cube without compiling
+    validate, vd   Report executing vs trace-only opcodes per function
+    version,  v    Print version
 
 EXAMPLES:
     cubelang compile examples/gsm8k.cube
+    cubelang compile --strict examples/qc_decision.cube
     cubelang compile examples/gsm8k.cube -o build/gsm8k.cubebin
     cubelang inspect build/gsm8k.cubebin
     cubelang disasm build/gsm8k.cubebin
@@ -71,13 +74,27 @@ fn cmd_version() {
 fn cmd_compile(args: &[String]) {
     if args.is_empty() {
         eprintln!("error: missing input file");
-        eprintln!("usage: cubelang compile <file.cube> [-o output.cubebin]");
+        eprintln!("usage: cubelang compile [--strict] <file.cube> [-o output.cubebin]");
         process::exit(1);
     }
 
-    let input = &args[0];
-    let output = if args.len() >= 3 && args[1] == "-o" {
-        PathBuf::from(&args[2])
+    // Parse flags and positional args. `--strict` (P0-1) rejects non-executing
+    // constructs (trace-only opcodes, `for`, `match`, intra-program `call`).
+    let mut strict = false;
+    let mut positional: Vec<&String> = Vec::new();
+    for arg in args {
+        if arg == "--strict" { strict = true; } else { positional.push(arg); }
+    }
+
+    if positional.is_empty() {
+        eprintln!("error: missing input file");
+        eprintln!("usage: cubelang compile [--strict] <file.cube> [-o output.cubebin]");
+        process::exit(1);
+    }
+
+    let input = positional[0];
+    let output = if positional.len() >= 3 && positional[1] == "-o" {
+        PathBuf::from(positional[2])
     } else {
         Path::new(input).with_extension("cubebin")
     };
@@ -91,12 +108,22 @@ fn cmd_compile(args: &[String]) {
         }
     };
 
-    // Compile
-    let programs = match compiler::compile(&source) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            process::exit(1);
+    // Compile (--strict surfaces non-executing constructs as hard errors).
+    let programs = if strict {
+        match compiler::compile_strict(&source) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error (--strict): {}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        match compiler::compile(&source) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
         }
     };
 
@@ -273,6 +300,8 @@ fn opcode_name(code: u8) -> &'static str {
         0x15 => "LABEL",      0x16 => "SEQ",        0x17 => "UNSEQ",
         0x21 => "REMEMBER",   0x34 => "SUM",        0x35 => "UNIFY",
         0x36 => "INST",       0x37 => "GEN",        0x38 => "NEWVAR",
+        0x39 => "RETURN",
+        0x3A => "MAKE_ARRAY", 0x3B => "LEN",       0x3C => "INDEX",
         0xFF => "SKIP",
         _ => "???",
     }
@@ -320,6 +349,37 @@ fn cmd_check(args: &[String]) {
             eprintln!("  {} error: {}", args[0], e);
             process::exit(1);
         }
+    }
+}
+
+// ── validate ────────────────────────────────────────────────────────────────
+
+fn cmd_validate(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: cubelang validate <file.cube>");
+        process::exit(1);
+    }
+
+    let source = match std::fs::read_to_string(&args[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", args[0], e);
+            process::exit(1);
+        }
+    };
+
+    let report = match cubelang::validate::validate(&source) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    print!("{}", report);
+    if !report.is_clean() {
+        eprintln!("\n{} trace-only / stub construct(s) found", report.finding_count());
+        process::exit(1);
     }
 }
 

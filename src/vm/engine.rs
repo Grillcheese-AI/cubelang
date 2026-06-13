@@ -112,7 +112,19 @@ pub struct VM {
     pub trace_enabled: bool,
     /// Name→hash mapping for reverse lookup.
     name_table: HashMap<[u8; 2], String>,
+    /// Plan-2: name of the program whose function is currently executing. Set
+    /// by `call()`; consulted by op::CALL to resolve sibling-function names.
+    current_program: Option<String>,
+    /// Plan-2: intra-program call recursion depth. Capped at MAX_CALL_DEPTH
+    /// so runaway recursion surfaces as an Error rather than a native overflow.
+    call_depth: u32,
 }
+
+/// Conservative recursion cap. exec_function has a sizeable per-frame
+/// footprint (registers/stack clones, operands buffer, label_map clone via
+/// scan), so 64 is comfortably below the native test-thread stack limit while
+/// being plenty for hand-written CubeLang programs.
+const MAX_CALL_DEPTH: u32 = 64;
 
 impl VM {
     pub fn new() -> Self {
@@ -127,6 +139,8 @@ impl VM {
             trace: Vec::new(),
             trace_enabled: false,
             name_table: HashMap::new(),
+            current_program: None,
+            call_depth: 0,
         }
     }
 
@@ -166,12 +180,25 @@ impl VM {
             None => return ExecResult::Error(format!("function not found: {}.{}", program, function)),
         };
 
-        // Set up args as registers (arg0, arg1, ...)
+        // Set up args as registers (arg0, arg1, ...). The keys here are
+        // synthesized "arg{i}" strings rather than blake3 hashes; the same
+        // synthesis happens inside the callee compiler (Expr::Ident("arg0")
+        // hashes to the matching r_xxyy below), so this only matters for
+        // host-side calls — keeping it for backwards compatibility.
         for (i, arg) in args.into_iter().enumerate() {
-            self.registers.insert(format!("arg{}", i), arg);
+            let name = format!("arg{}", i);
+            self.register_name(&name);
+            let h = blake3::hash(name.as_bytes());
+            let key = format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1]);
+            self.registers.insert(key, arg);
         }
 
-        self.exec_function(&func)
+        // Plan-2: remember which program owns the running function so an
+        // intra-program CALL can look up siblings by name.
+        let prev = self.current_program.replace(program.to_string());
+        let result = self.exec_function(&func);
+        self.current_program = prev;
+        result
     }
 
     /// Run the constructor of a program.
@@ -224,9 +251,70 @@ impl VM {
                     self.registers.insert(name, Value::Null);
                 }
 
+                op::MAKE_ARRAY => {
+                    // Plan-3. operands: [dst, n_imm, e0, e1, ..., e_{n-1}].
+                    // n is taken from the Imm; we then collect exactly that
+                    // many element operands. If the operand stream is short
+                    // (malformed bytecode) we fill with Null.
+                    let dst = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let n = match operands.get(1) {
+                        Some(Operand::Imm(k)) => (*k).max(0) as usize,
+                        _ => 0,
+                    };
+                    let mut items: Vec<Value> = Vec::with_capacity(n);
+                    for i in 0..n {
+                        items.push(self.resolve_assign_rhs(operands.get(2 + i)));
+                    }
+                    self.trace_op(pc, &format!("MAKE_ARRAY {} ({} items)", dst, n));
+                    self.registers.insert(dst, Value::Array(items));
+                }
+
+                op::LEN => {
+                    // operands: [dst, arr]
+                    let dst = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let arr = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                    let len = match self.registers.get(&arr) {
+                        Some(Value::Array(v)) => v.len() as i64,
+                        Some(Value::Str(s)) => s.len() as i64,
+                        _ => 0,
+                    };
+                    self.trace_op(pc, &format!("LEN {} = len({}) → {}", dst, arr, len));
+                    self.registers.insert(dst, Value::Int(len));
+                }
+
+                op::INDEX => {
+                    // operands: [dst, arr, i]. Out-of-range yields Null so
+                    // bad indices surface as untrusted data rather than crash.
+                    let dst = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let arr = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                    let i = self.resolve_i64(operands.get(2));
+                    let val = match self.registers.get(&arr) {
+                        Some(Value::Array(v)) if i >= 0 && (i as usize) < v.len() => v[i as usize].clone(),
+                        _ => Value::Null,
+                    };
+                    self.trace_op(pc, &format!("INDEX {} = {}[{}] → {}", dst, arr, i, val));
+                    self.registers.insert(dst, val);
+                }
+
+                op::RETURN => {
+                    // Plan-1: early return. With 0 operands, yield the current
+                    // accumulator. With 1 operand, resolve it (literal or
+                    // register) into the accumulator before exiting.
+                    if let Some(o) = operands.get(0) {
+                        self.accumulator = self.resolve_value(Some(o));
+                    }
+                    self.trace_op(pc, &format!("RETURN {}", self.accumulator));
+                    return ExecResult::Return(self.accumulator.clone());
+                }
+
                 op::ASSIGN => {
+                    // P0-2: a Named/Global operand must resolve to the source
+                    // register's VALUE, not the synthesized register-name string.
+                    // Without this, `assign b = a` stored `Value::Str("r_xxxx")`,
+                    // so arithmetic/sum on b returned 0. Literal Imm/FloatImm
+                    // assignment behaviour is preserved (see resolve_assign_rhs).
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let val = operands.get(1).map(|o| o.to_value()).unwrap_or(Value::Null);
+                    let val = self.resolve_assign_rhs(operands.get(1));
                     self.trace_op(pc, &format!("ASSIGN {} = {}", name, val));
                     self.registers.insert(name, val);
                 }
@@ -432,10 +520,75 @@ impl VM {
                 }
 
                 op::CALL => {
-                    let target = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    self.trace_op(pc, &format!("CALL {}", target));
-                    // Intra-program call resolution is a documented follow-up;
-                    // recorded as a structural step so traces stay faithful.
+                    // Plan-2: intra-program CALL v1.
+                    //   operands[0] = global(fn_name); operands[1..] = arg values.
+                    //   semantics: snapshot caller registers, install fresh
+                    //   arg0..argN, exec callee, restore caller registers,
+                    //   push the return value onto the stack (caller delivers
+                    //   it into a binding via POP).
+                    let key = operands.get(0).and_then(|o| match o {
+                        Operand::Global(h) | Operand::Named(h) => Some(*h),
+                        _ => None,
+                    });
+                    let fn_name = match key.and_then(|h| self.name_table.get(&h).cloned()) {
+                        Some(n) => n,
+                        None => {
+                            self.trace_op(pc, "CALL (unresolved name)");
+                            return ExecResult::Error("CALL: unresolved function name".into());
+                        }
+                    };
+
+                    if self.call_depth >= MAX_CALL_DEPTH {
+                        return ExecResult::Error(format!(
+                            "call depth exceeded ({}); recursion guard tripped at {}",
+                            MAX_CALL_DEPTH, fn_name));
+                    }
+
+                    let prog_name = match self.current_program.clone() {
+                        Some(p) => p,
+                        None => return ExecResult::Error(
+                            "CALL: no current program context".into()),
+                    };
+                    let callee = match self.programs.get(&prog_name)
+                        .and_then(|p| p.functions.iter().find(|f| f.name == fn_name))
+                    {
+                        Some(f) => f.clone(),
+                        None => return ExecResult::Error(format!(
+                            "CALL: function `{}` not found in program `{}`", fn_name, prog_name)),
+                    };
+
+                    // Resolve args. Each operand becomes a Value via the same
+                    // path used by ASSIGN's RHS (Imm/Float/Named/Global).
+                    let mut arg_values: Vec<Value> = Vec::new();
+                    for i in 1..operands.len() {
+                        arg_values.push(self.resolve_assign_rhs(Some(&operands[i])));
+                    }
+
+                    self.trace_op(pc, &format!("CALL {} ({} arg(s))", fn_name, arg_values.len()));
+
+                    // Snapshot caller registers and install fresh arg scope.
+                    let caller_regs = std::mem::take(&mut self.registers);
+                    for (i, v) in arg_values.into_iter().enumerate() {
+                        let arg_name = format!("arg{}", i);
+                        self.register_name(&arg_name);
+                        let h = blake3::hash(arg_name.as_bytes());
+                        let key = format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1]);
+                        self.registers.insert(key, v);
+                    }
+
+                    self.call_depth += 1;
+                    let r = self.exec_function(&callee);
+                    self.call_depth -= 1;
+
+                    // Restore caller-visible registers.
+                    self.registers = caller_regs;
+
+                    match r {
+                        ExecResult::Ok(v) | ExecResult::Return(v) => {
+                            self.stack.push(v);
+                        }
+                        ExecResult::Error(e) => return ExecResult::Error(e),
+                    }
                 }
 
                 // ── Data-movement opcodes (value-level semantics) ──────────
@@ -569,6 +722,26 @@ impl VM {
                 self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Int(0))
             }
             _ => Value::Int(0),
+        }
+    }
+
+    /// Resolve an ASSIGN right-hand-side. Like `resolve_value` for Named (copy
+    /// register value), but for Global we fall back to the synthesized name
+    /// token when no register is bound — preserving `assign x = "literal"`
+    /// behaviour (string literals compile to Global). Imm/FloatImm unchanged.
+    fn resolve_assign_rhs(&self, op: Option<&Operand>) -> Value {
+        match op {
+            Some(Operand::Imm(n)) => Value::Int(*n),
+            Some(Operand::FloatImm(f)) => Value::Float(*f),
+            Some(o @ Operand::Named(_)) => {
+                self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Null)
+            }
+            Some(o @ Operand::Global(_)) => {
+                let key = o.as_name();
+                self.registers.get(&key).cloned().unwrap_or(Value::Str(key))
+            }
+            Some(other) => other.to_value(),
+            None => Value::Null,
         }
     }
 
@@ -966,6 +1139,379 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Plan-1 (RETURN). Early `return v` must halt execution AND yield v.
+    // Probe: a "poison" `sum poison` after the return rewrites the accumulator
+    // if fall-through happens, so the returned value distinguishes halt vs fall.
+    #[test]
+    fn return_early_halts_with_value() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create r : quantity;
+                    create poison : quantity;
+                    assign r = 1;
+                    assign poison = 99;
+                    return r;
+                    sum poison;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) =>
+                assert_eq!(v.as_i64(), 1,
+                    "early return must yield 1, not the poisoned 99 (= fall-through)"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn return_early_inside_if_skips_rest() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create r : quantity;
+                    create poison : quantity;
+                    assign r = 5;
+                    assign poison = 99;
+                    if (r > 0) {
+                        return r;
+                    }
+                    sum poison;
+                    return poison;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 5,
+                "return inside if must halt before sum poison runs"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn return_bare_yields_current_accumulator() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create x : quantity;
+                    create poison : quantity;
+                    assign x = 7;
+                    assign poison = 99;
+                    sum x;
+                    return;
+                    sum poison;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 7,
+                "bare return must yield the accumulator set by sum x, not the poisoned sum"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // Plan-4 (LOOP for-each). `for (let x of arr) { body }` lowers to an
+    // index-based while using LEN/INDEX/COMPARE/COND/JMP. The loop must
+    // iterate every element, terminate on empty arrays, and nest correctly.
+    #[test]
+    fn for_each_sums_three_elements() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    let xs = [10, 20, 30];
+                    create total : quantity;
+                    assign total = 0;
+                    for (let x of xs) {
+                        add total, x;
+                    }
+                    sum total;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 60),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn for_each_empty_array_runs_zero_iterations() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    let xs = [];
+                    create total : quantity;
+                    assign total = 0;
+                    for (let x of xs) {
+                        add total, 999;
+                    }
+                    sum total;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 0),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn for_each_nested_loops_visit_every_pair() {
+        // sum over (xi + yj) for xi in [1,2], yj in [10,20] = 4*1 + 4*2 ... actually
+        // = (1+10)+(1+20)+(2+10)+(2+20) = 11+21+12+22 = 66.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    let xs = [1, 2];
+                    let ys = [10, 20];
+                    create total : quantity;
+                    assign total = 0;
+                    for (let x of xs) {
+                        for (let y of ys) {
+                            add total, x;
+                            add total, y;
+                        }
+                    }
+                    sum total;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 66),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // Plan-3 (MAKE_ARRAY / LEN / INDEX). Array literals must construct a
+    // real Value::Array, `arr.len()` must return its length, and `arr[i]`
+    // must index it. Out-of-range indexing yields Null.
+    #[test]
+    fn array_literal_len_is_three() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    let xs = [10, 20, 30];
+                    let n = xs.len();
+                    sum n;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 3),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_index_returns_element() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    let xs = [10, 20, 30];
+                    let x = xs[1];
+                    sum x;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 20),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_index_out_of_range_is_null() {
+        // Out-of-range indexing produces Null; sum yields 0 (as_i64 of Null).
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    let xs = [10, 20, 30];
+                    let x = xs[99];
+                    sum x;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 0,
+                "out-of-range index must be Null, not panic"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // Plan-2 (CALL). Intra-program call must transfer arg0..argN, execute the
+    // callee, and deliver its return value to the caller via the stack.
+    #[test]
+    fn call_returns_value_via_stack() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function dbl(): quantity {
+                    create r : quantity;
+                    assign r = 0;
+                    add r, arg0;
+                    add r, arg0;
+                    return r;
+                }
+                public function run(): void {
+                    let y = dbl(21);
+                    sum y;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) =>
+                assert_eq!(v.as_i64(), 42, "dbl(21) must return 42"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn call_caller_locals_isolated() {
+        // The callee writes to a register with the same name as a caller local.
+        // After return, the caller's value must be intact.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function helper(): quantity {
+                    create r : quantity;
+                    assign r = 99;
+                    return r;
+                }
+                public function run(): void {
+                    create r : quantity;
+                    assign r = 7;
+                    let _t = helper();
+                    sum r;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) =>
+                assert_eq!(v.as_i64(), 7,
+                    "caller's local r must still be 7 after helper() (got {:?})", v),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn call_recursion_factorial() {
+        // fact(n) = if n <= 1 then 1 else n * fact(n-1)
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function fact(): quantity {
+                    create n : quantity;
+                    assign n = 0;
+                    add n, arg0;
+                    if (n > 1) {
+                        create m : quantity;
+                        assign m = 0;
+                        add m, n;
+                        sub m, 1;
+                        let sub = fact(m);
+                        create out : quantity;
+                        assign out = 0;
+                        add out, n;
+                        mul out, sub;
+                        return out;
+                    }
+                    return 1;
+                }
+                public function run(): void {
+                    let r = fact(5);
+                    sum r;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) | ExecResult::Return(v) =>
+                assert_eq!(v.as_i64(), 120, "fact(5) must return 120"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn call_depth_guard_returns_clean_error() {
+        // Unbounded self-recursion should produce a clean Error, not a native
+        // stack overflow. fact() without a base case keeps calling.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function loop_forever(): quantity {
+                    let r = loop_forever();
+                    return r;
+                }
+                public function run(): void {
+                    let r = loop_forever();
+                    sum r;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Error(e) => assert!(e.to_lowercase().contains("depth"),
+                "expected depth-guard error, got: {}", e),
+            other => panic!("expected depth-guard Error, got {:?}", other),
+        }
+    }
+
+    // P0-2 regression: `assign b = a` must copy a's value, not store the
+    // register-name token. Before the fix, ASSIGN called `to_value()` on a
+    // Named operand and stored "r_xxxx" (a string) — sum returned 0 / a name.
+    #[test]
+    fn assign_register_to_register_copies_value() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create a : quantity;
+                    create b : quantity;
+                    assign a = 5;
+                    assign b = a;
+                    sum b;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 5,
+                "assign b = a must propagate the value 5 (got {:?})", v),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assign_register_to_register_then_arithmetic() {
+        // Compose with arithmetic so a regression also breaks the chain.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create a : quantity;
+                    create b : quantity;
+                    assign a = 7;
+                    assign b = a;
+                    add b, 3;
+                    sum b;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 10),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assign_literal_int_unchanged() {
+        // Guard: the bug fix must NOT regress literal assignment.
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create a : quantity;
+                    assign a = 42;
+                    sum a;
+                }
+            }
+        "#);
+        match vm.call("T", "run", Vec::new()) {
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 42),
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 
     #[test]
