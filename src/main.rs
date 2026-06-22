@@ -394,11 +394,13 @@ fn cmd_run(args: &[String]) {
     let input = &args[0];
     let mut target_fn = "solve".to_string();
     let mut trace = false;
+    let mut json_out = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--fn" | "-f" => { if i + 1 < args.len() { target_fn = args[i + 1].clone(); i += 1; } }
             "--trace" | "-t" => trace = true,
+            "--json" | "-j" => json_out = true,
             other => { eprintln!("warning: ignoring unknown option {}", other); }
         }
         i += 1;
@@ -436,7 +438,7 @@ fn cmd_run(args: &[String]) {
     // Run the target function.
     let result = vm.call(&prog_name, &target_fn, Vec::new());
 
-    if trace {
+    if trace && !json_out {
         println!("# trace ({} ops):", vm.trace.len());
         for line in &vm.trace { println!("  {}", line); }
         println!();
@@ -444,12 +446,43 @@ fn cmd_run(args: &[String]) {
 
     match result {
         ExecResult::Ok(val) | ExecResult::Return(val) => {
-            println!("  {}.{}() -> {}", prog_name, target_fn, val);
+            if json_out {
+                println!("{}", serde_json::json!({
+                    "ok": true,
+                    "program": prog_name,
+                    "function": target_fn,
+                    "result": value_to_json(&val),
+                }));
+            } else {
+                println!("  {}.{}() -> {}", prog_name, target_fn, val);
+            }
         }
         ExecResult::Error(e) => {
-            eprintln!("  {}.{}() runtime error: {}", prog_name, target_fn, e);
+            if json_out {
+                println!("{}", serde_json::json!({"ok": false, "error": e}));
+            } else {
+                eprintln!("  {}.{}() runtime error: {}", prog_name, target_fn, e);
+            }
             process::exit(1);
         }
+    }
+}
+
+/// Serialize a VM result Value to JSON for the `run --json` bridge output
+/// (cubbyverse parses this structured result; protobuf is a later transport swap).
+fn value_to_json(v: &cubelang::vm::Value) -> serde_json::Value {
+    use cubelang::vm::Value;
+    match v {
+        Value::Int(n) => serde_json::json!(n),
+        Value::Float(f) => serde_json::json!(f),
+        Value::Str(s) => serde_json::json!(s),
+        Value::Bool(b) => serde_json::json!(b),
+        Value::Null => serde_json::Value::Null,
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(value_to_json).collect()),
+        Value::Map(m) => serde_json::Value::Object(
+            m.iter().map(|(k, val)| (k.clone(), value_to_json(val))).collect(),
+        ),
+        Value::Hvec(h) => serde_json::json!({ "hvec_dim": h.dim() }),
     }
 }
 
