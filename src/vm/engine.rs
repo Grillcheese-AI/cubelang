@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use crate::compiler::{CompiledProgram, CompiledFunction, op};
 use crate::vm::memory::HippocampalMemory;
+use crate::vm::codebook::Codebook;
+use crate::vm::hypervec::Hypervec;
 
 /// Hypervector dimension for the VM's hippocampal memory. 4096 matches the
 /// codebook/index defaults ported from opcode-vsa-rs; quasi-orthogonality of
@@ -24,6 +26,9 @@ pub enum Value {
     Null,
     Array(Vec<Value>),
     Map(HashMap<String, Value>),
+    /// A bipolar hypervector value (VSA role-filler binding result). Lives in
+    /// the same {-1,+1}^MEM_DIM space as the hippocampal memory's addresses.
+    Hvec(Hypervec),
 }
 
 impl Value {
@@ -78,6 +83,7 @@ impl std::fmt::Display for Value {
             Value::Null => write!(f, "null"),
             Value::Array(a) => write!(f, "[{} items]", a.len()),
             Value::Map(m) => write!(f, "{{{} entries}}", m.len()),
+            Value::Hvec(h) => write!(f, "<hvec d={}>", h.dim()),
         }
     }
 }
@@ -100,6 +106,10 @@ pub struct VM {
     pub storage: HashMap<String, Value>,
     /// Hippocampal associative memory (VSA cleanup) for STORE/RECALL/REMEMBER/FORGET.
     pub memory: HippocampalMemory,
+    /// Symbol/role codebook for VSA role-filler binding (BIND_ROLE/UNBIND).
+    /// Deterministic symbol -> hypervector at MEM_DIM/MEM_SEED, so bound
+    /// structures are reproducible across runs and share the memory's space.
+    vsa: Codebook,
     /// Accumulator (SUM results).
     pub accumulator: Value,
     /// Event log.
@@ -133,6 +143,7 @@ impl VM {
             stack: Vec::new(),
             storage: HashMap::new(),
             memory: HippocampalMemory::new(MEM_DIM, MEM_SEED),
+            vsa: Codebook::with_dim(MEM_SEED, MEM_DIM),
             accumulator: Value::Null,
             events: Vec::new(),
             programs: HashMap::new(),
@@ -156,6 +167,12 @@ impl VM {
         }
         for func in &prog.functions {
             self.register_name(&func.name);
+        }
+        // Role + filler symbol names used by BIND_ROLE/UNBIND, so their 2-byte
+        // hashes in the bytecode reverse to the real strings the VSA codebook
+        // keys on (enabling genuine, human-readable role-filler binding).
+        for sym in &prog.symbol_names {
+            self.register_name(sym);
         }
         self.programs.insert(prog.name.clone(), prog);
     }
@@ -428,12 +445,17 @@ impl VM {
                 }
 
                 op::BIND_ROLE => {
+                    // Genuine VSA role-filler binding. The register key is the
+                    // operand's display token (matching every other op's
+                    // register addressing); the role and filler resolve to
+                    // their real symbol strings (via the name table) so the
+                    // codebook produces stable, human-recoverable vectors.
+                    // reg <- bundle(reg, bind(role, filler)).
                     let reg = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let role = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
-                    let filler = operands.get(2).map(|o| o.to_value()).unwrap_or(Value::Null);
+                    let role = self.resolve_symbol_name(operands.get(1));
+                    let filler = self.resolve_symbol_name(operands.get(2));
                     self.trace_op(pc, &format!("BIND_ROLE {} {} {}", reg, role, filler));
-                    // Store as reg.role = filler
-                    self.registers.insert(format!("{}.{}", reg, role), filler);
+                    self.vsa_bind_into(&reg, &role, &filler);
                 }
 
                 op::COMPARE => {
@@ -620,10 +642,26 @@ impl VM {
                 }
 
                 op::UNBIND => {
+                    // Genuine VSA unbind + cleanup. Recover the filler bound to
+                    // `role` in the register's bundled hypervector and leave the
+                    // recovered symbol (as a Str) in the register. Candidates are
+                    // the known symbol names (name table); the cosine-nearest
+                    // wins. A register that never held an Hvec is left untouched.
                     let reg = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let role = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
-                    self.registers.remove(&format!("{}.{}", reg, role));
-                    self.trace_op(pc, &format!("UNBIND {} {}", reg, role));
+                    let role = self.resolve_symbol_name(operands.get(1));
+                    // Snapshot candidate symbol strings up front to avoid holding
+                    // an immutable borrow of name_table across the &mut self call.
+                    let candidates: Vec<String> = self.name_table.values().cloned().collect();
+                    let cand_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+                    match self.vsa_unbind_cleanup(&reg, &role, &cand_refs) {
+                        Some((sym, sim)) => {
+                            self.trace_op(pc, &format!("UNBIND {} {} → {} (sim {:.3})", reg, role, sym, sim));
+                            self.registers.insert(reg, Value::Str(sym));
+                        }
+                        None => {
+                            self.trace_op(pc, &format!("UNBIND {} {} → (no hvec)", reg, role));
+                        }
+                    }
                 }
 
                 op::NEWVAR => {
@@ -750,6 +788,23 @@ impl VM {
         self.name_table.insert([h.as_bytes()[0], h.as_bytes()[1]], name.to_string());
     }
 
+    /// Reverse a Named/Role/Global operand's 2-byte hash to the original symbol
+    /// string via the name table (populated from the program's symbol_names on
+    /// load). Falls back to the operand's display token (`role_xxyy` etc.) when
+    /// the name was never registered — so binding is still deterministic, just
+    /// not human-readable. Used by BIND_ROLE/UNBIND to drive the VSA codebook.
+    fn resolve_symbol_name(&self, op: Option<&Operand>) -> String {
+        match op {
+            Some(Operand::Role(h)) | Some(Operand::Named(h)) | Some(Operand::Global(h)) => {
+                self.name_table.get(h).cloned().unwrap_or_else(|| {
+                    op.map(|o| o.as_name()).unwrap_or_default()
+                })
+            }
+            Some(o) => o.as_name(),
+            None => String::new(),
+        }
+    }
+
     /// Get the value of a register.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.registers.get(name)
@@ -767,6 +822,74 @@ impl VM {
         self.accumulator = Value::Null;
         self.trace.clear();
         self.events.clear();
+    }
+
+    // ── Genuine VSA role-filler binding ──────────────────────────────────
+    // These give BIND_ROLE/UNBIND real hyperdimensional semantics: a register
+    // holds a *bundled hypervector* of bind(role, filler) terms, and a role is
+    // recovered by unbind + codebook cleanup -- the bind(sentence, inv(ROLE))
+    // round-trip from the VSA/HDC literature. Built on the bind/bundle/cosine
+    // primitives in hypervec.rs; the codebook (self.vsa) maps role and filler
+    // symbols to deterministic quasi-orthogonal hypervectors.
+
+    /// The hypervector for a filler symbol (deterministic via the codebook).
+    pub fn vsa_symbol_vec(&mut self, symbol: &str) -> Hypervec {
+        self.vsa.get_cloned(symbol)
+    }
+
+    /// The hypervector for a role symbol. Roles and fillers share one codebook;
+    /// a `role:` prefix keeps the role namespace from colliding with fillers of
+    /// the same spelling (so a filler "SUBJECT" and the role SUBJECT differ).
+    pub fn vsa_role_vec(&mut self, role: &str) -> Hypervec {
+        self.vsa.get_cloned(&format!("role:{}", role))
+    }
+
+    /// BIND_ROLE: bundle `bind(role, filler)` into register `reg`.
+    ///
+    /// If `reg` is empty/non-hvec it becomes exactly `bind(role, filler)`;
+    /// otherwise the new pair is bundled (majority-vote superposition) with the
+    /// existing structure, so multiple roles compose into one vector:
+    ///   reg = bundle(reg, bind(role_i, filler_i))
+    pub fn vsa_bind_into(&mut self, reg: &str, role: &str, filler: &str) {
+        let rv = self.vsa_role_vec(role);
+        let fv = self.vsa_symbol_vec(filler);
+        let pair = rv.bind(&fv);
+        let combined = match self.registers.get(reg) {
+            Some(Value::Hvec(existing)) => Hypervec::bundle(&[existing, &pair]),
+            _ => pair,
+        };
+        self.registers.insert(reg.to_string(), Value::Hvec(combined));
+    }
+
+    /// UNBIND + cleanup: recover the filler bound to `role` in register `reg`.
+    ///
+    /// Computes `unbind(reg_hvec, role)` (= bind, self-inverse) and returns the
+    /// candidate symbol whose codebook vector is cosine-nearest to the result,
+    /// with that similarity. `None` if `reg` holds no hypervector. A high
+    /// similarity means a real binding was present; near-zero means the role
+    /// was not bound (the unbind yields quasi-orthogonal noise).
+    pub fn vsa_unbind_cleanup(
+        &mut self,
+        reg: &str,
+        role: &str,
+        candidates: &[&str],
+    ) -> Option<(String, f64)> {
+        let bound = match self.registers.get(reg) {
+            Some(Value::Hvec(h)) => h.clone(),
+            _ => return None,
+        };
+        let rv = self.vsa_role_vec(role);
+        let recovered = bound.unbind(&rv);
+        let mut best: Option<(String, f64)> = None;
+        for &cand in candidates {
+            let cv = self.vsa_symbol_vec(cand);
+            let sim = recovered.cosine_sim(&cv);
+            match &best {
+                Some((_, bs)) if *bs >= sim => {}
+                _ => best = Some((cand.to_string(), sim)),
+            }
+        }
+        best
     }
 }
 
@@ -1718,5 +1841,229 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+
+#[cfg(test)]
+mod vsa_binding_tests {
+    //! Genuine VSA role-filler binding over hypervectors.
+    //!
+    //! These drive the VM's hyperdimensional capability directly (not via
+    //! bytecode): a register can hold a bundled hypervector built from
+    //! bind(role, filler) terms, and a role can be unbound + cleaned up against
+    //! a candidate filler set to recover the original symbol -- the
+    //! bind(sentence, inverse(ROLE)) round-trip. The primitives live in
+    //! hypervec.rs; this wires them into the VM as Value::Hvec + helper methods.
+    use super::*;
+
+    // A bound register must hold an actual hypervector, not a string key.
+    #[test]
+    fn bind_role_produces_hypervector_value() {
+        let mut vm = VM::new();
+        vm.vsa_bind_into("sentence", "SUBJECT", "cat");
+        match vm.get("sentence") {
+            Some(Value::Hvec(h)) => assert_eq!(h.dim(), MEM_DIM,
+                "bound register must hold a MEM_DIM hypervector"),
+            other => panic!("expected Value::Hvec, got {:?}", other),
+        }
+    }
+
+    // Single role: unbind(bind(ROLE, filler), ROLE) ~= filler, recovered by
+    // cleanup against the candidate set at similarity 1.0 (self-inverse bind).
+    #[test]
+    fn single_role_unbinds_to_filler() {
+        let mut vm = VM::new();
+        vm.vsa_bind_into("s", "SUBJECT", "cat");
+        let candidates = ["cat", "dog", "mouse", "tree"];
+        let (sym, sim) = vm.vsa_unbind_cleanup("s", "SUBJECT", &candidates)
+            .expect("must recover a filler");
+        assert_eq!(sym, "cat", "unbinding SUBJECT must recover 'cat'");
+        assert!(sim > 0.99, "single-term unbind must be near-exact, got sim={sim:.4}");
+    }
+
+    // The headline example: cat chases mouse, bundled into one vector, each
+    // role recoverable. With 3 bundled terms the recovered filler is the
+    // cosine-nearest candidate (noisy but correct -- the cleanup memory's job).
+    #[test]
+    fn three_role_sentence_recovers_each_filler() {
+        let mut vm = VM::new();
+        vm.vsa_bind_into("sent", "SUBJECT", "cat");
+        vm.vsa_bind_into("sent", "VERB", "chases");
+        vm.vsa_bind_into("sent", "OBJECT", "mouse");
+
+        let cand = ["cat", "dog", "chases", "eats", "mouse", "tree", "runs"];
+        let (s, ss) = vm.vsa_unbind_cleanup("sent", "SUBJECT", &cand).unwrap();
+        let (v, vs) = vm.vsa_unbind_cleanup("sent", "VERB", &cand).unwrap();
+        let (o, os) = vm.vsa_unbind_cleanup("sent", "OBJECT", &cand).unwrap();
+        assert_eq!(s, "cat", "SUBJECT must clean up to cat (sim {ss:.3})");
+        assert_eq!(v, "chases", "VERB must clean up to chases (sim {vs:.3})");
+        assert_eq!(o, "mouse", "OBJECT must clean up to mouse (sim {os:.3})");
+    }
+
+    // Querying a role the sentence does not contain must NOT confidently
+    // return a bound filler: the best cleanup similarity should be low
+    // (quasi-orthogonal noise), distinguishing "absent" from a real hit.
+    #[test]
+    fn absent_role_yields_low_similarity() {
+        let mut vm = VM::new();
+        vm.vsa_bind_into("sent", "SUBJECT", "cat");
+        vm.vsa_bind_into("sent", "OBJECT", "mouse");
+        let cand = ["cat", "mouse", "dog"];
+        // LOCATION was never bound -> unbinding it yields noise vs all candidates.
+        let best = vm.vsa_unbind_cleanup("sent", "LOCATION", &cand);
+        if let Some((_, sim)) = best {
+            assert!(sim < 0.3,
+                "unbinding an absent role must be low-similarity noise, got {sim:.4}");
+        }
+    }
+
+    // Determinism: same symbols -> same hypervector across VM instances
+    // (fixed codebook seed), so bound structures are reproducible across runs.
+    #[test]
+    fn role_and_symbol_vectors_are_deterministic() {
+        let mut vm1 = VM::new();
+        let mut vm2 = VM::new();
+        let a = vm1.vsa_symbol_vec("cat");
+        let b = vm2.vsa_symbol_vec("cat");
+        assert_eq!(a, b, "same symbol must map to same hypervector across VMs");
+        let r1 = vm1.vsa_role_vec("SUBJECT");
+        let r2 = vm2.vsa_role_vec("SUBJECT");
+        assert_eq!(r1, r2, "same role must map to same hypervector across VMs");
+        // Distinct symbols are quasi-orthogonal (so cleanup can separate them).
+        assert!(a.cosine_sim(&vm1.vsa_symbol_vec("dog")).abs() < 0.1,
+            "distinct fillers must be quasi-orthogonal");
+    }
+}
+
+
+#[cfg(test)]
+mod vsa_opcode_wiring_tests {
+    //! End-to-end: `bind` statements in real CubeLang source must produce
+    //! genuine VSA hypervector bindings in the target register (not string-key
+    //! inserts), recoverable by unbinding the role. This drives the compiler
+    //! to retain role/filler symbol names (so the VM can reverse the 2-byte
+    //! hashes the bytecode carries) and the BIND_ROLE/UNBIND opcode arms to
+    //! call the vsa_* methods.
+    use super::*;
+
+    fn compile_and_load(source: &str) -> VM {
+        let programs = crate::compiler::compile(source).unwrap();
+        let mut vm = VM::new();
+        for prog in programs {
+            vm.load(prog);
+        }
+        vm
+    }
+
+    // After `bind sentence, SUBJECT, "cat"`, the register `sentence` must hold
+    // a Value::Hvec -- a real bound hypervector -- not a Str/Null.
+    #[test]
+    fn bind_statement_produces_hypervector_register() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create sentence : frame;
+                    bind sentence, SUBJECT, "cat";
+                }
+            }
+        "#);
+        vm.call("T", "run", Vec::new());
+        // The register key is the hashed name; find the single Hvec value.
+        let has_hvec = vm.registers.values()
+            .any(|v| matches!(v, Value::Hvec(_)));
+        assert!(has_hvec,
+            "after `bind`, some register must hold a Value::Hvec (genuine VSA bind)");
+    }
+
+    // The headline round-trip from source: bind three roles into one register,
+    // then each role unbinds+cleans-up to the right filler. We reach into the
+    // VM's vsa methods for cleanup using the SAME register the bytecode wrote.
+    #[test]
+    fn bound_frame_recovers_fillers_via_unbind() {
+        let mut vm = compile_and_load(r#"
+            program T implements ISolver {
+                public function run(): void {
+                    create frame : frame;
+                    bind frame, SUBJECT, "cat";
+                    bind frame, VERB, "chases";
+                    bind frame, OBJECT, "mouse";
+                }
+            }
+        "#);
+        vm.call("T", "run", Vec::new());
+
+        // Resolve the register the compiler used for `frame` (hashed name key).
+        let reg_key = vm.registers.iter()
+            .find(|(_, v)| matches!(v, Value::Hvec(_)))
+            .map(|(k, _)| k.clone())
+            .expect("a bound hypervector register must exist");
+
+        let cand = ["cat", "dog", "chases", "eats", "mouse", "tree"];
+        let (s, _) = vm.vsa_unbind_cleanup(&reg_key, "SUBJECT", &cand).unwrap();
+        let (v, _) = vm.vsa_unbind_cleanup(&reg_key, "VERB", &cand).unwrap();
+        let (o, _) = vm.vsa_unbind_cleanup(&reg_key, "OBJECT", &cand).unwrap();
+        assert_eq!(s, "cat", "SUBJECT must recover cat");
+        assert_eq!(v, "chases", "VERB must recover chases");
+        assert_eq!(o, "mouse", "OBJECT must recover mouse");
+    }
+
+    // UNBIND opcode (engine-level): after binding, executing UNBIND on the role
+    // must remove/replace the bound structure with the recovered filler symbol
+    // in the target register. We hand-build the bytecode since no surface
+    // syntax emits UNBIND yet, mirroring the compiler's operand layout.
+    #[test]
+    fn unbind_opcode_recovers_filler_into_register() {
+        use crate::compiler::{op, CompiledProgram, CompiledFunction};
+
+        // Bytecode for: BIND_ROLE frame, SUBJECT, "cat"; UNBIND frame, SUBJECT
+        // operand tags: NAMED=0x01, ROLE=0x04, GLOBAL=0x05
+        fn h(s: &str) -> [u8; 2] {
+            let d = blake3::hash(s.as_bytes());
+            [d.as_bytes()[0], d.as_bytes()[1]]
+        }
+        let frame = h("frame");
+        let subj = h("SUBJECT");
+        let cat = h("cat");
+
+        let mut bc: Vec<u8> = Vec::new();
+        // BIND_ROLE (3 operands): NAMED frame, ROLE SUBJECT, GLOBAL "cat"
+        bc.push(op::BIND_ROLE); bc.push(3);
+        bc.push(0x01); bc.push(frame[0]); bc.push(frame[1]);
+        bc.push(0x04); bc.push(subj[0]);  bc.push(subj[1]);
+        bc.push(0x05); bc.push(cat[0]);   bc.push(cat[1]);
+        // UNBIND (2 operands): NAMED frame, ROLE SUBJECT
+        bc.push(op::UNBIND); bc.push(2);
+        bc.push(0x01); bc.push(frame[0]); bc.push(frame[1]);
+        bc.push(0x04); bc.push(subj[0]);  bc.push(subj[1]);
+
+        let func = CompiledFunction {
+            name: "run".to_string(),
+            bytecode: bc,
+            labels: Vec::new(),
+            debug_lines: Vec::new(),
+        };
+        let prog = CompiledProgram {
+            name: "T".to_string(),
+            implements: vec!["ISolver".to_string()],
+            functions: vec![func],
+            storage_fields: Vec::new(),
+            symbol_names: vec![
+                "frame".to_string(), "SUBJECT".to_string(), "cat".to_string(),
+            ],
+        };
+
+        let mut vm = VM::new();
+        vm.load(prog);
+        vm.call("T", "run", Vec::new());
+
+        // After UNBIND, the frame register should carry the recovered filler
+        // symbol "cat" (as a Str), the cleanup result of unbinding SUBJECT.
+        let frame_key = format!("r_{:02x}{:02x}", frame[0], frame[1]);
+        match vm.get(&frame_key) {
+            Some(Value::Str(s)) => assert_eq!(s, "cat",
+                "UNBIND must leave the recovered filler 'cat' in the register"),
+            other => panic!("expected recovered Str(\"cat\"), got {:?}", other),
+        }
     }
 }

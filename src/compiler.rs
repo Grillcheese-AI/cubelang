@@ -135,7 +135,12 @@ fn ext_bytecode(o: ExtOp) -> u8 {
 /// Magic bytes for .cubebin files.
 pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
 /// Current .cubebin format version.
-pub const CUBEBIN_VERSION: u8 = 1;
+///
+/// v2 appends a trailing symbol-name table (role + filler names used by
+/// BIND_ROLE/UNBIND) after the functions block. v1 readers stop after the
+/// functions; v2 readers parse the table when present. The reader treats a
+/// missing table (older/truncated input) as an empty table for compatibility.
+pub const CUBEBIN_VERSION: u8 = 2;
 
 /// A compiled CubeLang program — serializable to `.cubebin` format.
 ///
@@ -169,6 +174,12 @@ pub struct CompiledProgram {
     pub implements: Vec<String>,
     pub functions: Vec<CompiledFunction>,
     pub storage_fields: Vec<String>,
+    /// Role and string-literal filler symbols that appear in `bind` statements.
+    /// The bytecode carries only 2-byte blake3 hashes of these names; the VM
+    /// reverses the hashes via this table so BIND_ROLE/UNBIND can drive the
+    /// real VSA codebook (which keys on the symbol strings). Empty for programs
+    /// with no bindings; loaded-from-disk programs repopulate it from .cubebin.
+    pub symbol_names: Vec<String>,
 }
 
 impl CompiledProgram {
@@ -207,6 +218,15 @@ impl CompiledProgram {
             buf.extend_from_slice(&func.bytecode);
         }
 
+        // Symbol-name table (v2+). u16 LE count, then each name as u8-len + utf8.
+        // These are the role/filler symbols BIND_ROLE/UNBIND need to reverse
+        // the 2-byte hashes carried in the bytecode.
+        buf.extend_from_slice(&(self.symbol_names.len() as u16).to_le_bytes());
+        for sym in &self.symbol_names {
+            buf.push(sym.len() as u8);
+            buf.extend_from_slice(sym.as_bytes());
+        }
+
         buf
     }
 
@@ -222,7 +242,7 @@ impl CompiledProgram {
 
         // Version
         let version = data[pos]; pos += 1;
-        if version != CUBEBIN_VERSION {
+        if version != 1 && version != 2 {
             return Err(format!("unsupported .cubebin version: {}", version));
         }
 
@@ -273,7 +293,22 @@ impl CompiledProgram {
             });
         }
 
-        Ok(CompiledProgram { name, implements, functions, storage_fields })
+        // Symbol-name table (v2+). Present when at least the u16 count remains.
+        // v1 input (or truncated) leaves this empty for backward compatibility.
+        let mut symbol_names = Vec::new();
+        if version >= 2 && pos + 2 <= data.len() {
+            let n_syms = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            for _ in 0..n_syms {
+                if pos >= data.len() { break; }
+                let len = data[pos] as usize; pos += 1;
+                if pos + len > data.len() { break; }
+                symbol_names.push(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+                pos += len;
+            }
+        }
+
+        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names })
     }
 
     /// Save to a `.cubebin` file.
@@ -328,6 +363,10 @@ pub struct Compiler {
     strict_errors: Vec<String>,
     current_program: String,
     current_function: String,
+    /// Role + string-literal filler names seen in `bind` statements, collected
+    /// so the VM can reverse the bytecode's 2-byte hashes for genuine VSA
+    /// binding. Deduplicated on insertion; attached to each CompiledProgram.
+    symbol_names: Vec<String>,
 }
 
 impl Compiler {
@@ -341,6 +380,7 @@ impl Compiler {
             strict_errors: Vec::new(),
             current_program: String::new(),
             current_function: String::new(),
+            symbol_names: Vec::new(),
         }
     }
 
@@ -376,6 +416,9 @@ impl Compiler {
         let mut functions = Vec::new();
         let mut storage_fields = Vec::new();
         self.current_program = prog.name.clone();
+        // Reset per-program symbol collection so bindings don't leak across
+        // programs compiled in the same pass.
+        self.symbol_names.clear();
 
         for item in &prog.body {
             match item {
@@ -396,6 +439,7 @@ impl Compiler {
             implements: prog.implements.clone(),
             functions,
             storage_fields,
+            symbol_names: std::mem::take(&mut self.symbol_names),
         }
     }
 
@@ -642,6 +686,15 @@ impl Compiler {
             }
             OpcodeStmt::Bind { reg, role, val } => {
                 self.emit_debug(op::BIND_ROLE, &format!("bind {} {} ...", reg, role));
+                // Record role + filler names so the VM can reverse the hashes
+                // for genuine VSA binding. The filler is a string literal or an
+                // identifier; other expr forms have no stable symbol to record.
+                self.record_symbol(role);
+                match val {
+                    Expr::StringLit(s) => self.record_symbol(s),
+                    Expr::Ident(n) => self.record_symbol(n),
+                    _ => {}
+                }
                 self.emit_byte(op::BIND_ROLE);
                 self.emit_byte(3);
                 self.emit_named(reg);
@@ -659,6 +712,8 @@ impl Compiler {
                 // bind_role reg, ROLE : 2-arg surface form. Filler defaults to
                 // the register itself (self-binding the register into the role).
                 self.emit_debug(op::BIND_ROLE, &format!("bind_role {} {}", reg, role));
+                self.record_symbol(role);
+                self.record_symbol(reg);
                 self.emit_byte(op::BIND_ROLE);
                 self.emit_byte(3);
                 self.emit_named(reg);
@@ -1115,6 +1170,15 @@ impl Compiler {
         self.label_counter += 1;
         format!("_{}_{}", prefix, self.label_counter)
     }
+
+    /// Record a role/filler symbol name (deduplicated) so the VM can reverse
+    /// the 2-byte hash the bytecode carries back to the original string for
+    /// genuine VSA codebook lookups.
+    fn record_symbol(&mut self, name: &str) {
+        if !self.symbol_names.iter().any(|s| s == name) {
+            self.symbol_names.push(name.to_string());
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1406,7 +1470,7 @@ mod tests {
         // Serialize
         let bin = prog.to_cubebin();
         assert_eq!(&bin[0..4], b"CUBE");
-        assert_eq!(bin[4], 1); // version
+        assert_eq!(bin[4], CUBEBIN_VERSION); // version (v2: + symbol table)
 
         // Deserialize
         let loaded = CompiledProgram::from_cubebin(&bin).unwrap();
