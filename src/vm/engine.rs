@@ -93,11 +93,44 @@ impl std::fmt::Display for Value {
 pub enum ExecResult {
     Ok(Value),
     Return(Value),
+    /// The program cannot proceed without information only the caller has.
+    ///
+    /// This is NOT an error and NOT a result: it is a third outcome. A program
+    /// that has grounded several real candidates and cannot choose between them
+    /// must neither pick one (that is a confabulation) nor fail (nothing went
+    /// wrong). It suspends, hands the question outward, and resumes when told.
+    ///
+    /// Resumption is cheap because registers/storage/memory/accumulator are
+    /// VM-global; only the interpreter's *locals* (pc, flag, jump_budget) need
+    /// capturing. See `VM::resume`.
+    Suspend(Suspension),
     Error(String),
+}
+
+/// Everything needed to continue a suspended program, plus what to ask.
+#[derive(Debug, Clone)]
+pub struct Suspension {
+    /// The question, as the program phrased it (ASK's first operand).
+    pub question: Value,
+    /// Candidate answers the program is choosing between (ASK's remaining operands).
+    pub candidates: Vec<Value>,
+    /// Interpreter locals, captured so `resume` can pick up mid-loop.
+    pub pc: usize,
+    pub flag: bool,
+    pub jump_budget: u64,
+    /// Which function was executing (resume re-enters it).
+    pub function: String,
+    /// Which program owns that function. Captured because `call()` restores
+    /// `current_program` on the way out, so the VM has forgotten it by the time
+    /// the host sees the Suspend. A suspension must be self-describing.
+    pub program: String,
 }
 
 /// The CubeLang virtual machine.
 pub struct VM {
+    /// Set by `resume()`; consumed by the next `exec_function` entry to restore
+    /// interpreter locals (pc/flag/jump_budget) after an ASK suspension.
+    resume_state: Option<Suspension>,
     /// Named registers.
     pub registers: HashMap<String, Value>,
     /// Stack for PUSH/POP chaining.
@@ -152,7 +185,77 @@ impl VM {
             name_table: HashMap::new(),
             current_program: None,
             call_depth: 0,
+            resume_state: None,
         }
+    }
+
+    /// Resume a program suspended by ASK, supplying the caller's answer.
+    ///
+    /// THE CALLER IS THE MODEL, NOT A HUMAN. The trunk renders `susp.question`
+    /// and `susp.candidates` into language, the user replies in language, and
+    /// the trunk maps that reply back to ONE OF THE CANDIDATES. The VM never
+    /// talks to a person, and a person never picks an index.
+    ///
+    /// That division is what keeps the guarantee: the trunk supplies syntax
+    /// (rendering) and selection (mapping), never content. So the selection is
+    /// CHECKABLE, and this function checks it -- `answer` must be *identical*
+    /// to a candidate, not merely plausible. A trunk that returns 1968 when the
+    /// candidates are {1959, 1969} has confabulated a value into a slot that
+    /// could only ever hold one of two, and is rejected here rather than
+    /// silently believed.
+    ///
+    /// The answer is PUSHED ONTO THE STACK, matching how CALL delivers a
+    /// callee's return value. The resumed program binds it with `pop <reg>`.
+    /// (An earlier draft used the accumulator; wrong, because `SUM x` overwrites
+    /// the accumulator from register x.)
+    ///
+    /// Resumption needs no call frames: registers/storage/memory are VM-global,
+    /// so `Suspension` carries back only the interpreter locals (pc, flag,
+    /// jump_budget).
+    pub fn resume(&mut self, susp: Suspension, answer: Value) -> ExecResult {
+        // Structural guard: the selection must be one the program offered.
+        // Deliberately NOT `derive(PartialEq)` on Value -- Hvec holds floats and
+        // "equal hypervectors" is a similarity question, not an equality one. A
+        // selection is always a scalar/string, so compare only those.
+        fn same_selection(a: &Value, b: &Value) -> bool {
+            match (a, b) {
+                (Value::Int(x), Value::Int(y)) => x == y,
+                (Value::Str(x), Value::Str(y)) => x == y,
+                (Value::Bool(x), Value::Bool(y)) => x == y,
+                (Value::Float(x), Value::Float(y)) => x == y,
+                _ => false,
+            }
+        }
+        if !susp.candidates.is_empty() && !susp.candidates.iter().any(|c| same_selection(c, &answer)) {
+            return ExecResult::Error(format!(
+                "resume: answer {} is not among the {} candidates the program offered \
+                 (a selection must be chosen, not invented)",
+                answer,
+                susp.candidates.len()
+            ));
+        }
+        let prog_name = susp.program.clone();
+        let prog = match self.programs.get(&prog_name) {
+            Some(p) => p.clone(),
+            None => return ExecResult::Error(format!("resume: program not found: {}", prog_name)),
+        };
+        let func = match prog.functions.iter().find(|f| f.name == susp.function) {
+            Some(f) => f.clone(),
+            None => {
+                return ExecResult::Error(format!(
+                    "resume: function not found: {}.{}",
+                    prog_name, susp.function
+                ))
+            }
+        };
+        // Deliver the answer the same way CALL delivers a result: via the stack.
+        self.stack.push(answer);
+        // A nested ASK inside the resumed run must report the same program.
+        let prev = self.current_program.replace(prog_name);
+        self.resume_state = Some(susp);
+        let result = self.exec_function(&func);
+        self.current_program = prev;
+        result
     }
 
     /// Load a compiled program into the VM.
@@ -237,6 +340,17 @@ impl VM {
         // Loop-iteration guard: bound total back-edges to prevent infinite
         // loops from a malformed / non-terminating program reaching the VM.
         let mut jump_budget: u64 = 1_000_000;
+
+        // Resuming a suspended program: restore the interpreter locals that
+        // `Suspension` captured. Registers/storage/memory/accumulator are
+        // VM-global and were never lost. `pc` already points PAST the ASK
+        // instruction, so execution continues with the answer in scope.
+        if let Some(r) = self.resume_state.take() {
+            pc = r.pc;
+            flag = r.flag;
+            jump_budget = r.jump_budget;
+        }
+
         while pc < bc.len() {
             let opcode = bc[pc]; pc += 1;
 
@@ -610,6 +724,25 @@ impl VM {
                             self.stack.push(v);
                         }
                         ExecResult::Error(e) => return ExecResult::Error(e),
+                        // A callee cannot suspend: by this point we have already
+                        // restored the caller's registers and unwound call_depth,
+                        // so resuming would re-enter the callee with the caller's
+                        // frame. Propagating would corrupt state silently; this
+                        // fails loudly instead.
+                        //
+                        // Lifting this needs real call frames (the deferred
+                        // `v2` in CUBELANG_OPCODES_PLAN.md) so a Suspension can
+                        // capture the whole stack, not one function's locals.
+                        // ASK at the top level of `solve` works today.
+                        ExecResult::Suspend(s) => {
+                            return ExecResult::Error(format!(
+                                "ASK inside a CALL is not supported (in {}): the flat \
+                                 global-register model cannot capture a callee frame. \
+                                 Move the ASK to the top-level function, or implement \
+                                 real call frames.",
+                                s.function
+                            ))
+                        }
                     }
                 }
 
@@ -707,7 +840,39 @@ impl VM {
                 op::BROADCAST => self.trace_structural(pc, "BROADCAST", &operands),
                 op::EXPLORE => self.trace_structural(pc, "EXPLORE", &operands),
                 op::FORGE => self.trace_structural(pc, "FORGE", &operands),
-                op::ASK => self.trace_structural(pc, "ASK", &operands),
+                op::ASK => {
+                    // ASK <question>, <candidate>...
+                    //
+                    // Suspend: hand the question outward and stop. This is the
+                    // THIRD outcome, alongside Ok and Error. A program holding
+                    // several grounded candidates must not pick one (that is a
+                    // confabulation) nor fail (nothing went wrong). It asks.
+                    //
+                    // `pc` already points past this instruction, so `resume`
+                    // continues from here; the answer arrives on the STACK
+                    // (same convention as CALL), bound by a following `pop`.
+                    // The question is a string literal, which compiles to
+                    // Operand::Global (a 2-byte hash). `resolve_symbol_name`
+                    // reverses it via the name table populated on load.
+                    // Falls back to the `g_xxxx` token if it was never
+                    // registered -- deterministic, just not human-readable.
+                    let question = Value::Str(self.resolve_symbol_name(operands.get(0)));
+                    let candidates: Vec<Value> = operands
+                        .iter()
+                        .skip(1)
+                        .map(|o| self.resolve_value(Some(o)))
+                        .collect();
+                    self.trace_op(pc, &format!("ASK {} ({} candidates)", question, candidates.len()));
+                    return ExecResult::Suspend(Suspension {
+                        question,
+                        candidates,
+                        pc,
+                        flag,
+                        jump_budget,
+                        function: func.name.clone(),
+                        program: self.current_program.clone().unwrap_or_default(),
+                    });
+                }
                 op::SYNC => self.trace_structural(pc, "SYNC", &operands),
 
                 _ => {

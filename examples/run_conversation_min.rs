@@ -35,6 +35,10 @@ fn main() {
         ExecResult::Ok(v) | ExecResult::Return(v) => {
             println!("constructor ok: {}", v);
         }
+        ExecResult::Suspend(s) => {
+            eprintln!("constructor suspended (ASK): {}", s.question);
+            std::process::exit(1);
+        }
         ExecResult::Error(e) => {
             eprintln!("constructor error: {}", e);
             std::process::exit(1);
@@ -48,6 +52,20 @@ fn main() {
     match result {
         ExecResult::Ok(v) | ExecResult::Return(v) => {
             println!("solve ok: {}", v);
+        }
+        ExecResult::Suspend(s) => {
+            // The program asked. A real host would surface this to the user;
+            // here we auto-answer with the first candidate to show resumption.
+            println!("solve suspended: {} ({} candidates)", s.question, s.candidates.len());
+            let answer = s.candidates.first().cloned().unwrap_or(Value::Null);
+            match vm.resume(s, answer) {
+                ExecResult::Ok(v) | ExecResult::Return(v) => println!("resumed -> {}", v),
+                ExecResult::Suspend(s2) => println!("suspended again: {}", s2.question),
+                ExecResult::Error(e) => {
+                    eprintln!("resume error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         ExecResult::Error(e) => {
             eprintln!("solve error: {}", e);

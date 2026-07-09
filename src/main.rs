@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use cubelang::compiler::{self, CompiledProgram, op};
-use cubelang::vm::{VM, ExecResult};
+use cubelang::vm::{VM, ExecResult, Value};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -455,6 +455,59 @@ fn cmd_run(args: &[String]) {
                 }));
             } else {
                 println!("  {}.{}() -> {}", prog_name, target_fn, val);
+            }
+        }
+        ExecResult::Suspend(susp) => {
+            // The program asked. It is neither finished nor broken: it grounded
+            // several candidates and only the caller can choose.
+            //
+            // THE REAL CALLER IS THE MODEL, NOT A HUMAN. The trunk renders the
+            // question + candidates into language, the user replies in language,
+            // and the trunk maps that reply back to one of the candidates before
+            // calling `vm.resume`. `--json` is that boundary.
+            if json_out {
+                println!("{}", serde_json::json!({
+                    "ok": true,
+                    "suspended": true,
+                    "program": susp.program,
+                    "function": susp.function,
+                    "question": value_to_json(&susp.question),
+                    "candidates": susp.candidates.iter().map(value_to_json).collect::<Vec<_>>(),
+                }));
+            } else {
+                // DEBUG HARNESS ONLY. A person never picks an index in the real
+                // system; this exists so `cubelang run` can exercise resume from
+                // a terminal. Do not mistake it for the interface.
+                eprintln!("  [debug harness: the model, not a person, answers ASK]");
+                println!("  ? {}", susp.question);
+                for (i, c) in susp.candidates.iter().enumerate() {
+                    println!("      [{}] {}", i, c);
+                }
+                print!("  choose [0-{}]: ", susp.candidates.len().saturating_sub(1));
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+
+                let mut line = String::new();
+                let answer = match std::io::stdin().read_line(&mut line) {
+                    Ok(_) => match line.trim().parse::<usize>() {
+                        Ok(i) if i < susp.candidates.len() => susp.candidates[i].clone(),
+                        _ => Value::Null,
+                    },
+                    Err(_) => Value::Null,
+                };
+
+                match vm.resume(susp, answer) {
+                    ExecResult::Ok(val) | ExecResult::Return(val) => {
+                        println!("  {}.{}() -> {}", prog_name, target_fn, val);
+                    }
+                    ExecResult::Suspend(s2) => {
+                        println!("  (suspended again: {})", s2.question);
+                    }
+                    ExecResult::Error(e) => {
+                        eprintln!("  error after resume: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         ExecResult::Error(e) => {
