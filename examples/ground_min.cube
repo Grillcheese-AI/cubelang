@@ -1,0 +1,55 @@
+# ground_min.cube - the three-valued grounding contract, end to end.
+#
+#   QUERY -> len -> branch:
+#       0 chunks -> gap    (say you don't know)
+#       1 chunk  -> fact   (render it)
+#       N chunks -> ASK    (only the caller knows which)
+#
+# Every opcode here executes. QUERY does an exact hash lookup with provenance;
+# ASK suspends and resumes. Zero embeddings, zero forward passes.
+
+program Ground {
+
+    storage {
+        grounded: mutable u64 = 0;
+        abstained: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign grounded = 0;
+        assign abstained = 0;
+    }
+
+    @external
+    public function solve(mention: str): quantity {
+        query mention;
+
+        # `ctx` is the SPEC's own name for this. It must be usable.
+        create ctx : quantity;
+        pop ctx;
+
+        let n = ctx.len();
+
+        create outcome : quantity;
+        assign outcome = 0;
+
+        if (n == 0) {
+            # The honest gap. Nothing failed; we simply have no fact.
+            add abstained, 1;
+            assign outcome = 0;
+        } else {
+            if (n == 1) {
+                add grounded, 1;
+                assign outcome = 1;
+            } else {
+                # Ambiguity. The store holds several real, cited facts and
+                # cannot choose. Only the caller knows which was meant.
+                ask "which one did you mean", ctx;
+                assign outcome = 2;
+            }
+        }
+
+        return outcome;
+    }
+}

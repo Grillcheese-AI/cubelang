@@ -1131,6 +1131,12 @@ impl Compiler {
     }
 
     fn emit_global(&mut self, name: &str) {
+        // Globals (string literals, mostly) compile to a 2-byte hash. Record the
+        // spelling so `VM::load` puts it in the name table and
+        // `resolve_symbol_name` can reverse it. Without this an ASK's question
+        // text -- the very thing the trunk is supposed to render into language
+        // for the user -- comes back as `g_e009`.
+        self.record_symbol(name);
         self.emit_byte(OP_GLOBAL);
         let hash = name_hash(name);
         self.emit_byte(hash[0]);

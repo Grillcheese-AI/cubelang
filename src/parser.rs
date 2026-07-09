@@ -205,6 +205,40 @@ impl Parser {
             TokenKind::OpTransfer      => "transfer".into(),
             TokenKind::OpCompare       => "compare".into(),
             TokenKind::OpBindRole      => "bind_role".into(),
+
+            // Type keywords — also soft. Many are ordinary English words a
+            // programmer will reach for as a variable name: `ctx`, `role`,
+            // `map`, `set`, `file`, `url`, `request`, `response`, `agent`.
+            // The SPEC's own example cannot otherwise be written:
+            //     let ctx: rag = knowledge.query("...", top_k: 5);
+            // Position disambiguates: after `create`/`let`/`.` an identifier is
+            // required, after `:` a type is. `create ctx : ctx;` parses.
+            TokenKind::TyCtx             => "ctx".into(),
+            TokenKind::TyRag             => "rag".into(),
+            TokenKind::TyRole            => "role".into(),
+            TokenKind::TyOpcode          => "opcode".into(),
+            TokenKind::TyModule          => "module".into(),
+            TokenKind::TyMdx             => "mdx".into(),
+            TokenKind::TyAgent           => "agent".into(),
+            TokenKind::TyClonedAgent     => "cloned_agent".into(),
+            TokenKind::TyFile            => "file".into(),
+            TokenKind::TyUrl             => "url".into(),
+            TokenKind::TyDataset         => "dataset".into(),
+            TokenKind::TyExternalProgram => "external_program".into(),
+            TokenKind::TyRequest         => "request".into(),
+            TokenKind::TyResponse        => "response".into(),
+            TokenKind::TyArray           => "array".into(),
+            TokenKind::TyMap             => "map".into(),
+            TokenKind::TySet             => "set".into(),
+            TokenKind::TyPromise         => "promise".into(),
+            TokenKind::TyChannel         => "channel".into(),
+            TokenKind::TyTuple           => "tuple".into(),
+            TokenKind::TyVec             => "vec".into(),
+            TokenKind::TyEmb             => "emb".into(),
+            TokenKind::TyByte            => "byte".into(),
+            // Primitive width/scalar names are left RESERVED on purpose. A
+            // variable called `u8` or `bool` is a bug wearing a name.
+
             _ => return Err(self.err(format!("expected identifier, got {:?}", self.tokens[self.pos].kind))),
         };
         self.pos += 1;
@@ -212,11 +246,44 @@ impl Parser {
     }
 
     /// True if `kind` can stand in as an identifier in expression / name
-    /// position — i.e. any opcode keyword. These are contextual: opcode at a
-    /// statement start parses as an opcode (via parse_stmt's dispatch), but as
-    /// a value/name elsewhere it is an ordinary identifier.
+    /// position — any opcode keyword, plus the non-primitive type keywords.
+    /// These are contextual: an opcode at a statement start parses as an opcode
+    /// (via parse_stmt's dispatch), but as a value/name elsewhere it is an
+    /// ordinary identifier. Likewise `ctx`/`map`/`role`/... are types after `:`
+    /// and identifiers everywhere else.
+    ///
+    /// Must agree with the soft-keyword arms in `expect_ident`, or a name will
+    /// parse in one position and not the other.
     fn kind_is_ident_like(&self, kind: &TokenKind) -> bool {
-        kind.is_opcode()
+        if kind.is_opcode() {
+            return true;
+        }
+        matches!(
+            kind,
+            TokenKind::TyCtx
+                | TokenKind::TyRag
+                | TokenKind::TyRole
+                | TokenKind::TyOpcode
+                | TokenKind::TyModule
+                | TokenKind::TyMdx
+                | TokenKind::TyAgent
+                | TokenKind::TyClonedAgent
+                | TokenKind::TyFile
+                | TokenKind::TyUrl
+                | TokenKind::TyDataset
+                | TokenKind::TyExternalProgram
+                | TokenKind::TyRequest
+                | TokenKind::TyResponse
+                | TokenKind::TyArray
+                | TokenKind::TyMap
+                | TokenKind::TySet
+                | TokenKind::TyPromise
+                | TokenKind::TyChannel
+                | TokenKind::TyTuple
+                | TokenKind::TyVec
+                | TokenKind::TyEmb
+                | TokenKind::TyByte
+        )
     }
 
     fn expect_string(&mut self) -> PResult<String> {

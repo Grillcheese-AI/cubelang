@@ -387,7 +387,9 @@ fn cmd_validate(args: &[String]) {
 
 fn cmd_run(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: cubelang run <file.cube|file.cubebin> [--fn name] [--trace]");
+        eprintln!("usage: cubelang run <file.cube|file.cubebin> \
+                   [--fn name] [--trace] [--json] [--arg VALUE]... \
+                   [--knowledge facts.jsonl]");
         process::exit(1);
     }
 
@@ -395,12 +397,23 @@ fn cmd_run(args: &[String]) {
     let mut target_fn = "solve".to_string();
     let mut trace = false;
     let mut json_out = false;
+    let mut knowledge_path: Option<String> = None;
+    let mut call_args: Vec<Value> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--fn" | "-f" => { if i + 1 < args.len() { target_fn = args[i + 1].clone(); i += 1; } }
             "--trace" | "-t" => trace = true,
             "--json" | "-j" => json_out = true,
+            // Facts for QUERY. Without this the VM has no knowledge and
+            // abstains on every query -- which is correct, but not useful.
+            "--knowledge" | "-k" => {
+                if i + 1 < args.len() { knowledge_path = Some(args[i + 1].clone()); i += 1; }
+            }
+            // Arguments bound to the function's DECLARED parameter names.
+            "--arg" | "-a" => {
+                if i + 1 < args.len() { call_args.push(Value::Str(args[i + 1].clone())); i += 1; }
+            }
             other => { eprintln!("warning: ignoring unknown option {}", other); }
         }
         i += 1;
@@ -409,6 +422,24 @@ fn cmd_run(args: &[String]) {
     // Load: compile .cube in-memory, or load a .cubebin directly.
     let mut vm = VM::new();
     vm.trace_enabled = trace;
+
+    if let Some(kp) = &knowledge_path {
+        match std::fs::read_to_string(kp) {
+            Ok(data) => match vm.knowledge.load_jsonl(&data) {
+                Ok((facts, aliases)) => {
+                    if !json_out {
+                        println!("  knowledge: {} facts, {} aliases from {}",
+                                 facts, aliases, kp);
+                    }
+                }
+                // A malformed fact file must fail loudly. Silently grounding
+                // against a half-loaded store is worse than not grounding.
+                Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+            },
+            Err(e) => { eprintln!("error: cannot read {}: {}", kp, e); process::exit(1); }
+        }
+    }
+
     let prog_name: String = if input.ends_with(".cubebin") {
         match vm.load_file(Path::new(input)) {
             Ok(name) => name,
@@ -436,7 +467,7 @@ fn cmd_run(args: &[String]) {
     let _ = vm.call(&prog_name, "constructor", Vec::new());
 
     // Run the target function.
-    let result = vm.call(&prog_name, &target_fn, Vec::new());
+    let result = vm.call(&prog_name, &target_fn, call_args);
 
     if trace && !json_out {
         println!("# trace ({} ops):", vm.trace.len());
@@ -481,7 +512,19 @@ fn cmd_run(args: &[String]) {
                 eprintln!("  [debug harness: the model, not a person, answers ASK]");
                 println!("  ? {}", susp.question);
                 for (i, c) in susp.candidates.iter().enumerate() {
-                    println!("      [{}] {}", i, c);
+                    // A QUERY chunk is a Map; showing "{3 entries}" defeats the
+                    // point of a harness meant to exercise the contract by hand.
+                    match c {
+                        Value::Map(m) => {
+                            let text = m.get("text").map(|v| v.to_string()).unwrap_or_default();
+                            let src = m.get("source").map(|v| v.to_string()).unwrap_or_default();
+                            println!("      [{}] {}", i, text);
+                            if !src.is_empty() {
+                                println!("          {}", src);
+                            }
+                        }
+                        other => println!("      [{}] {}", i, other),
+                    }
                 }
                 print!("  choose [0-{}]: ", susp.candidates.len().saturating_sub(1));
                 use std::io::Write;

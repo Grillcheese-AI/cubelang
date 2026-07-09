@@ -220,14 +220,31 @@ impl VM {
     pub fn resume(&mut self, susp: Suspension, answer: Value) -> ExecResult {
         // Structural guard: the selection must be one the program offered.
         // Deliberately NOT `derive(PartialEq)` on Value -- Hvec holds floats and
-        // "equal hypervectors" is a similarity question, not an equality one. A
-        // selection is always a scalar/string, so compare only those.
+        // "equal hypervectors" is a similarity question, not an equality one.
+        //
+        // Compared structurally, because a QUERY chunk is a Map: the trunk maps
+        // the user's reply back to one of the offered chunks and hands that Map
+        // straight back. A scalar-only comparison would reject every possible
+        // answer and make ASK unusable on grounded facts.
         fn same_selection(a: &Value, b: &Value) -> bool {
             match (a, b) {
                 (Value::Int(x), Value::Int(y)) => x == y,
                 (Value::Str(x), Value::Str(y)) => x == y,
                 (Value::Bool(x), Value::Bool(y)) => x == y,
                 (Value::Float(x), Value::Float(y)) => x == y,
+                (Value::Null, Value::Null) => true,
+                (Value::Array(x), Value::Array(y)) => {
+                    x.len() == y.len()
+                        && x.iter().zip(y).all(|(i, j)| same_selection(i, j))
+                }
+                (Value::Map(x), Value::Map(y)) => {
+                    x.len() == y.len()
+                        && x.iter().all(|(k, v)| {
+                            y.get(k).map_or(false, |w| same_selection(v, w))
+                        })
+                }
+                // Hypervectors are never a *selection*; equality is the wrong
+                // question to ask of them.
                 _ => false,
             }
         }
@@ -918,11 +935,21 @@ impl VM {
                     // Falls back to the `g_xxxx` token if it was never
                     // registered -- deterministic, just not human-readable.
                     let question = Value::Str(self.resolve_symbol_name(operands.get(0)));
-                    let candidates: Vec<Value> = operands
+                    let mut candidates: Vec<Value> = operands
                         .iter()
                         .skip(1)
                         .map(|o| self.resolve_value(Some(o)))
                         .collect();
+                    // `ask "which?", hits;` where `hits` is the array QUERY
+                    // pushed means "choose among these", not "here is one
+                    // candidate that happens to be a list". Flatten it, or the
+                    // caller can never name a selection and `resume`'s guard
+                    // rejects every possible answer.
+                    if candidates.len() == 1 {
+                        if let Value::Array(items) = &candidates[0] {
+                            candidates = items.clone();
+                        }
+                    }
                     self.trace_op(pc, &format!("ASK {} ({} candidates)", question, candidates.len()));
                     return ExecResult::Suspend(Suspension {
                         question,

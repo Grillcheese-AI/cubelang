@@ -240,3 +240,160 @@ fn params_survive_the_cubebin_round_trip() {
         other => panic!("round-tripped program failed: {:?}", other),
     }
 }
+
+// ── QUERY -> ASK: the composition, and the bugs it exposed ────────────────
+
+/// The whole three-valued contract, in one program. `ctx` is the SPEC's own
+/// name for the RAG context -- and was a reserved TYPE keyword, so the SPEC's
+/// example could not be written until type keywords became soft.
+const GROUND: &str = r#"
+program Ground {
+    @external
+    public function solve(mention: str): quantity {
+        query mention;
+        create ctx : quantity;
+        pop ctx;
+        let n = ctx.len();
+        create outcome : quantity;
+        assign outcome = 0;
+        if (n == 0) {
+            assign outcome = 0;
+        } else {
+            if (n == 1) {
+                assign outcome = 1;
+            } else {
+                ask "which one did you mean", ctx;
+                assign outcome = 2;
+            }
+        }
+        return outcome;
+    }
+}
+"#;
+
+fn ground_vm() -> (VM, String) {
+    let mut progs = compiler::compile(GROUND).expect("compile GROUND");
+    let prog = progs.pop().unwrap();
+    let name = prog.name.clone();
+    let mut vm = VM::new();
+    vm.knowledge.load_jsonl(FACTS).unwrap();
+    vm.load(prog);
+    (vm, name)
+}
+
+#[test]
+fn REGRESSION_type_keywords_are_usable_as_identifiers() {
+    // `ctx`, `map`, `role`, `file`, `url`, `request`, `set` ... are ordinary
+    // words. Reserving them outright made the SPEC's own example unwritable:
+    //     let ctx: rag = knowledge.query("...", top_k: 5);
+    const NAMES: &str = r#"
+program Names {
+    @external
+    public function solve(): quantity {
+        create ctx : quantity;   assign ctx = 1;
+        create map : quantity;   assign map = 2;
+        create role : quantity;  assign role = 3;
+        create request : quantity; assign request = 4;
+        return ctx;
+    }
+}
+"#;
+    let progs = compiler::compile(NAMES).expect("type keywords must parse as identifiers");
+    assert_eq!(progs[0].name, "Names");
+}
+
+#[test]
+fn zero_chunks_is_a_gap_one_is_a_fact() {
+    let (mut vm, name) = ground_vm();
+    for (mention, expect) in [
+        ("goldsmith", 0i64),          // no such key -> gap
+        ("xyzzy blorptangle", 0),     // nonsense -> gap
+        ("printing press", 1),        // exactly one grounded fact
+        ("Movable-Type PRESS", 1),    // same fact, reached by alias
+    ] {
+        match vm.call(&name, "solve", vec![Value::Str(mention.into())]) {
+            ExecResult::Ok(Value::Int(n)) | ExecResult::Return(Value::Int(n)) => {
+                assert_eq!(n, expect, "{}", mention)
+            }
+            other => panic!("{}: {:?}", mention, other),
+        }
+    }
+}
+
+#[test]
+fn REGRESSION_ask_flattens_the_chunk_array_into_candidates() {
+    // `ask "...", ctx;` where ctx is the array QUERY pushed means "choose among
+    // these". Passing it as ONE candidate that happens to be a list makes the
+    // selection unnameable -- and resume's guard then rejects every answer.
+    let (mut vm, name) = ground_vm();
+    let susp = match vm.call(&name, "solve", vec![Value::Str("Mercury".into())]) {
+        ExecResult::Suspend(s) => s,
+        other => panic!("expected Suspend on an ambiguous entity, got {:?}", other),
+    };
+
+    assert_eq!(susp.candidates.len(), 2, "candidates must be flat, not nested");
+    for c in &susp.candidates {
+        match c {
+            Value::Map(m) => {
+                assert!(matches!(m.get("source"), Some(Value::Str(s)) if s.starts_with("http")));
+                assert!(m.contains_key("text"));
+            }
+            other => panic!("each candidate must be a chunk Map, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn REGRESSION_the_ask_question_text_survives_compilation() {
+    // String literals compile to a 2-byte hash. Unless the spelling is recorded
+    // in symbol_names, the question comes back as `g_e009` -- and the question
+    // is the very thing the trunk is supposed to render into language.
+    let (mut vm, name) = ground_vm();
+    let susp = match vm.call(&name, "solve", vec![Value::Str("Mercury".into())]) {
+        ExecResult::Suspend(s) => s,
+        other => panic!("{:?}", other),
+    };
+    match &susp.question {
+        Value::Str(q) => assert_eq!(q, "which one did you mean"),
+        other => panic!("question must be its literal text, got {:?}", other),
+    }
+}
+
+#[test]
+fn REGRESSION_resume_accepts_a_chunk_Map_as_a_selection() {
+    // resume's guard compared scalars only. A grounded candidate is a Map, so
+    // the guard would have rejected EVERY possible answer -- a safety check
+    // that made the feature impossible to use.
+    let (mut vm, name) = ground_vm();
+    let susp = match vm.call(&name, "solve", vec![Value::Str("Mercury".into())]) {
+        ExecResult::Suspend(s) => s,
+        other => panic!("{:?}", other),
+    };
+    let planet = susp.candidates[0].clone();
+    match vm.resume(susp, planet) {
+        ExecResult::Ok(Value::Int(n)) | ExecResult::Return(Value::Int(n)) => assert_eq!(n, 2),
+        other => panic!("resume must accept an offered chunk, got {:?}", other),
+    }
+}
+
+#[test]
+fn resume_still_rejects_an_invented_chunk() {
+    // The guarantee survives the structural comparison: a Map that was never
+    // offered is a fabrication, however well-formed it looks.
+    use std::collections::HashMap;
+    let (mut vm, name) = ground_vm();
+    let susp = match vm.call(&name, "solve", vec![Value::Str("Mercury".into())]) {
+        ExecResult::Suspend(s) => s,
+        other => panic!("{:?}", other),
+    };
+
+    let mut fake = HashMap::new();
+    fake.insert("text".to_string(), Value::Str("a Roman god".into()));
+    fake.insert("score".to_string(), Value::Float(1.0));
+    fake.insert("source".to_string(), Value::Str("https://example.invalid".into()));
+
+    match vm.resume(susp, Value::Map(fake)) {
+        ExecResult::Error(e) => assert!(e.contains("chosen, not invented"), "{}", e),
+        other => panic!("a fabricated chunk must be rejected, got {:?}", other),
+    }
+}
