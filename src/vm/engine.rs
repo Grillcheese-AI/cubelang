@@ -128,6 +128,10 @@ pub struct Suspension {
 
 /// The CubeLang virtual machine.
 pub struct VM {
+    /// Grounded facts, keyed by canonical surface form. Backs `QUERY`.
+    /// Empty by default: a VM with no knowledge abstains on every query, which
+    /// is the correct behaviour for a VM with no knowledge.
+    pub knowledge: crate::vm::knowledge::KnowledgeStore,
     /// Set by `resume()`; consumed by the next `exec_function` entry to restore
     /// interpreter locals (pc/flag/jump_budget) after an ASK suspension.
     resume_state: Option<Suspension>,
@@ -186,6 +190,7 @@ impl VM {
             current_program: None,
             call_depth: 0,
             resume_state: None,
+            knowledge: crate::vm::knowledge::KnowledgeStore::new(),
         }
     }
 
@@ -512,9 +517,57 @@ impl VM {
                 }
 
                 op::QUERY => {
-                    let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let val = self.registers.get(&name).cloned().unwrap_or(Value::Null);
-                    self.trace_op(pc, &format!("QUERY {} → {}", name, val));
+                    // QUERY <mention>
+                    //
+                    // Was: read a register, write a trace line, retrieve nothing.
+                    // The SPEC has always typed this as
+                    //   rag { chunks: array<{text, score, source}> }
+                    // -- provenance in the type, waiting for an implementation.
+                    //
+                    // Now: an EXACT lookup against the VM's knowledge store. The
+                    // chunk array is pushed onto the stack (same convention as
+                    // CALL and ASK), so `pop ctx` binds it.
+                    //
+                    // Zero embeddings. A canonical title IS a key: DBpedia's
+                    // 4.6M entities normalize to 4,628,421 unique titles at 0.2%
+                    // collisions. Embedding the query would cost a forward pass
+                    // per lookup -- a linear marginal cost, which is exactly the
+                    // economics this architecture exists to avoid.
+                    //
+                    // A MISS PUSHES AN EMPTY ARRAY. Not an Error (nothing
+                    // failed), and never a nearest neighbour -- that is how you
+                    // get "the capital of France is Kyiv" at 0.699. Zero chunks
+                    // is the program's cue to say it does not know. The caller
+                    // branches on `len`:
+                    //     0 -> gap, RETURN     1 -> fact, RETURN     N -> ASK
+                    let reg = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let mention = match self.registers.get(&reg) {
+                        // a register holding a string is the usual case
+                        Some(Value::Str(s)) => s.clone(),
+                        // otherwise fall back to the operand's own symbol name,
+                        // so `query "printing press";` works as a literal
+                        _ => self.resolve_symbol_name(operands.get(0)),
+                    };
+
+                    let chunks: Vec<Value> = self
+                        .knowledge
+                        .lookup(&mention)
+                        .iter()
+                        .map(|f| {
+                            let mut m = HashMap::new();
+                            m.insert("text".to_string(), Value::Str(f.text.clone()));
+                            // An exact key match is confidence 1.0, not a
+                            // similarity. A cosine neighbour at 0.87 is a guess
+                            // and must never wear the same number.
+                            m.insert("score".to_string(), Value::Float(1.0));
+                            m.insert("source".to_string(), Value::Str(f.source.clone()));
+                            Value::Map(m)
+                        })
+                        .collect();
+
+                    self.trace_op(pc, &format!(
+                        "QUERY {:?} -> {} chunk(s)", mention, chunks.len()));
+                    self.stack.push(Value::Array(chunks));
                 }
 
                 op::REMEMBER => {

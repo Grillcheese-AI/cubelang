@@ -13,11 +13,13 @@ pub mod hypervec;
 pub mod codebook;
 pub mod index;
 pub mod memory;
+pub mod knowledge;
 pub mod engine;
 
 // Re-export the engine's public surface so existing `use cubelang::vm::{VM, ...}`
 // call sites keep working after the flat vm.rs -> vm/ split.
 pub use engine::{VM, ExecResult, Suspension, Value};
+pub use knowledge::{Fact, KnowledgeStore};
 
 // Re-export the VSA memory primitives for use by the engine and externally.
 pub use hypervec::{Hypervec, DEFAULT_DIM};
