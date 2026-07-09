@@ -140,7 +140,13 @@ pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
 /// BIND_ROLE/UNBIND) after the functions block. v1 readers stop after the
 /// functions; v2 readers parse the table when present. The reader treats a
 /// missing table (older/truncated input) as an empty table for compatibility.
-pub const CUBEBIN_VERSION: u8 = 2;
+///
+/// v3 carries each function's DECLARED PARAMETER NAMES, between the function
+/// name and its bytecode. Without them `VM::call` had nothing to bind host
+/// arguments to and synthesized `arg0`/`arg1`, so a function declared
+/// `solve(mention: str)` read an unbound register. v2 files still load: their
+/// `params` is empty and `call` falls back to the old synthesis.
+pub const CUBEBIN_VERSION: u8 = 3;
 
 /// A compiled CubeLang program — serializable to `.cubebin` format.
 ///
@@ -213,6 +219,13 @@ impl CompiledProgram {
         for func in &self.functions {
             buf.push(func.name.len() as u8);
             buf.extend_from_slice(func.name.as_bytes());
+            // v3: declared parameter names, so a host can bind arguments by name
+            // rather than by the synthesized `arg0`/`arg1` fallback.
+            buf.push(func.params.len() as u8);
+            for p in &func.params {
+                buf.push(p.len() as u8);
+                buf.extend_from_slice(p.as_bytes());
+            }
             let bc_len = func.bytecode.len() as u32;
             buf.extend_from_slice(&bc_len.to_le_bytes());
             buf.extend_from_slice(&func.bytecode);
@@ -242,7 +255,10 @@ impl CompiledProgram {
 
         // Version
         let version = data[pos]; pos += 1;
-        if version != 1 && version != 2 {
+        // v1: functions only. v2: + trailing symbol-name table.
+        // v3: + per-function declared parameter names. All three still load;
+        // older files simply carry no params and fall back to `argN` binding.
+        if version != 1 && version != 2 && version != 3 {
             return Err(format!("unsupported .cubebin version: {}", version));
         }
 
@@ -280,6 +296,19 @@ impl CompiledProgram {
             let fn_name = String::from_utf8_lossy(&data[pos..pos + fn_name_len]).to_string();
             pos += fn_name_len;
 
+            // v3 added declared parameter names here. v2 files have none: they
+            // load with an empty `params`, and `VM::call` falls back to the old
+            // `arg0`/`arg1` synthesis for them. Forward-compatible, not silent.
+            let mut params: Vec<String> = Vec::new();
+            if version >= 3 {
+                let n_params = data[pos] as usize; pos += 1;
+                for _ in 0..n_params {
+                    let l = data[pos] as usize; pos += 1;
+                    params.push(String::from_utf8_lossy(&data[pos..pos + l]).to_string());
+                    pos += l;
+                }
+            }
+
             let bc_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
             pos += 4;
             let bytecode = data[pos..pos + bc_len].to_vec();
@@ -287,6 +316,7 @@ impl CompiledProgram {
 
             functions.push(CompiledFunction {
                 name: fn_name,
+                params,
                 bytecode,
                 labels: Vec::new(),
                 debug_lines: Vec::new(),
@@ -327,6 +357,14 @@ impl CompiledProgram {
 #[derive(Debug, Clone)]
 pub struct CompiledFunction {
     pub name: String,
+    /// Declared parameter names, in order.
+    ///
+    /// These used to be discarded at compile time, which left `VM::call` with
+    /// nothing to bind host arguments to. It fell back to synthesizing `arg0`,
+    /// `arg1`, ... -- so a `.cube` function declared `solve(mention: str)` read
+    /// an UNBOUND register when called from a host. Every example in the SPEC
+    /// hits this. Carrying the names fixes it at the source.
+    pub params: Vec<String>,
     pub bytecode: Vec<u8>,
     pub labels: Vec<(String, usize)>,   // label name → byte offset
     pub debug_lines: Vec<DebugLine>,    // source mapping
@@ -455,6 +493,7 @@ impl Compiler {
 
         CompiledFunction {
             name: func.sig.name.clone(),
+            params: func.sig.params.iter().map(|p| p.name.clone()).collect(),
             bytecode: self.bytecode.clone(),
             labels: self.labels.clone(),
             debug_lines: self.debug_lines.clone(),

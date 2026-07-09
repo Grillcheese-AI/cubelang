@@ -305,17 +305,25 @@ impl VM {
             None => return ExecResult::Error(format!("function not found: {}.{}", program, function)),
         };
 
-        // Set up args as registers (arg0, arg1, ...). The keys here are
-        // synthesized "arg{i}" strings rather than blake3 hashes; the same
-        // synthesis happens inside the callee compiler (Expr::Ident("arg0")
-        // hashes to the matching r_xxyy below), so this only matters for
-        // host-side calls — keeping it for backwards compatibility.
+        // Bind host arguments to registers.
+        //
+        // Previously this ONLY synthesized `arg0`, `arg1`, ... because
+        // CompiledFunction discarded the declared parameter names at compile
+        // time. So a function written as `solve(mention: str)` read an UNBOUND
+        // register when called from a host -- silently, since an unbound
+        // register resolves to Int(0)/Null rather than erroring. Every example
+        // in the SPEC hits this.
+        //
+        // Now: bind by DECLARED NAME (v3 .cubebin carries them), and keep the
+        // `argN` alias so v2 files and existing callers still work.
         for (i, arg) in args.into_iter().enumerate() {
-            let name = format!("arg{}", i);
-            self.register_name(&name);
-            let h = blake3::hash(name.as_bytes());
-            let key = format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1]);
-            self.registers.insert(key, arg);
+            if let Some(param) = func.params.get(i) {
+                self.register_name(param);
+                self.registers.insert(Self::register_key(param), arg.clone());
+            }
+            let alias = format!("arg{}", i);
+            self.register_name(&alias);
+            self.registers.insert(Self::register_key(&alias), arg);
         }
 
         // Plan-2: remember which program owns the running function so an
@@ -1004,6 +1012,14 @@ impl VM {
     fn register_name(&mut self, name: &str) {
         let h = blake3::hash(name.as_bytes());
         self.name_table.insert([h.as_bytes()[0], h.as_bytes()[1]], name.to_string());
+    }
+
+    /// The register key a symbol compiles to: `r_` + the first two bytes of its
+    /// blake3 hash, matching `Operand::Named(h).as_name()`. Hosts must use this
+    /// to reach a register the bytecode refers to by name.
+    pub fn register_key(name: &str) -> String {
+        let h = blake3::hash(name.as_bytes());
+        format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1])
     }
 
     /// Reverse a Named/Role/Global operand's 2-byte hash to the original symbol
@@ -2257,6 +2273,7 @@ mod vsa_opcode_wiring_tests {
 
         let func = CompiledFunction {
             name: "run".to_string(),
+            params: Vec::new(),
             bytecode: bc,
             labels: Vec::new(),
             debug_lines: Vec::new(),

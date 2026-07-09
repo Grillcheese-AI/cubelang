@@ -24,15 +24,17 @@ const FACTS: &str = concat!(
 
 /// Ground a mention and hand the chunk array straight back.
 ///
-/// Three surface-syntax facts this program had to discover the hard way:
-///   * `ctx` is a reserved TYPE keyword (`TyCtx`) -- the SPEC's
-///     `let ctx: rag = knowledge.query(...)` made it one.
+/// Reads the DECLARED PARAMETER NAME `mention`. That used to be impossible:
+/// `CompiledFunction` discarded parameter names, so `VM::call` synthesized
+/// `arg0` and a program reading `mention` got an unbound register -- silently,
+/// because unbound registers resolve to Int(0) rather than erroring. Every
+/// example in the SPEC hit this. Fixed in .cubebin v3.
+///
+/// Two surface-syntax facts that remain, discovered here:
+///   * `ctx` is a reserved TYPE keyword (`TyCtx`) -- the SPEC's own
+///     `let ctx: rag = knowledge.query(...)` cannot be written.
 ///   * `len` is not surface syntax. `op::LEN` is compiler-generated from `for`
 ///     and `let n = a.len()`. So this returns the array and Rust counts it.
-///   * `VM::call` binds host arguments as `arg0, arg1, ...` -- NOT by the
-///     declared parameter name. A `.cube` function that reads `mention` sees an
-///     unbound register. That is a real ergonomic gap in host-side calls, noted
-///     in `call()`'s own comment.
 const PROGRAM: &str = r#"
 program Ground {
     storage { queries: mutable u64 = 0; }
@@ -42,7 +44,7 @@ program Ground {
 
     @external
     public function solve(mention: str): quantity {
-        query arg0;
+        query mention;
         create hits : quantity;
         pop hits;
         return hits;
@@ -156,4 +158,85 @@ fn a_fact_without_a_source_is_rejected_at_load() {
         .unwrap_err();
     assert!(err.contains("source"), "{}", err);
     assert!(vm.knowledge.is_empty());
+}
+
+// ── the host-call gap ─────────────────────────────────────────────────────
+// `CompiledFunction` discarded declared parameter names, so `VM::call` had
+// nothing to bind to and synthesized `arg0`. A `.cube` reading `mention` saw an
+// unbound register -- which resolves to Int(0), not an error. Silent.
+
+#[test]
+fn REGRESSION_the_compiler_keeps_declared_parameter_names() {
+    let progs = compiler::compile(PROGRAM).expect("compile");
+    let solve = progs[0]
+        .functions
+        .iter()
+        .find(|f| f.name == "solve")
+        .expect("solve");
+    assert_eq!(solve.params, vec!["mention".to_string()]);
+
+    // and a zero-arg function has none
+    let ctor = progs[0].functions.iter().find(|f| f.name == "constructor").unwrap();
+    assert!(ctor.params.is_empty());
+}
+
+#[test]
+fn REGRESSION_host_args_bind_to_the_declared_name() {
+    // The program reads `mention`, not `arg0`. If binding regressed, the lookup
+    // silently misses and this returns zero chunks.
+    let (mut vm, name) = vm_with_facts();
+    assert_eq!(count(&mut vm, &name, "printing press"), 1);
+}
+
+#[test]
+fn argN_alias_still_works_for_backwards_compatibility() {
+    const BY_ARGN: &str = r#"
+program ByArgN {
+    @external
+    public function solve(mention: str): quantity {
+        query arg0;
+        create hits : quantity;
+        pop hits;
+        return hits;
+    }
+}
+"#;
+    let mut progs = compiler::compile(BY_ARGN).expect("compile");
+    let prog = progs.pop().unwrap();
+    let name = prog.name.clone();
+    let mut vm = VM::new();
+    vm.knowledge.load_jsonl(FACTS).unwrap();
+    vm.load(prog);
+    match vm.call(&name, "solve", vec![Value::Str("printing press".into())]) {
+        ExecResult::Ok(Value::Array(v)) | ExecResult::Return(Value::Array(v)) => {
+            assert_eq!(v.len(), 1)
+        }
+        other => panic!("argN alias broke: {:?}", other),
+    }
+}
+
+#[test]
+fn params_survive_the_cubebin_round_trip() {
+    // v3 carries parameter names between the function name and its bytecode.
+    // Without this, `cubelang run prog.cubebin` would lose them and fall back
+    // to `arg0` -- the bug would return the moment you compiled to disk.
+    let progs = compiler::compile(PROGRAM).expect("compile");
+    let bytes = progs[0].to_cubebin();
+    let back = compiler::CompiledProgram::from_cubebin(&bytes).expect("round trip");
+
+    let solve = back.functions.iter().find(|f| f.name == "solve").unwrap();
+    assert_eq!(solve.params, vec!["mention".to_string()]);
+
+    // and the reconstructed program still grounds
+    let name = back.name.clone();
+    let mut vm = VM::new();
+    vm.knowledge.load_jsonl(FACTS).unwrap();
+    vm.load(back);
+    let _ = vm.call(&name, "constructor", vec![]);
+    match vm.call(&name, "solve", vec![Value::Str("Movable Type Press".into())]) {
+        ExecResult::Ok(Value::Array(v)) | ExecResult::Return(Value::Array(v)) => {
+            assert_eq!(v.len(), 1, "alias lookup after round trip")
+        }
+        other => panic!("round-tripped program failed: {:?}", other),
+    }
 }
