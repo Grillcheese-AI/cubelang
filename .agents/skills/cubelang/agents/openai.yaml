@@ -1,0 +1,6 @@
+interface:
+  display_name: "Cubelang"
+  short_description: "Repo-specific patterns and workflows for cubelang"
+  default_prompt: "Use the cubelang repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true
