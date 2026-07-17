@@ -25,8 +25,9 @@ program Ground {
     public function solve(mention: str): quantity {
         query mention;
 
-        # `ctx` is the SPEC's own name for this. It must be usable.
+        # `ctx` is the SPEC's own name for this.
         create ctx : quantity;
+        # use `pop` to get the ctx variable properly
         pop ctx;
 
         let n = ctx.len();
@@ -35,7 +36,7 @@ program Ground {
         assign outcome = 0;
 
         if (n == 0) {
-            # The honest gap. Nothing failed; we simply have no fact.
+            # The gap. Nothing failed; we simply have no fact.
             add abstained, 1;
             assign outcome = 0;
         } else {
