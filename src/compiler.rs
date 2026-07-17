@@ -37,7 +37,45 @@ pub mod op {
     pub const INST: u8      = 0x36;
     pub const GEN: u8       = 0x37;
     pub const NEWVAR: u8    = 0x38;
-    pub const SKIP: u8      = 0xFF;
+    /// Early-return opcode (Plan-1). 0 operands: `RETURN` yields the current
+    /// accumulator. 1 operand: `RETURN <v>` resolves v (Imm/Float/Named) and
+    /// sets the accumulator before exiting. Lifts `Stmt::Return` out of
+    /// the SKIP-fallback that lets execution silently run past it.
+    pub const RETURN: u8    = 0x39;
+    /// Plan-3 array opcodes. MAKE_ARRAY builds a Value::Array in `dst` from N
+    /// element operands; LEN/INDEX inspect/extract from it. Pre-requisites for
+    /// real for-each lowering (Plan-4).
+    pub const MAKE_ARRAY: u8 = 0x3A;
+    pub const LEN: u8        = 0x3B;
+    pub const INDEX: u8      = 0x3C;
+    pub const SKIP: u8       = 0xFF;
+
+    // Extended reasoning opcodes (canonical values from opcode-vsa-rs ir.rs).
+    pub const SEQ: u8            = 0x16;
+    pub const DIFF: u8           = 0x18;
+    pub const DETECT_PATTERN: u8 = 0x19;
+    pub const PREDICT: u8        = 0x1A;
+    pub const MATCH: u8          = 0x1B;
+    pub const DEBATE: u8         = 0x1C;
+    pub const DISCOVER: u8       = 0x1E;
+    pub const DECODE: u8         = 0x23;
+    pub const SCORE: u8          = 0x24;
+    pub const SPECIALIZE: u8     = 0x25;
+    pub const REWARD: u8         = 0x27;
+    pub const INFER: u8          = 0x2A;
+    pub const MERGE: u8          = 0x2D;
+    pub const SPLIT: u8          = 0x2E;
+    pub const FILTER: u8         = 0x2F;
+    pub const MAP_ROLES: u8      = 0x30;
+    pub const REDUCE: u8         = 0x31;
+    pub const TEMPORAL_BIND: u8  = 0x32;
+    pub const ANALOGY: u8     = 0x33;
+    pub const BROADCAST: u8   = 0x2B;
+    pub const EXPLORE: u8     = 0x26;
+    pub const FORGE: u8       = 0x28;
+    pub const ASK: u8         = 0x1D;
+    pub const SYNC: u8        = 0x2C;
+    pub const FORGET: u8      = 0x22;
 }
 
 // ── Operand encoding ────────────────────────────────────────────────────────
@@ -47,6 +85,7 @@ const OP_IMM: u8    = 0x02;
 const OP_TYPE: u8   = 0x03;
 const OP_ROLE: u8   = 0x04;
 const OP_GLOBAL: u8 = 0x05;
+const OP_FLOAT: u8  = 0x06;
 const OP_NONE: u8   = 0x00;
 
 /// BLAKE3 2-byte prefix of a string (deterministic hash).
@@ -55,12 +94,59 @@ fn name_hash(s: &str) -> [u8; 2] {
     [h.as_bytes()[0], h.as_bytes()[1]]
 }
 
+/// Map an extended reasoning opcode to its canonical bytecode (opcode-vsa-rs ir.rs).
+fn ext_bytecode(o: ExtOp) -> u8 {
+    match o {
+        ExtOp::Seq           => op::SEQ,
+        ExtOp::Diff          => op::DIFF,
+        ExtOp::DetectPattern => op::DETECT_PATTERN,
+        ExtOp::Predict       => op::PREDICT,
+        ExtOp::Match         => op::MATCH,
+        ExtOp::Debate        => op::DEBATE,
+        ExtOp::Discover      => op::DISCOVER,
+        ExtOp::Decode        => op::DECODE,
+        ExtOp::Score         => op::SCORE,
+        ExtOp::Specialize    => op::SPECIALIZE,
+        ExtOp::Reward        => op::REWARD,
+        ExtOp::Infer         => op::INFER,
+        ExtOp::Merge         => op::MERGE,
+        ExtOp::Split         => op::SPLIT,
+        ExtOp::Filter        => op::FILTER,
+        ExtOp::MapRoles      => op::MAP_ROLES,
+        ExtOp::Reduce        => op::REDUCE,
+        ExtOp::Push          => op::PUSH,
+        ExtOp::Sum           => op::SUM,
+        ExtOp::Compare       => op::COMPARE,
+        ExtOp::TemporalBind  => op::TEMPORAL_BIND,
+        ExtOp::Analogy      => op::ANALOGY,
+        ExtOp::Gen          => op::GEN,
+        ExtOp::Inst         => op::INST,
+        ExtOp::Broadcast    => op::BROADCAST,
+        ExtOp::Explore      => op::EXPLORE,
+        ExtOp::Forge        => op::FORGE,
+        ExtOp::Ask          => op::ASK,
+        ExtOp::Sync         => op::SYNC,
+        ExtOp::Forget       => op::FORGET,
+    }
+}
+
 // ── Compiled output ─────────────────────────────────────────────────────────
 
 /// Magic bytes for .cubebin files.
 pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
 /// Current .cubebin format version.
-pub const CUBEBIN_VERSION: u8 = 1;
+///
+/// v2 appends a trailing symbol-name table (role + filler names used by
+/// BIND_ROLE/UNBIND) after the functions block. v1 readers stop after the
+/// functions; v2 readers parse the table when present. The reader treats a
+/// missing table (older/truncated input) as an empty table for compatibility.
+///
+/// v3 carries each function's DECLARED PARAMETER NAMES, between the function
+/// name and its bytecode. Without them `VM::call` had nothing to bind host
+/// arguments to and synthesized `arg0`/`arg1`, so a function declared
+/// `solve(mention: str)` read an unbound register. v2 files still load: their
+/// `params` is empty and `call` falls back to the old synthesis.
+pub const CUBEBIN_VERSION: u8 = 3;
 
 /// A compiled CubeLang program — serializable to `.cubebin` format.
 ///
@@ -94,6 +180,12 @@ pub struct CompiledProgram {
     pub implements: Vec<String>,
     pub functions: Vec<CompiledFunction>,
     pub storage_fields: Vec<String>,
+    /// Role and string-literal filler symbols that appear in `bind` statements.
+    /// The bytecode carries only 2-byte blake3 hashes of these names; the VM
+    /// reverses the hashes via this table so BIND_ROLE/UNBIND can drive the
+    /// real VSA codebook (which keys on the symbol strings). Empty for programs
+    /// with no bindings; loaded-from-disk programs repopulate it from .cubebin.
+    pub symbol_names: Vec<String>,
 }
 
 impl CompiledProgram {
@@ -127,9 +219,25 @@ impl CompiledProgram {
         for func in &self.functions {
             buf.push(func.name.len() as u8);
             buf.extend_from_slice(func.name.as_bytes());
+            // v3: declared parameter names, so a host can bind arguments by name
+            // rather than by the synthesized `arg0`/`arg1` fallback.
+            buf.push(func.params.len() as u8);
+            for p in &func.params {
+                buf.push(p.len() as u8);
+                buf.extend_from_slice(p.as_bytes());
+            }
             let bc_len = func.bytecode.len() as u32;
             buf.extend_from_slice(&bc_len.to_le_bytes());
             buf.extend_from_slice(&func.bytecode);
+        }
+
+        // Symbol-name table (v2+). u16 LE count, then each name as u8-len + utf8.
+        // These are the role/filler symbols BIND_ROLE/UNBIND need to reverse
+        // the 2-byte hashes carried in the bytecode.
+        buf.extend_from_slice(&(self.symbol_names.len() as u16).to_le_bytes());
+        for sym in &self.symbol_names {
+            buf.push(sym.len() as u8);
+            buf.extend_from_slice(sym.as_bytes());
         }
 
         buf
@@ -147,7 +255,10 @@ impl CompiledProgram {
 
         // Version
         let version = data[pos]; pos += 1;
-        if version != CUBEBIN_VERSION {
+        // v1: functions only. v2: + trailing symbol-name table.
+        // v3: + per-function declared parameter names. All three still load;
+        // older files simply carry no params and fall back to `argN` binding.
+        if version != 1 && version != 2 && version != 3 {
             return Err(format!("unsupported .cubebin version: {}", version));
         }
 
@@ -185,6 +296,19 @@ impl CompiledProgram {
             let fn_name = String::from_utf8_lossy(&data[pos..pos + fn_name_len]).to_string();
             pos += fn_name_len;
 
+            // v3 added declared parameter names here. v2 files have none: they
+            // load with an empty `params`, and `VM::call` falls back to the old
+            // `arg0`/`arg1` synthesis for them. Forward-compatible, not silent.
+            let mut params: Vec<String> = Vec::new();
+            if version >= 3 {
+                let n_params = data[pos] as usize; pos += 1;
+                for _ in 0..n_params {
+                    let l = data[pos] as usize; pos += 1;
+                    params.push(String::from_utf8_lossy(&data[pos..pos + l]).to_string());
+                    pos += l;
+                }
+            }
+
             let bc_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
             pos += 4;
             let bytecode = data[pos..pos + bc_len].to_vec();
@@ -192,13 +316,29 @@ impl CompiledProgram {
 
             functions.push(CompiledFunction {
                 name: fn_name,
+                params,
                 bytecode,
                 labels: Vec::new(),
                 debug_lines: Vec::new(),
             });
         }
 
-        Ok(CompiledProgram { name, implements, functions, storage_fields })
+        // Symbol-name table (v2+). Present when at least the u16 count remains.
+        // v1 input (or truncated) leaves this empty for backward compatibility.
+        let mut symbol_names = Vec::new();
+        if version >= 2 && pos + 2 <= data.len() {
+            let n_syms = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            for _ in 0..n_syms {
+                if pos >= data.len() { break; }
+                let len = data[pos] as usize; pos += 1;
+                if pos + len > data.len() { break; }
+                symbol_names.push(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+                pos += len;
+            }
+        }
+
+        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names })
     }
 
     /// Save to a `.cubebin` file.
@@ -217,6 +357,14 @@ impl CompiledProgram {
 #[derive(Debug, Clone)]
 pub struct CompiledFunction {
     pub name: String,
+    /// Declared parameter names, in order.
+    ///
+    /// These used to be discarded at compile time, which left `VM::call` with
+    /// nothing to bind host arguments to. It fell back to synthesizing `arg0`,
+    /// `arg1`, ... -- so a `.cube` function declared `solve(mention: str)` read
+    /// an UNBOUND register when called from a host. Every example in the SPEC
+    /// hits this. Carrying the names fixes it at the source.
+    pub params: Vec<String>,
     pub bytecode: Vec<u8>,
     pub labels: Vec<(String, usize)>,   // label name → byte offset
     pub debug_lines: Vec<DebugLine>,    // source mapping
@@ -247,6 +395,16 @@ pub struct Compiler {
     labels: Vec<(String, usize)>,
     debug_lines: Vec<DebugLine>,
     label_counter: u32,
+    /// Strict mode: rejects non-executing constructs (P0-1). Errors accumulate
+    /// in `strict_errors`; the public `compile_strict` API surfaces them.
+    strict: bool,
+    strict_errors: Vec<String>,
+    current_program: String,
+    current_function: String,
+    /// Role + string-literal filler names seen in `bind` statements, collected
+    /// so the VM can reverse the bytecode's 2-byte hashes for genuine VSA
+    /// binding. Deduplicated on insertion; attached to each CompiledProgram.
+    symbol_names: Vec<String>,
 }
 
 impl Compiler {
@@ -256,7 +414,29 @@ impl Compiler {
             labels: Vec::new(),
             debug_lines: Vec::new(),
             label_counter: 0,
+            strict: false,
+            strict_errors: Vec::new(),
+            current_program: String::new(),
+            current_function: String::new(),
+            symbol_names: Vec::new(),
         }
+    }
+
+    pub fn new_strict() -> Self {
+        let mut c = Self::new();
+        c.strict = true;
+        c
+    }
+
+    fn strict_violation(&mut self, construct: &str, line: Option<u32>) {
+        let where_ = format!("{}::{}", self.current_program, self.current_function);
+        let msg = match line {
+            Some(l) => format!("strict: {} at line {} in {} (non-executing in safe-subset VM)",
+                construct, l, where_),
+            None => format!("strict: {} in {} (non-executing in safe-subset VM)",
+                construct, where_),
+        };
+        self.strict_errors.push(msg);
     }
 
     /// Compile a full source file.
@@ -273,6 +453,10 @@ impl Compiler {
     fn compile_program(&mut self, prog: &ProgramDecl) -> CompiledProgram {
         let mut functions = Vec::new();
         let mut storage_fields = Vec::new();
+        self.current_program = prog.name.clone();
+        // Reset per-program symbol collection so bindings don't leak across
+        // programs compiled in the same pass.
+        self.symbol_names.clear();
 
         for item in &prog.body {
             match item {
@@ -293,6 +477,7 @@ impl Compiler {
             implements: prog.implements.clone(),
             functions,
             storage_fields,
+            symbol_names: std::mem::take(&mut self.symbol_names),
         }
     }
 
@@ -300,6 +485,7 @@ impl Compiler {
         self.bytecode.clear();
         self.labels.clear();
         self.debug_lines.clear();
+        self.current_function = func.sig.name.clone();
 
         for stmt in &func.body {
             self.compile_stmt(stmt);
@@ -307,15 +493,43 @@ impl Compiler {
 
         CompiledFunction {
             name: func.sig.name.clone(),
+            params: func.sig.params.iter().map(|p| p.name.clone()).collect(),
             bytecode: self.bytecode.clone(),
             labels: self.labels.clone(),
             debug_lines: self.debug_lines.clone(),
         }
     }
 
+    // ── Strict-mode safety check (P0-1) ─────────────────────────────────
+
+    fn strict_check_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            // Plan-4 lowered `for` to a real while+index loop, so it no longer
+            // counts as non-executing under strict mode.
+            Stmt::Match(m) => {
+                self.strict_violation("match (no arm selection at runtime)",
+                    Some(m.span.line));
+            }
+            // Plan-2: intra-program CALL now executes (snapshot/restore +
+            // stack-delivered return), so calls no longer trip strict mode.
+            Stmt::Opcode(OpcodeStmt::Extended { op: ext, .. }) => {
+                if is_trace_only_ext_op(*ext) {
+                    self.strict_violation(&format!("opcode {} (trace-only)", ext_name(*ext)), None);
+                }
+            }
+            Stmt::Opcode(OpcodeStmt::Unify { .. }) => {
+                self.strict_violation("opcode unify (trace-only)", None);
+            }
+            _ => {}
+        }
+    }
+
     // ── Statement compilation ───────────────────────────────────────────
 
     fn compile_stmt(&mut self, stmt: &Stmt) {
+        if self.strict {
+            self.strict_check_stmt(stmt);
+        }
         match stmt {
             Stmt::Opcode(op) => self.compile_opcode(op),
             Stmt::Let(l) => self.compile_let(l),
@@ -323,10 +537,22 @@ impl Compiler {
             Stmt::For(f) => self.compile_for(f),
             Stmt::While(w) => self.compile_while(w),
             Stmt::Match(m) => self.compile_match(m),
-            Stmt::Return(_) => {
-                // Return is handled by the VM runtime, emit SKIP as placeholder
-                self.emit_debug(op::SKIP, "return");
-                self.emit_byte(op::SKIP);
+            Stmt::Return(value) => {
+                // Plan-1: real early return. Bare `return;` → 0 operands.
+                // `return <expr>;` → 1 operand resolved at runtime.
+                match value {
+                    Some(expr) => {
+                        self.emit_debug(op::RETURN, "return value");
+                        self.emit_byte(op::RETURN);
+                        self.emit_byte(1);
+                        self.compile_expr_operand(expr);
+                    }
+                    None => {
+                        self.emit_debug(op::RETURN, "return");
+                        self.emit_byte(op::RETURN);
+                        self.emit_byte(0);
+                    }
+                }
             }
             Stmt::Atomic(a) => {
                 // Atomic block: snapshot ctx before, rollback on error
@@ -482,14 +708,32 @@ impl Compiler {
                 self.emit_named(reg);
                 self.compile_expr_operand(key);
             }
-            OpcodeStmt::Recall { key } => {
+            OpcodeStmt::Recall { reg, key } => {
                 self.emit_debug(op::RECALL, "recall ...");
                 self.emit_byte(op::RECALL);
-                self.emit_byte(1);
-                self.compile_expr_operand(key);
+                match reg {
+                    Some(r) => {
+                        self.emit_byte(2);
+                        self.emit_named(r);
+                        self.compile_expr_operand(key);
+                    }
+                    None => {
+                        self.emit_byte(1);
+                        self.compile_expr_operand(key);
+                    }
+                }
             }
             OpcodeStmt::Bind { reg, role, val } => {
                 self.emit_debug(op::BIND_ROLE, &format!("bind {} {} ...", reg, role));
+                // Record role + filler names so the VM can reverse the hashes
+                // for genuine VSA binding. The filler is a string literal or an
+                // identifier; other expr forms have no stable symbol to record.
+                self.record_symbol(role);
+                match val {
+                    Expr::StringLit(s) => self.record_symbol(s),
+                    Expr::Ident(n) => self.record_symbol(n),
+                    _ => {}
+                }
                 self.emit_byte(op::BIND_ROLE);
                 self.emit_byte(3);
                 self.emit_named(reg);
@@ -503,6 +747,45 @@ impl Compiler {
                 self.emit_named(a);
                 self.emit_named(b);
             }
+            OpcodeStmt::BindRole { reg, role } => {
+                // bind_role reg, ROLE : 2-arg surface form. Filler defaults to
+                // the register itself (self-binding the register into the role).
+                self.emit_debug(op::BIND_ROLE, &format!("bind_role {} {}", reg, role));
+                self.record_symbol(role);
+                self.record_symbol(reg);
+                self.emit_byte(op::BIND_ROLE);
+                self.emit_byte(3);
+                self.emit_named(reg);
+                self.emit_role(role);
+                self.emit_named(reg);
+            }
+            OpcodeStmt::Transfer { src, dst, amount } => {
+                self.emit_debug(op::TRANSFER, &format!("transfer {} {} ...", src, dst));
+                self.emit_byte(op::TRANSFER);
+                self.emit_byte(3);
+                self.emit_named(src);
+                self.emit_named(dst);
+                self.compile_expr_operand(amount);
+            }
+            OpcodeStmt::Compare { a, b } => {
+                self.emit_debug(op::COMPARE, &format!("compare {} {}", a, b));
+                self.emit_byte(op::COMPARE);
+                self.emit_byte(2);
+                self.emit_named(a);
+                self.emit_named(b);
+            }
+            OpcodeStmt::Extended { op: ext, args } => {
+                let code = ext_bytecode(*ext);
+                self.emit_debug(code, &format!("{:?} ({} args)", ext, args.len()));
+                self.emit_byte(code);
+                self.emit_byte(args.len() as u8);
+                for arg in args {
+                    match arg {
+                        ExtArg::Reg(name) => self.emit_named(name),
+                        ExtArg::Val(expr) => self.compile_expr_operand(expr),
+                    }
+                }
+            }
         }
     }
 
@@ -512,10 +795,10 @@ impl Compiler {
         let else_label = self.fresh_label("else");
         let end_label = self.fresh_label("endif");
 
-        // Condition → COND jump to else
-        self.emit_debug(op::COND, "if");
-        self.compile_expr_discard(&if_stmt.condition);
-        self.emit_jmp(&else_label);
+        // Evaluate condition → sets the VM comparison flag.
+        self.compile_condition(&if_stmt.condition);
+        // COND: jump to else_label if the flag is FALSE (skip the then-body).
+        self.emit_cond_jump(&else_label);
 
         // Then body
         for s in &if_stmt.then_body {
@@ -532,24 +815,90 @@ impl Compiler {
                 self.compile_stmt(s);
             }
         }
-
-        if if_stmt.else_body.is_some() {
-            self.emit_label(&end_label);
-        }
+        self.emit_label(&end_label);
     }
 
     fn compile_for(&mut self, for_stmt: &ForStmt) {
-        let loop_label = self.fresh_label("for");
-        let end_label = self.fresh_label("endfor");
+        // Plan-4. Lower `for (let x of arr) { body }` to an index-based while:
+        //
+        //   ASSIGN __i = 0
+        //   LEN __n, arr_reg
+        //   LABEL loop_top
+        //   COMPARE __i, __n, kind=2(lt) ; COND -> loop_end
+        //   INDEX <binding>, arr_reg, __i
+        //   <body>
+        //   ADD __i, 1
+        //   JMP loop_top
+        //   LABEL loop_end
+        //
+        // The iteration source must be available as a register: if it's already
+        // an Ident we name it directly; otherwise we materialise it into a
+        // fresh temp (handles `for (let x of [1,2,3])` and similar) via a
+        // recursive compile_let.
+        let n_id = { self.label_counter += 1; self.label_counter };
+        let i_var   = format!("__for_i_{}",   n_id);
+        let n_var   = format!("__for_n_{}",   n_id);
+        let arr_var = format!("__for_arr_{}", n_id);
+        let loop_top = self.fresh_label("for_top");
+        let end_label = self.fresh_label("for_end");
 
-        self.emit_label(&loop_label);
-        self.emit_debug(op::LOOP, &format!("for {} of ...", for_stmt.binding));
+        let arr_name: String = match &for_stmt.iter {
+            Expr::Ident(n) => n.clone(),
+            other => {
+                // Materialise into __for_arr_<n> via the same lowering used
+                // for any other `let`. Picks up ArrayLit -> MAKE_ARRAY.
+                let tmp_let = LetStmt {
+                    name: arr_var.clone(),
+                    ty: None,
+                    value: other.clone(),
+                    span: for_stmt.span,
+                };
+                self.compile_let(&tmp_let);
+                arr_var.clone()
+            }
+        };
 
+        // __i = 0
+        self.emit_byte(op::CREATE);  self.emit_byte(2);
+        self.emit_named(&i_var);     self.emit_type("auto");
+        self.emit_byte(op::ASSIGN);  self.emit_byte(2);
+        self.emit_named(&i_var);     self.emit_imm(0);
+
+        // LEN __n, arr_name
+        self.emit_debug(op::LEN, &format!("for: len {}", arr_name));
+        self.emit_byte(op::LEN);     self.emit_byte(2);
+        self.emit_named(&n_var);     self.emit_named(&arr_name);
+
+        // loop_top:
+        self.emit_label(&loop_top);
+
+        // COMPARE __i, __n, kind=2(lt) ; COND -> end
+        self.emit_debug(op::COMPARE, "for: i < n");
+        self.emit_byte(op::COMPARE); self.emit_byte(3);
+        self.emit_named(&i_var);     self.emit_named(&n_var);
+        self.emit_imm(2);
+        self.emit_cond_jump(&end_label);
+
+        // INDEX <binding>, arr_name, __i
+        self.emit_byte(op::CREATE);  self.emit_byte(2);
+        self.emit_named(&for_stmt.binding); self.emit_type("auto");
+        self.emit_debug(op::INDEX, &format!("for: {} = {}[i]", for_stmt.binding, arr_name));
+        self.emit_byte(op::INDEX);   self.emit_byte(3);
+        self.emit_named(&for_stmt.binding);
+        self.emit_named(&arr_name);
+        self.emit_named(&i_var);
+
+        // body
         for s in &for_stmt.body {
             self.compile_stmt(s);
         }
 
-        self.emit_jmp(&loop_label);
+        // ADD __i, 1
+        self.emit_byte(op::ADD);     self.emit_byte(2);
+        self.emit_named(&i_var);     self.emit_imm(1);
+
+        // JMP loop_top ; LABEL loop_end
+        self.emit_jmp(&loop_top);
         self.emit_label(&end_label);
     }
 
@@ -557,14 +906,18 @@ impl Compiler {
         let loop_label = self.fresh_label("while");
         let end_label = self.fresh_label("endwhile");
 
+        // loop_top:
         self.emit_label(&loop_label);
-        self.emit_debug(op::LOOP, "while");
-        self.compile_expr_discard(&while_stmt.condition);
+        // Evaluate condition → flag; COND jumps to end_label if false.
+        self.compile_condition(&while_stmt.condition);
+        self.emit_cond_jump(&end_label);
 
+        // body
         for s in &while_stmt.body {
             self.compile_stmt(s);
         }
 
+        // jump back to re-test the condition
         self.emit_jmp(&loop_label);
         self.emit_label(&end_label);
     }
@@ -594,10 +947,87 @@ impl Compiler {
             self.emit_type("auto");
         }
 
+        // Plan-2: `let x = foo(args)` lowers to CALL + POP x so the callee's
+        // return value (stack-delivered) lands in x. Other RHS forms keep the
+        // existing ASSIGN path.
+        if let Expr::Call(callee, args) = &let_stmt.value {
+            self.emit_call(callee, args);
+            self.emit_debug(op::POP, &format!("pop {}", let_stmt.name));
+            self.emit_byte(op::POP);
+            self.emit_byte(1);
+            self.emit_named(&let_stmt.name);
+            return;
+        }
+
+        // Plan-3 array RHS lowerings.
+        match &let_stmt.value {
+            // let xs = [a, b, c] → MAKE_ARRAY xs, n, a, b, c
+            Expr::ArrayLit(elems) => {
+                self.emit_debug(op::MAKE_ARRAY,
+                    &format!("make_array {} (n={})", let_stmt.name, elems.len()));
+                self.emit_byte(op::MAKE_ARRAY);
+                self.emit_byte((elems.len() as u8).saturating_add(2));
+                self.emit_named(&let_stmt.name);
+                self.emit_imm(elems.len() as i64);
+                for e in elems { self.compile_expr_operand(e); }
+                return;
+            }
+            // let n = arr.len() → LEN n, arr (special-case the built-in;
+            // any other method falls through to the CALL path above).
+            Expr::MethodCall(obj, method, args) if method == "len" && args.is_empty() => {
+                if let Expr::Ident(arr) = obj.as_ref() {
+                    self.emit_debug(op::LEN, &format!("len {} = {}.len()", let_stmt.name, arr));
+                    self.emit_byte(op::LEN);
+                    self.emit_byte(2);
+                    self.emit_named(&let_stmt.name);
+                    self.emit_named(arr);
+                    return;
+                }
+            }
+            // let x = arr[i] → INDEX x, arr, i
+            Expr::Index(arr_expr, idx_expr) => {
+                if let Expr::Ident(arr) = arr_expr.as_ref() {
+                    self.emit_debug(op::INDEX,
+                        &format!("index {} = {}[...]", let_stmt.name, arr));
+                    self.emit_byte(op::INDEX);
+                    self.emit_byte(3);
+                    self.emit_named(&let_stmt.name);
+                    self.emit_named(arr);
+                    self.compile_expr_operand(idx_expr);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
         self.emit_byte(op::ASSIGN);
         self.emit_byte(2);
         self.emit_named(&let_stmt.name);
         self.compile_expr_operand(&let_stmt.value);
+    }
+
+    /// Plan-2: emit `CALL <fn_name>, arg0, ..., argN` with all args resolved
+    /// at call time. Method calls fall back to `CALL <method>, <receiver>` —
+    /// the receiver becomes arg0; full method dispatch is a later refinement.
+    fn emit_call(&mut self, callee: &Expr, args: &[Expr]) {
+        match callee {
+            Expr::Ident(name) => {
+                self.emit_debug(op::CALL, &format!("call {}({})", name, args.len()));
+                self.emit_byte(op::CALL);
+                self.emit_byte((args.len() + 1) as u8);
+                self.emit_global(name);
+                for a in args { self.compile_expr_operand(a); }
+            }
+            _ => {
+                self.emit_debug(op::CALL, "call <expr>");
+                self.emit_byte(op::CALL);
+                self.emit_byte((args.len() + 1) as u8);
+                self.emit_byte(OP_NONE);
+                self.emit_byte(0x00);
+                self.emit_byte(0x00);
+                for a in args { self.compile_expr_operand(a); }
+            }
+        }
     }
 
     // ── Expression compilation (to operand bytes) ───────────────────────
@@ -605,7 +1035,7 @@ impl Compiler {
     fn compile_expr_operand(&mut self, expr: &Expr) {
         match expr {
             Expr::IntLit(n) => self.emit_imm(*n),
-            Expr::FloatLit(f) => self.emit_imm(*f as i64),
+            Expr::FloatLit(f) => self.emit_float_imm(*f),
             Expr::StringLit(s) => self.emit_global(s),
             Expr::BoolLit(b) => self.emit_imm(if *b { 1 } else { 0 }),
             Expr::Null => self.emit_imm(0),
@@ -632,22 +1062,25 @@ impl Compiler {
     fn compile_expr_discard(&mut self, expr: &Expr) {
         match expr {
             Expr::Call(callee, args) => {
-                self.emit_debug(op::CALL, "call");
-                self.emit_byte(op::CALL);
+                // Plan-2: emit CALL with args, then POP into __discard so the
+                // callee's return value (always pushed by CALL) doesn't leak
+                // onto the caller's value stack across the next statement.
+                self.emit_call(callee, args);
+                self.emit_byte(op::POP);
                 self.emit_byte(1);
-                if let Expr::Ident(name) = callee.as_ref() {
-                    self.emit_global(name);
-                } else {
-                    self.emit_byte(OP_NONE);
-                    self.emit_byte(0x00);
-                    self.emit_byte(0x00);
-                }
+                self.emit_named("__call_discard");
             }
-            Expr::MethodCall(obj, method, args) => {
+            Expr::MethodCall(_obj, method, args) => {
+                // v1: method becomes the fn name; receiver becomes arg0.
+                // (Full method dispatch is a later refinement.)
                 self.emit_debug(op::CALL, &format!(".{}()", method));
                 self.emit_byte(op::CALL);
-                self.emit_byte(1);
+                self.emit_byte((args.len() + 1) as u8);
                 self.emit_global(method);
+                for a in args { self.compile_expr_operand(a); }
+                self.emit_byte(op::POP);
+                self.emit_byte(1);
+                self.emit_named("__call_discard");
             }
             _ => {
                 // Side-effect-free expression — emit SKIP
@@ -676,6 +1109,13 @@ impl Compiler {
         }
     }
 
+    fn emit_float_imm(&mut self, val: f64) {
+        self.emit_byte(OP_FLOAT);
+        for b in val.to_le_bytes() {
+            self.emit_byte(b);
+        }
+    }
+
     fn emit_type(&mut self, ty: &str) {
         self.emit_byte(OP_TYPE);
         let hash = name_hash(ty);
@@ -691,6 +1131,12 @@ impl Compiler {
     }
 
     fn emit_global(&mut self, name: &str) {
+        // Globals (string literals, mostly) compile to a 2-byte hash. Record the
+        // spelling so `VM::load` puts it in the name table and
+        // `resolve_symbol_name` can reverse it. Without this an ASK's question
+        // text -- the very thing the trunk is supposed to render into language
+        // for the user -- comes back as `g_e009`.
+        self.record_symbol(name);
         self.emit_byte(OP_GLOBAL);
         let hash = name_hash(name);
         self.emit_byte(hash[0]);
@@ -712,6 +1158,51 @@ impl Compiler {
         self.emit_global(label);
     }
 
+    /// Emit a conditional jump: COND <label>. At runtime the VM jumps to
+    /// `label` if the comparison flag is FALSE (i.e. skip-if-false).
+    fn emit_cond_jump(&mut self, label: &str) {
+        self.emit_debug(op::COND, &format!("cond -> {}", label));
+        self.emit_byte(op::COND);
+        self.emit_byte(1);
+        self.emit_global(label);
+    }
+
+    /// Lower a boolean condition expression so it leaves a result in the VM's
+    /// comparison flag. Comparisons (`a > b`, `a == b`, ...) lower to a COMPARE
+    /// carrying the two operands plus a comparison-kind immediate. Any other
+    /// expression is compared against truthiness (`expr != 0`).
+    ///
+    /// COMPARE operand layout: [lhs, rhs, kind_imm] where kind ∈
+    /// 0=eq 1=ne 2=lt 3=le 4=gt 5=ge 6=truthy.
+    fn compile_condition(&mut self, cond: &Expr) {
+        if let Expr::BinOp(lhs, bop, rhs) = cond {
+            let kind: Option<i64> = match bop {
+                BinOp::Eq => Some(0),
+                BinOp::NotEq => Some(1),
+                BinOp::Lt => Some(2),
+                BinOp::LtEq => Some(3),
+                BinOp::Gt => Some(4),
+                BinOp::GtEq => Some(5),
+                _ => None, // And/Or/arithmetic: fall through to truthy below
+            };
+            if let Some(k) = kind {
+                self.emit_debug(op::COMPARE, &format!("cond {:?}", bop));
+                self.emit_byte(op::COMPARE);
+                self.emit_byte(3);
+                self.compile_expr_operand(lhs);
+                self.compile_expr_operand(rhs);
+                self.emit_imm(k);
+                return;
+            }
+        }
+        // Fallback: truthiness test of a single expression (kind = 6).
+        self.emit_debug(op::COMPARE, "cond truthy");
+        self.emit_byte(op::COMPARE);
+        self.emit_byte(2);
+        self.compile_expr_operand(cond);
+        self.emit_imm(6);
+    }
+
     fn emit_debug(&mut self, opcode: u8, description: &str) {
         self.debug_lines.push(DebugLine {
             offset: self.bytecode.len(),
@@ -723,6 +1214,15 @@ impl Compiler {
     fn fresh_label(&mut self, prefix: &str) -> String {
         self.label_counter += 1;
         format!("_{}_{}", prefix, self.label_counter)
+    }
+
+    /// Record a role/filler symbol name (deduplicated) so the VM can reverse
+    /// the 2-byte hash the bytecode carries back to the original string for
+    /// genuine VSA codebook lookups.
+    fn record_symbol(&mut self, name: &str) {
+        if !self.symbol_names.iter().any(|s| s == name) {
+            self.symbol_names.push(name.to_string());
+        }
     }
 }
 
@@ -738,6 +1238,46 @@ fn type_name(ty: &TypeExpr) -> String {
     }
 }
 
+/// True when this extended opcode does NOT execute value-level semantics in
+/// the current VM (it only emits a structural trace line). The strict-mode
+/// blocklist (P0-1) uses this; it is also the authoritative list for the
+/// `validate` subcommand (P0-3). The list mirrors `trace_structural` in
+/// `src/vm/engine.rs` — keep in sync as P2 opcodes start executing.
+pub fn is_trace_only_ext_op(o: ExtOp) -> bool {
+    matches!(o,
+        ExtOp::Infer | ExtOp::MapRoles | ExtOp::Filter | ExtOp::Score
+        | ExtOp::DetectPattern | ExtOp::Decode | ExtOp::Reduce | ExtOp::Merge
+        | ExtOp::Split | ExtOp::Debate | ExtOp::Predict | ExtOp::Discover
+        | ExtOp::Diff | ExtOp::Seq | ExtOp::Specialize | ExtOp::Reward
+        | ExtOp::Match | ExtOp::TemporalBind | ExtOp::Analogy | ExtOp::Gen
+        | ExtOp::Inst | ExtOp::Broadcast | ExtOp::Explore | ExtOp::Forge
+        | ExtOp::Ask | ExtOp::Sync
+    )
+}
+
+/// Canonical lowercase mnemonic for an extended opcode (matches the surface
+/// keyword in source).
+pub fn ext_name(o: ExtOp) -> &'static str {
+    match o {
+        ExtOp::Infer => "infer",            ExtOp::MapRoles => "map_roles",
+        ExtOp::Filter => "filter",          ExtOp::Score => "score",
+        ExtOp::DetectPattern => "detect_pattern",
+        ExtOp::Decode => "decode",          ExtOp::Reduce => "reduce",
+        ExtOp::Merge => "merge",            ExtOp::Split => "split",
+        ExtOp::Debate => "debate",          ExtOp::Predict => "predict",
+        ExtOp::Discover => "discover",      ExtOp::Diff => "diff",
+        ExtOp::Seq => "seq",                ExtOp::Specialize => "specialize",
+        ExtOp::Reward => "reward",          ExtOp::Match => "match",
+        ExtOp::Push => "push",              ExtOp::Sum => "sum",
+        ExtOp::Compare => "compare",        ExtOp::TemporalBind => "temporal_bind",
+        ExtOp::Analogy => "analogy",        ExtOp::Gen => "gen",
+        ExtOp::Inst => "inst",              ExtOp::Broadcast => "broadcast",
+        ExtOp::Explore => "explore",        ExtOp::Forge => "forge",
+        ExtOp::Ask => "ask",                ExtOp::Sync => "sync",
+        ExtOp::Forget => "forget",
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Compile CubeLang source to bytecode programs.
@@ -745,6 +1285,20 @@ pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::Pars
     let ast = crate::parser::parse(source)?;
     let mut compiler = Compiler::new();
     Ok(compiler.compile(&ast))
+}
+
+/// Compile in strict mode (P0-1): rejects any construct that compiles but does
+/// not execute under the safe-subset VM — extended trace-only opcodes,
+/// `for`, `match`, intra-program `call`. Returns one combined error string
+/// listing every violation (named construct + source line when available).
+pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
+    let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
+    let mut compiler = Compiler::new_strict();
+    let programs = compiler.compile(&ast);
+    if !compiler.strict_errors.is_empty() {
+        return Err(compiler.strict_errors.join("\n"));
+    }
+    Ok(programs)
 }
 
 #[cfg(test)]
@@ -961,7 +1515,7 @@ mod tests {
         // Serialize
         let bin = prog.to_cubebin();
         assert_eq!(&bin[0..4], b"CUBE");
-        assert_eq!(bin[4], 1); // version
+        assert_eq!(bin[4], CUBEBIN_VERSION); // version (v2: + symbol table)
 
         // Deserialize
         let loaded = CompiledProgram::from_cubebin(&bin).unwrap();
@@ -1001,6 +1555,135 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── P0-1: --strict compile mode ──────────────────────────────────
+
+    #[test]
+    fn strict_qc_decision_compiles() {
+        let source = include_str!("../examples/qc_decision.cube");
+        let result = compile_strict(source);
+        assert!(result.is_ok(),
+            "qc_decision.cube (safe-subset reference) must compile under --strict: {:?}",
+            result.err());
+    }
+
+    #[test]
+    fn strict_accepts_for_now_that_it_executes() {
+        // Plan-4: `for` lowers to while+index; it executes for real and is
+        // no longer a strict-mode violation.
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    let xs = [1, 2, 3];
+                    create total : quantity;
+                    assign total = 0;
+                    for (let x of xs) {
+                        add total, x;
+                    }
+                    sum total;
+                }
+            }
+        "#;
+        compile_strict(source).expect("for must be accepted under --strict now");
+    }
+
+    #[test]
+    fn strict_rejects_match() {
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    match (x) {
+                        1 => { sum x; }
+                        _ => { query x; }
+                    }
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("match must be rejected in --strict");
+        let low = err.to_lowercase();
+        assert!(low.contains("match"), "error must name 'match': got: {}", err);
+        assert!(err.contains("line"), "error must include source line: got: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_trace_only_predict() {
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    predict x;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("predict must be rejected in --strict");
+        assert!(err.to_lowercase().contains("predict"),
+            "error must name 'predict': got: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_trace_only_infer() {
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    infer x;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("infer must be rejected in --strict");
+        assert!(err.to_lowercase().contains("infer"));
+    }
+
+    #[test]
+    fn strict_accepts_call_now_that_it_executes() {
+        // Plan-2: CALL is real. A program whose only "stub" risk is a call
+        // should now compile under --strict.
+        let source = r#"
+            program Test implements ISolver {
+                public function helper(): quantity {
+                    return 1;
+                }
+                public function run(): void {
+                    let r = helper();
+                    sum r;
+                }
+            }
+        "#;
+        compile_strict(source).expect("CALL must be accepted under --strict now");
+    }
+
+    #[test]
+    fn strict_reports_all_violations_not_just_first() {
+        // Two distinct violations on different lines — both should be reported.
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    predict x;
+                    infer y;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("both violations should be rejected");
+        let low = err.to_lowercase();
+        assert!(low.contains("predict"), "error must mention predict: {}", err);
+        assert!(low.contains("infer"),   "error must mention infer: {}", err);
+    }
+
+    #[test]
+    fn non_strict_compile_still_allows_trace_only() {
+        // Non-strict path must keep accepting these (regression guard).
+        let source = r#"
+            program Test implements ISolver {
+                public function run(): void {
+                    predict x;
+                    infer y;
+                }
+            }
+        "#;
+        let programs = compile(source).expect("non-strict compile must accept trace-only ops");
+        assert_eq!(programs.len(), 1);
+        let func = &programs[0].functions[0];
+        assert!(func.bytecode.contains(&op::PREDICT));
+        assert!(func.bytecode.contains(&op::INFER));
     }
 
     #[test]

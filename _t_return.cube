@@ -1,0 +1,15 @@
+program RetTest implements ISolver {
+  type Input = quantity; type Output = quantity;
+  storage { side: mutable u64 = 0; }
+  @system @once public function constructor() { assign side = 0; }
+  @external public function parse(raw: str): Input { return raw; }
+  @external public function solve(input: Input): Output {
+    create d : quantity; assign d = 0;
+    assign d = 1;
+    return d;
+    add side, 99;
+    assign d = 7;
+    sum d; return d;
+  }
+  @external public pure function verify(i: Input, o: Output): bool { return true; }
+}

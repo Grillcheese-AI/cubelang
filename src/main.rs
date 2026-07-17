@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use cubelang::compiler::{self, CompiledProgram, op};
+use cubelang::vm::{VM, ExecResult, Value};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,11 +23,13 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "compile" | "c" => cmd_compile(&args[2..]),
-        "inspect" | "i" => cmd_inspect(&args[2..]),
-        "disasm"  | "d" => cmd_disasm(&args[2..]),
-        "check"   | "k" => cmd_check(&args[2..]),
-        "version" | "v" | "--version" | "-v" => cmd_version(),
+        "compile"  | "c" => cmd_compile(&args[2..]),
+        "inspect"  | "i" => cmd_inspect(&args[2..]),
+        "disasm"   | "d" => cmd_disasm(&args[2..]),
+        "check"    | "k" => cmd_check(&args[2..]),
+        "validate" | "vd" => cmd_validate(&args[2..]),
+        "run"      | "r" => cmd_run(&args[2..]),
+        "version"  | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
             eprintln!("unknown command: {}", args[1]);
@@ -43,18 +46,22 @@ USAGE:
     cubelang <command> [options] <file>
 
 COMMANDS:
-    compile, c    Compile .cube to .cubebin
-    inspect, i    Show .cubebin program info
-    disasm,  d    Disassemble .cubebin to readable opcodes
-    check,   k    Parse and check .cube without compiling
-    version, v    Print version
+    compile,  c    Compile .cube to .cubebin (use --strict to reject stubs)
+    run,      r    Compile (or load .cubebin) and execute a program
+    inspect,  i    Show .cubebin program info
+    disasm,   d    Disassemble .cubebin to readable opcodes
+    check,    k    Parse and check .cube without compiling
+    validate, vd   Report executing vs trace-only opcodes per function
+    version,  v    Print version
 
 EXAMPLES:
     cubelang compile examples/gsm8k.cube
+    cubelang compile --strict examples/qc_decision.cube
     cubelang compile examples/gsm8k.cube -o build/gsm8k.cubebin
     cubelang inspect build/gsm8k.cubebin
     cubelang disasm build/gsm8k.cubebin
     cubelang check examples/gsm8k.cube
+    cubelang run examples/fibonacci.cube --trace
 "#);
 }
 
@@ -67,13 +74,27 @@ fn cmd_version() {
 fn cmd_compile(args: &[String]) {
     if args.is_empty() {
         eprintln!("error: missing input file");
-        eprintln!("usage: cubelang compile <file.cube> [-o output.cubebin]");
+        eprintln!("usage: cubelang compile [--strict] <file.cube> [-o output.cubebin]");
         process::exit(1);
     }
 
-    let input = &args[0];
-    let output = if args.len() >= 3 && args[1] == "-o" {
-        PathBuf::from(&args[2])
+    // Parse flags and positional args. `--strict` (P0-1) rejects non-executing
+    // constructs (trace-only opcodes, `for`, `match`, intra-program `call`).
+    let mut strict = false;
+    let mut positional: Vec<&String> = Vec::new();
+    for arg in args {
+        if arg == "--strict" { strict = true; } else { positional.push(arg); }
+    }
+
+    if positional.is_empty() {
+        eprintln!("error: missing input file");
+        eprintln!("usage: cubelang compile [--strict] <file.cube> [-o output.cubebin]");
+        process::exit(1);
+    }
+
+    let input = positional[0];
+    let output = if positional.len() >= 3 && positional[1] == "-o" {
+        PathBuf::from(positional[2])
     } else {
         Path::new(input).with_extension("cubebin")
     };
@@ -87,12 +108,22 @@ fn cmd_compile(args: &[String]) {
         }
     };
 
-    // Compile
-    let programs = match compiler::compile(&source) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            process::exit(1);
+    // Compile (--strict surfaces non-executing constructs as hard errors).
+    let programs = if strict {
+        match compiler::compile_strict(&source) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error (--strict): {}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        match compiler::compile(&source) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
         }
     };
 
@@ -269,6 +300,8 @@ fn opcode_name(code: u8) -> &'static str {
         0x15 => "LABEL",      0x16 => "SEQ",        0x17 => "UNSEQ",
         0x21 => "REMEMBER",   0x34 => "SUM",        0x35 => "UNIFY",
         0x36 => "INST",       0x37 => "GEN",        0x38 => "NEWVAR",
+        0x39 => "RETURN",
+        0x3A => "MAKE_ARRAY", 0x3B => "LEN",       0x3C => "INDEX",
         0xFF => "SKIP",
         _ => "???",
     }
@@ -316,6 +349,236 @@ fn cmd_check(args: &[String]) {
             eprintln!("  {} error: {}", args[0], e);
             process::exit(1);
         }
+    }
+}
+
+// ── validate ────────────────────────────────────────────────────────────────
+
+fn cmd_validate(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: cubelang validate <file.cube>");
+        process::exit(1);
+    }
+
+    let source = match std::fs::read_to_string(&args[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", args[0], e);
+            process::exit(1);
+        }
+    };
+
+    let report = match cubelang::validate::validate(&source) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    print!("{}", report);
+    if !report.is_clean() {
+        eprintln!("\n{} trace-only / stub construct(s) found", report.finding_count());
+        process::exit(1);
+    }
+}
+
+// ── run ─────────────────────────────────────────────────────────────────────
+
+fn cmd_run(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: cubelang run <file.cube|file.cubebin> \
+                   [--fn name] [--trace] [--json] [--arg VALUE]... \
+                   [--knowledge facts.jsonl]");
+        process::exit(1);
+    }
+
+    let input = &args[0];
+    let mut target_fn = "solve".to_string();
+    let mut trace = false;
+    let mut json_out = false;
+    let mut knowledge_path: Option<String> = None;
+    let mut call_args: Vec<Value> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--fn" | "-f" => { if i + 1 < args.len() { target_fn = args[i + 1].clone(); i += 1; } }
+            "--trace" | "-t" => trace = true,
+            "--json" | "-j" => json_out = true,
+            // Facts for QUERY. Without this the VM has no knowledge and
+            // abstains on every query -- which is correct, but not useful.
+            "--knowledge" | "-k" => {
+                if i + 1 < args.len() { knowledge_path = Some(args[i + 1].clone()); i += 1; }
+            }
+            // Arguments bound to the function's DECLARED parameter names.
+            "--arg" | "-a" => {
+                if i + 1 < args.len() { call_args.push(Value::Str(args[i + 1].clone())); i += 1; }
+            }
+            other => { eprintln!("warning: ignoring unknown option {}", other); }
+        }
+        i += 1;
+    }
+
+    // Load: compile .cube in-memory, or load a .cubebin directly.
+    let mut vm = VM::new();
+    vm.trace_enabled = trace;
+
+    if let Some(kp) = &knowledge_path {
+        match std::fs::read_to_string(kp) {
+            Ok(data) => match vm.knowledge.load_jsonl(&data) {
+                Ok((facts, aliases)) => {
+                    if !json_out {
+                        println!("  knowledge: {} facts, {} aliases from {}",
+                                 facts, aliases, kp);
+                    }
+                }
+                // A malformed fact file must fail loudly. Silently grounding
+                // against a half-loaded store is worse than not grounding.
+                Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+            },
+            Err(e) => { eprintln!("error: cannot read {}: {}", kp, e); process::exit(1); }
+        }
+    }
+
+    let prog_name: String = if input.ends_with(".cubebin") {
+        match vm.load_file(Path::new(input)) {
+            Ok(name) => name,
+            Err(e) => { eprintln!("error: cannot load {}: {}", input, e); process::exit(1); }
+        }
+    } else {
+        let source = match std::fs::read_to_string(input) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("error: cannot read {}: {}", input, e); process::exit(1); }
+        };
+        let programs = match compiler::compile(&source) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+        };
+        if programs.is_empty() {
+            eprintln!("error: no programs in {}", input);
+            process::exit(1);
+        }
+        let name = programs[0].name.clone();
+        for p in programs { vm.load(p); }
+        name
+    };
+
+    // Run the constructor first if the program defines one (sets up storage).
+    let _ = vm.call(&prog_name, "constructor", Vec::new());
+
+    // Run the target function.
+    let result = vm.call(&prog_name, &target_fn, call_args);
+
+    if trace && !json_out {
+        println!("# trace ({} ops):", vm.trace.len());
+        for line in &vm.trace { println!("  {}", line); }
+        println!();
+    }
+
+    match result {
+        ExecResult::Ok(val) | ExecResult::Return(val) => {
+            if json_out {
+                println!("{}", serde_json::json!({
+                    "ok": true,
+                    "program": prog_name,
+                    "function": target_fn,
+                    "result": value_to_json(&val),
+                }));
+            } else {
+                println!("  {}.{}() -> {}", prog_name, target_fn, val);
+            }
+        }
+        ExecResult::Suspend(susp) => {
+            // The program asked. It is neither finished nor broken: it grounded
+            // several candidates and only the caller can choose.
+            //
+            // THE REAL CALLER IS THE MODEL, NOT A HUMAN. The trunk renders the
+            // question + candidates into language, the user replies in language,
+            // and the trunk maps that reply back to one of the candidates before
+            // calling `vm.resume`. `--json` is that boundary.
+            if json_out {
+                println!("{}", serde_json::json!({
+                    "ok": true,
+                    "suspended": true,
+                    "program": susp.program,
+                    "function": susp.function,
+                    "question": value_to_json(&susp.question),
+                    "candidates": susp.candidates.iter().map(value_to_json).collect::<Vec<_>>(),
+                }));
+            } else {
+                // DEBUG HARNESS ONLY. A person never picks an index in the real
+                // system; this exists so `cubelang run` can exercise resume from
+                // a terminal. Do not mistake it for the interface.
+                eprintln!("  [debug harness: the model, not a person, answers ASK]");
+                println!("  ? {}", susp.question);
+                for (i, c) in susp.candidates.iter().enumerate() {
+                    // A QUERY chunk is a Map; showing "{3 entries}" defeats the
+                    // point of a harness meant to exercise the contract by hand.
+                    match c {
+                        Value::Map(m) => {
+                            let text = m.get("text").map(|v| v.to_string()).unwrap_or_default();
+                            let src = m.get("source").map(|v| v.to_string()).unwrap_or_default();
+                            println!("      [{}] {}", i, text);
+                            if !src.is_empty() {
+                                println!("          {}", src);
+                            }
+                        }
+                        other => println!("      [{}] {}", i, other),
+                    }
+                }
+                print!("  choose [0-{}]: ", susp.candidates.len().saturating_sub(1));
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+
+                let mut line = String::new();
+                let answer = match std::io::stdin().read_line(&mut line) {
+                    Ok(_) => match line.trim().parse::<usize>() {
+                        Ok(i) if i < susp.candidates.len() => susp.candidates[i].clone(),
+                        _ => Value::Null,
+                    },
+                    Err(_) => Value::Null,
+                };
+
+                match vm.resume(susp, answer) {
+                    ExecResult::Ok(val) | ExecResult::Return(val) => {
+                        println!("  {}.{}() -> {}", prog_name, target_fn, val);
+                    }
+                    ExecResult::Suspend(s2) => {
+                        println!("  (suspended again: {})", s2.question);
+                    }
+                    ExecResult::Error(e) => {
+                        eprintln!("  error after resume: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        ExecResult::Error(e) => {
+            if json_out {
+                println!("{}", serde_json::json!({"ok": false, "error": e}));
+            } else {
+                eprintln!("  {}.{}() runtime error: {}", prog_name, target_fn, e);
+            }
+            process::exit(1);
+        }
+    }
+}
+
+/// Serialize a VM result Value to JSON for the `run --json` bridge output
+/// (cubbyverse parses this structured result; protobuf is a later transport swap).
+fn value_to_json(v: &cubelang::vm::Value) -> serde_json::Value {
+    use cubelang::vm::Value;
+    match v {
+        Value::Int(n) => serde_json::json!(n),
+        Value::Float(f) => serde_json::json!(f),
+        Value::Str(s) => serde_json::json!(s),
+        Value::Bool(b) => serde_json::json!(b),
+        Value::Null => serde_json::Value::Null,
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(value_to_json).collect()),
+        Value::Map(m) => serde_json::Value::Object(
+            m.iter().map(|(k, val)| (k.clone(), value_to_json(val))).collect(),
+        ),
+        Value::Hvec(h) => serde_json::json!({ "hvec_dim": h.dim() }),
     }
 }
 

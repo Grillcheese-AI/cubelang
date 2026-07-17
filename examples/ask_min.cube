@@ -1,0 +1,41 @@
+# ask_min.cube - the ASK/Suspend contract.
+#
+# The program grounds two real candidates and cannot choose between them. It
+# must not pick one (that is a confabulation) and must not fail (nothing went
+# wrong). It ASKs, suspends, and resumes with the caller's answer.
+#
+# Modelled on the measured DBpedia case: the "Moon landing" abstract cites BOTH
+# Luna 2 (13 September 1959) and Apollo 11 (20 July 1969). Only the user knows
+# which landing they meant. Picking silently would be a CITED FALSEHOOD.
+
+program AskMin {
+
+    storage {
+        asked: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign asked = 0;
+    }
+
+    @external
+    public function solve(): quantity {
+        create luna : quantity;
+        assign luna = 1959;
+
+        create apollo : quantity;
+        assign apollo = 1969;
+
+        # Two grounded candidates, no way to choose. Hand it outward.
+        # ASK suspends here. The caller's answer arrives on the stack, the same
+        # way CALL delivers a return value -- so `pop` binds it.
+        ask "which moon landing did you mean", luna, apollo;
+
+        # Execution RESUMES here.
+        create chosen : quantity;
+        pop chosen;
+        sum chosen;
+        return chosen;
+    }
+}

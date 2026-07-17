@@ -1,0 +1,65 @@
+# recall_min.cube - A-tier reasoning kernel: store-correct-recall.
+# Pattern: store an initial belief -> receive a correction (overwrite the same
+# key) -> RECALL -> the corrected value is what is retrieved. Exercises the
+# hippocampal memory overwrite semantics (store under an existing key replaces
+# the payload). A genuine belief-revision / error-correction reasoning primitive.
+
+interface ISolver {
+    type Input;
+    type Output;
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+}
+
+program RecallMin implements ISolver {
+    type Input = quantity;
+    type Output = quantity;
+
+    storage {
+        corrections_applied: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign corrections_applied = 0;
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return raw;
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        # initial (wrong) belief about a quantity
+        create belief : quantity;
+        assign belief = 40;
+        store belief, "estimate";
+        remember belief;
+
+        # a correction arrives; overwrite the same memory key
+        create correction : quantity;
+        assign correction = 65;
+        store correction, "estimate";
+        add corrections_applied, 1;
+
+        # recall the (now corrected) value from memory
+        recall estimate;
+
+        # surface the recalled value as the result
+        create recalled : quantity;
+        assign recalled = 0;
+        add recalled, estimate;
+
+        query recalled;
+        remember recalled;
+        sum recalled;
+        return recalled;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}

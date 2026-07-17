@@ -1,0 +1,436 @@
+# conversation_agent.cube
+# cubelang v0.1.0
+# conversational reasoning template
+
+interface IConversationAgent {
+    type Input;
+    type Output;
+
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+    optional public function learn(input: Input, expected: Output, actual: Output): void;
+}
+
+event ReplyGenerated {
+    program: str;
+    intent: str;
+    act: str;
+    confidence: f64;
+}
+
+event PatternLearned {
+    program: str;
+    pattern: str;
+    total: u64;
+}
+
+struct Turn {
+    session_id: str;
+    user_id: str;
+    text: str;
+    timestamp: str;
+    metadata: map<str, any>;
+}
+
+struct MemoryHit {
+    key: str;
+    score: f64;
+    value: str;
+}
+
+struct DialogueState {
+    session_id: str;
+    user_id: str;
+    query: str;
+    intent: str;
+    act: str;
+    retrieved: array<MemoryHit>;
+    facts: array<str>;
+    plan: array<str>;
+    risk_flags: array<str>;
+    trace: array<str>;
+}
+
+struct Reply {
+    text: str;
+    act: str;
+    confidence: f64;
+    used_memory: array<str>;
+    trace: array<str>;
+}
+
+program ConversationReasoner implements IConversationAgent {
+    type Input = Turn;
+    type Output = Reply;
+
+    storage {
+        patterns: mutable map<str, function>;
+        sessions: mutable map<str, DialogueState>;
+        memory_index: mutable map<str, str>;
+        success_count: mutable u64 = 0;
+        fail_count: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        self.patterns = {};
+        self.sessions = {};
+        self.memory_index = {};
+        self.success_count = 0;
+        self.fail_count = 0;
+
+        self.memory_index["profile:alice"] = "Alice prefers concise technical answers.";
+        self.memory_index["topic:vsa"] = "VSA uses binding, bundling, and permutation.";
+        self.memory_index["topic:cubelang"] = "CubeLang programs are interface-bound reasoning modules.";
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return Turn {
+            session_id: "default-session",
+            user_id: "default-user",
+            text: raw,
+            timestamp: "now",
+            metadata: {}
+        };
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        let state = self.build_state(input);
+
+        atomic {
+            create intent_reg : symbol;
+            create plan_reg : sequence;
+            create reply_reg : response;
+
+            assign intent_reg = state.intent;
+            store intent_reg, "last_intent";
+            remember intent_reg;
+
+            let plan_size = state.plan.length;
+            assign plan_reg = plan_size;
+            remember plan_reg;
+
+            let draft = self.compose_reply(state);
+            assign reply_reg = draft.text;
+            query reply_reg;
+            remember reply_reg;
+
+            commit;
+        }
+
+        self.sessions[input.session_id] = state;
+        self.success_count += 1;
+
+        let output = self.compose_reply(state);
+
+        emit ReplyGenerated {
+            program: "ConversationReasoner",
+            intent: state.intent,
+            act: output.act,
+            confidence: output.confidence,
+        };
+
+        return output;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        if (output.text == "") {
+            return false;
+        }
+
+        if (output.confidence <= 0.0) {
+            return false;
+        }
+
+        if (output.trace.length == 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    @internal
+    public mutable function learn(input: Input, expected: Output, actual: Output): void {
+        self.fail_count += 1;
+
+        let key = self.classify_error(input, expected, actual);
+
+        if (self.patterns.has(key)) {
+            return;
+        }
+
+        let handler = self.derive_handler(input, expected, actual);
+        self.patterns[key] = handler;
+
+        emit PatternLearned {
+            program: "ConversationReasoner",
+            pattern: key,
+            total: self.patterns.size,
+        };
+    }
+
+    @internal
+    private function build_state(input: Input): DialogueState {
+        let retrieved = self.retrieve_memories(input.text);
+        let facts = self.extract_facts(retrieved);
+        let intent = self.classify_intent(input.text, retrieved);
+        let act = self.choose_act(intent, input.text, facts);
+        let plan = self.make_plan(intent, act, input.text, facts);
+        let risk_flags = self.detect_risks(input.text);
+        let trace: array<str> = [];
+
+        trace.push("PARSE");
+        trace.push("RETRIEVE");
+        trace.push("CLASSIFY:" + intent);
+        trace.push("ACT:" + act);
+        trace.push("PLAN");
+
+        return DialogueState {
+            session_id: input.session_id,
+            user_id: input.user_id,
+            query: input.text,
+            intent: intent,
+            act: act,
+            retrieved: retrieved,
+            facts: facts,
+            plan: plan,
+            risk_flags: risk_flags,
+            trace: trace,
+        };
+    }
+
+    @internal
+    private function retrieve_memories(query: str): array<MemoryHit> {
+        let hits: array<MemoryHit> = [];
+
+        if (query.contains("vsa")) {
+            hits.push(MemoryHit {
+                key: "topic:vsa",
+                score: 0.95,
+                value: self.memory_index["topic:vsa"],
+            });
+        }
+
+        if (query.contains("cubelang") || query.contains("cube")) {
+            hits.push(MemoryHit {
+                key: "topic:cubelang",
+                score: 0.93,
+                value: self.memory_index["topic:cubelang"],
+            });
+        }
+
+        if (query.contains("alice")) {
+            hits.push(MemoryHit {
+                key: "profile:alice",
+                score: 0.80,
+                value: self.memory_index["profile:alice"],
+            });
+        }
+
+        return hits;
+    }
+
+    @internal
+    private function extract_facts(hits: array<MemoryHit>): array<str> {
+        let facts: array<str> = [];
+
+        for (let hit of hits) {
+            facts.push(hit.value);
+        }
+
+        return facts;
+    }
+
+    @internal
+    private function classify_intent(query: str, hits: array<MemoryHit>): str {
+        if (query.contains("how") || query.contains("write") || query.contains("build")) {
+            return "implementation";
+        }
+
+        if (query.contains("why")) {
+            return "explanation";
+        }
+
+        if (query.contains("compare") || query.contains("vs")) {
+            return "comparison";
+        }
+
+        if (query.contains("?")) {
+            return "question";
+        }
+
+        if (hits.length > 0) {
+            return "grounded_followup";
+        }
+
+        return "open_dialogue";
+    }
+
+    @internal
+    private function choose_act(intent: str, query: str, facts: array<str>): str {
+        match (intent) {
+            "implementation" => return "show_program";
+            "comparison" => return "compare";
+            "explanation" => return "explain";
+            "question" => return "answer";
+            "grounded_followup" => return "grounded_answer";
+            _ => return "respond";
+        }
+    }
+
+    @internal
+    private function make_plan(intent: str, act: str, query: str, facts: array<str>): array<str> {
+        let plan: array<str> = [];
+
+        plan.push("identify request");
+        plan.push("retrieve relevant memory");
+
+        if (facts.length > 0) {
+            plan.push("ground answer in retrieved facts");
+        }
+
+        match (act) {
+            "show_program" => {
+                plan.push("produce concrete structure");
+                plan.push("explain each stage");
+            }
+            "compare" => {
+                plan.push("list tradeoffs");
+            }
+            "explain" => {
+                plan.push("clarify mechanism");
+            }
+            "grounded_answer" => {
+                plan.push("link prior context to answer");
+            }
+            _ => {
+                plan.push("respond directly");
+            }
+        }
+
+        return plan;
+    }
+
+    @internal
+    private function detect_risks(query: str): array<str> {
+        let flags: array<str> = [];
+
+        if (query.contains("delete all") || query.contains("destroy")) {
+            flags.push("destructive_request");
+        }
+
+        if (query.contains("private key") || query.contains("password")) {
+            flags.push("sensitive_data");
+        }
+
+        return flags;
+    }
+
+    @internal
+    private function compose_reply(state: DialogueState): Output {
+        let intro = self.render_intro(state);
+        let body = self.render_body(state);
+        let ending = self.render_ending(state);
+        let text = intro + "\n\n" + body + "\n\n" + ending;
+
+        state.trace.push("DRAFT");
+        state.trace.push("VERIFY");
+
+        return Reply {
+            text: text,
+            act: state.act,
+            confidence: self.estimate_confidence(state),
+            used_memory: self.memory_keys(state.retrieved),
+            trace: state.trace,
+        };
+    }
+
+    @internal
+    private function render_intro(state: DialogueState): str {
+        match (state.act) {
+            "show_program" => return "Here is a concrete CubeLang structure for this conversational reasoning task.";
+            "compare" => return "Here are the main tradeoffs and distinctions.";
+            "explain" => return "Here is the mechanism in plain language.";
+            "grounded_answer" => return "Here is the answer grounded in the current context.";
+            "answer" => return "Here is the direct answer.";
+            _ => return "Here is a useful response.";
+        }
+    }
+
+    @internal
+    private function render_body(state: DialogueState): str {
+        let body = "Intent: " + state.intent + ". ";
+
+        if (state.facts.length > 0) {
+            return body + "Relevant memory: " + state.facts[0] + ". Plan: " + state.plan.join(" -> ");
+        }
+
+        return body + "Plan: " + state.plan.join(" -> ");
+    }
+
+    @internal
+    private function render_ending(state: DialogueState): str {
+        if (state.risk_flags.length > 0) {
+            return "Safety note: " + state.risk_flags.join(", ");
+        }
+
+        return "Confidence: " + self.estimate_confidence(state);
+    }
+
+    @internal
+    private function estimate_confidence(state: DialogueState): f64 {
+        let score: f64 = 0.35;
+
+        if (state.retrieved.length > 0) {
+            return score + 0.30;
+        }
+
+        if (state.plan.length > 3) {
+            return score + 0.20;
+        }
+
+        return score + 0.10;
+    }
+
+    @internal
+    private function memory_keys(hits: array<MemoryHit>): array<str> {
+        let keys: array<str> = [];
+
+        for (let hit of hits) {
+            keys.push(hit.key);
+        }
+
+        return keys;
+    }
+
+    @internal
+    private function classify_error(input: Input, expected: Output, actual: Output): str {
+        if (actual.text == "") {
+            return "empty_reply";
+        }
+
+        if (actual.confidence < 0.2) {
+            return "low_confidence";
+        }
+
+        if (actual.act != expected.act) {
+            return "wrong_dialogue_act";
+        }
+
+        return "generic_mismatch";
+    }
+
+    @internal
+    private function derive_handler(input: Input, expected: Output, actual: Output): function {
+        return self.default_repair;
+    }
+
+    @internal
+    private function default_repair(input: Input): void {
+        self.memory_index["repair:last"] = "Fallback to direct grounded answer with explicit plan.";
+    }
+}

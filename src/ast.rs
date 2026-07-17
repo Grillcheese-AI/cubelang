@@ -544,9 +544,32 @@ pub enum OpcodeStmt {
     Query { reg: String },                       // query x
     Remember { reg: String },                    // remember x
     Store { reg: String, key: Expr },           // store x, "key"
-    Recall { key: Expr },                        // recall "key"
+    Recall { reg: Option<String>, key: Expr }, // recall "key"  |  recall x, "key"
     Bind { reg: String, role: String, val: Expr }, // bind x, AGENT, val
     Unify { a: String, b: String },             // unify a, b
+    BindRole { reg: String, role: String },     // bind_role x, AGENT (self-fill)
+    Transfer { src: String, dst: String, amount: Expr }, // transfer a, b, 1
+    Compare { a: String, b: String },           // compare a, b
+    /// Extended reasoning opcodes (infer, score, detect_pattern, map_roles,
+    /// filter, decode, reduce, merge, split, debate, predict, discover, diff,
+    /// seq, specialize, reward). Generic: a canonical mnemonic + ordered args.
+    Extended { op: ExtOp, args: Vec<ExtArg> },
+}
+
+/// An argument to an extended opcode: either a register/name or a value expr.
+#[derive(Debug, Clone)]
+pub enum ExtArg {
+    Reg(String),   // a bare identifier ? a register / role name
+    Val(Expr),     // a literal, array, field access, etc.
+}
+
+/// Canonical extended opcode identity (carries mnemonic + bytecode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtOp {
+    Infer, MapRoles, Filter, Score, DetectPattern, Decode, Reduce, Merge,
+    Split, Debate, Predict, Discover, Diff, Seq, Specialize, Reward,
+    Match, Push, Sum, Compare, TemporalBind,
+    Analogy, Gen, Inst, Broadcast, Explore, Forge, Ask, Sync, Forget,
 }
 
 // ── Expressions ─────────────────────────────────────────────────────────────

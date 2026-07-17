@@ -168,10 +168,122 @@ impl Parser {
             TokenKind::Return       => "return".into(),
             TokenKind::Match        => "match".into(),
             TokenKind::Async        => "async".into(),
+            TokenKind::TyResponse   => "response".into(),
+            TokenKind::TyRequest    => "request".into(),
+            // Extended reasoning opcodes — usable as identifiers everywhere
+            // except statement-leading position (where parse_stmt routes them
+            // to opcode parsing). This keeps natural names like `diff`, `score`,
+            // `match`, `filter`, `split` available as variables/types/fields.
+            TokenKind::OpSeq           => "seq".into(),
+            TokenKind::OpDiff          => "diff".into(),
+            TokenKind::OpDetectPattern => "detect_pattern".into(),
+            TokenKind::OpPredict       => "predict".into(),
+            TokenKind::OpDebate        => "debate".into(),
+            TokenKind::OpDiscover      => "discover".into(),
+            TokenKind::OpDecode        => "decode".into(),
+            TokenKind::OpScore         => "score".into(),
+            TokenKind::OpSpecialize    => "specialize".into(),
+            TokenKind::OpReward        => "reward".into(),
+            TokenKind::OpInfer         => "infer".into(),
+            TokenKind::OpMerge         => "merge".into(),
+            TokenKind::OpSplit         => "split".into(),
+            TokenKind::OpFilter        => "filter".into(),
+            TokenKind::OpMapRoles      => "map_roles".into(),
+            TokenKind::OpReduce        => "reduce".into(),
+            TokenKind::OpTemporalBind  => "temporal_bind".into(),
+            TokenKind::OpAnalogy       => "analogy".into(),
+            TokenKind::OpGen           => "gen".into(),
+            TokenKind::OpInst          => "inst".into(),
+            TokenKind::OpBroadcast     => "broadcast".into(),
+            TokenKind::OpExplore       => "explore".into(),
+            TokenKind::OpForge         => "forge".into(),
+            TokenKind::OpAsk           => "ask".into(),
+            TokenKind::OpSync          => "sync".into(),
+            TokenKind::OpForget        => "forget".into(),
+            TokenKind::OpCond          => "cond".into(),
+            TokenKind::OpLoop          => "loop".into(),
+            TokenKind::OpTransfer      => "transfer".into(),
+            TokenKind::OpCompare       => "compare".into(),
+            TokenKind::OpBindRole      => "bind_role".into(),
+
+            // Type keywords — also soft. Many are ordinary English words a
+            // programmer will reach for as a variable name: `ctx`, `role`,
+            // `map`, `set`, `file`, `url`, `request`, `response`, `agent`.
+            // The SPEC's own example cannot otherwise be written:
+            //     let ctx: rag = knowledge.query("...", top_k: 5);
+            // Position disambiguates: after `create`/`let`/`.` an identifier is
+            // required, after `:` a type is. `create ctx : ctx;` parses.
+            TokenKind::TyCtx             => "ctx".into(),
+            TokenKind::TyRag             => "rag".into(),
+            TokenKind::TyRole            => "role".into(),
+            TokenKind::TyOpcode          => "opcode".into(),
+            TokenKind::TyModule          => "module".into(),
+            TokenKind::TyMdx             => "mdx".into(),
+            TokenKind::TyAgent           => "agent".into(),
+            TokenKind::TyClonedAgent     => "cloned_agent".into(),
+            TokenKind::TyFile            => "file".into(),
+            TokenKind::TyUrl             => "url".into(),
+            TokenKind::TyDataset         => "dataset".into(),
+            TokenKind::TyExternalProgram => "external_program".into(),
+            TokenKind::TyRequest         => "request".into(),
+            TokenKind::TyResponse        => "response".into(),
+            TokenKind::TyArray           => "array".into(),
+            TokenKind::TyMap             => "map".into(),
+            TokenKind::TySet             => "set".into(),
+            TokenKind::TyPromise         => "promise".into(),
+            TokenKind::TyChannel         => "channel".into(),
+            TokenKind::TyTuple           => "tuple".into(),
+            TokenKind::TyVec             => "vec".into(),
+            TokenKind::TyEmb             => "emb".into(),
+            TokenKind::TyByte            => "byte".into(),
+            // Primitive width/scalar names are left RESERVED on purpose. A
+            // variable called `u8` or `bool` is a bug wearing a name.
+
             _ => return Err(self.err(format!("expected identifier, got {:?}", self.tokens[self.pos].kind))),
         };
         self.pos += 1;
         Ok(name)
+    }
+
+    /// True if `kind` can stand in as an identifier in expression / name
+    /// position — any opcode keyword, plus the non-primitive type keywords.
+    /// These are contextual: an opcode at a statement start parses as an opcode
+    /// (via parse_stmt's dispatch), but as a value/name elsewhere it is an
+    /// ordinary identifier. Likewise `ctx`/`map`/`role`/... are types after `:`
+    /// and identifiers everywhere else.
+    ///
+    /// Must agree with the soft-keyword arms in `expect_ident`, or a name will
+    /// parse in one position and not the other.
+    fn kind_is_ident_like(&self, kind: &TokenKind) -> bool {
+        if kind.is_opcode() {
+            return true;
+        }
+        matches!(
+            kind,
+            TokenKind::TyCtx
+                | TokenKind::TyRag
+                | TokenKind::TyRole
+                | TokenKind::TyOpcode
+                | TokenKind::TyModule
+                | TokenKind::TyMdx
+                | TokenKind::TyAgent
+                | TokenKind::TyClonedAgent
+                | TokenKind::TyFile
+                | TokenKind::TyUrl
+                | TokenKind::TyDataset
+                | TokenKind::TyExternalProgram
+                | TokenKind::TyRequest
+                | TokenKind::TyResponse
+                | TokenKind::TyArray
+                | TokenKind::TyMap
+                | TokenKind::TySet
+                | TokenKind::TyPromise
+                | TokenKind::TyChannel
+                | TokenKind::TyTuple
+                | TokenKind::TyVec
+                | TokenKind::TyEmb
+                | TokenKind::TyByte
+        )
     }
 
     fn expect_string(&mut self) -> PResult<String> {
@@ -826,12 +938,16 @@ impl Parser {
             TokenKind::Assert => self.parse_assert_stmt(),
             TokenKind::Try => self.parse_try_catch_stmt(),
 
+            TokenKind::OpCond => self.parse_cond_stmt(),
+            TokenKind::OpLoop => self.parse_loop_stmt(),
             // Opcode statements
             tok if TokenKind::OpCreate == tok => self.parse_opcode_stmt(),
             tok if matches!(tok, TokenKind::OpAssign | TokenKind::OpAdd | TokenKind::OpSub |
                 TokenKind::OpMul | TokenKind::OpDiv | TokenKind::OpSum | TokenKind::OpPush |
                 TokenKind::OpPop | TokenKind::OpQuery | TokenKind::OpRemember | TokenKind::OpStore |
-                TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify) => self.parse_opcode_stmt(),
+                TokenKind::OpRecall | TokenKind::OpBind | TokenKind::OpUnify |
+                TokenKind::OpBindRole | TokenKind::OpTransfer | TokenKind::OpCompare |
+                TokenKind::OpInfer | TokenKind::OpMapRoles | TokenKind::OpFilter | TokenKind::OpScore | TokenKind::OpDetectPattern | TokenKind::OpDecode | TokenKind::OpReduce | TokenKind::OpMerge | TokenKind::OpSplit | TokenKind::OpDebate | TokenKind::OpPredict | TokenKind::OpDiscover | TokenKind::OpDiff | TokenKind::OpSeq | TokenKind::OpSpecialize | TokenKind::OpReward | TokenKind::OpTemporalBind | TokenKind::OpAnalogy | TokenKind::OpGen | TokenKind::OpInst | TokenKind::OpBroadcast | TokenKind::OpExplore | TokenKind::OpForge | TokenKind::OpAsk | TokenKind::OpSync | TokenKind::OpForget) => self.parse_opcode_stmt(),
 
             // Logging
             TokenKind::Log | TokenKind::Debug | TokenKind::Warn | TokenKind::Error => {
@@ -937,6 +1053,16 @@ impl Parser {
     fn parse_match_stmt(&mut self) -> PResult<Stmt> {
         let span = self.span();
         self.expect(&TokenKind::Match)?;
+        // Opcode form: `match a, b` (no parens) ? MATCH target candidates (0x1B).
+        // Distinct from the statement form `match (expr) { arms }`.
+        if !self.at(&TokenKind::LParen) {
+            let args = self.parse_ext_args()?;
+            self.eat(&TokenKind::Semicolon);
+            return Ok(Stmt::Opcode(OpcodeStmt::Extended {
+                op: ExtOp::Match,
+                args,
+            }));
+        }
         self.expect(&TokenKind::LParen)?;
         let expr = self.parse_expr()?;
         self.expect(&TokenKind::RParen)?;
@@ -1038,6 +1164,44 @@ impl Parser {
 
     // ── Opcode statements ───────────────────────────────────────────────
 
+    fn parse_cond_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.span();
+        self.expect(&TokenKind::OpCond)?;
+        let reg = self.parse_reg_ref()?;
+        self.expect(&TokenKind::Comma)?;
+        let val = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        self.expect(&TokenKind::LBrace)?;
+        let then_body = self.parse_stmt_block()?;
+        self.expect(&TokenKind::RBrace)?;
+        let else_body = if self.eat(&TokenKind::Else) {
+            self.expect(&TokenKind::LBrace)?;
+            let b = self.parse_stmt_block()?;
+            self.expect(&TokenKind::RBrace)?;
+            Some(b)
+        } else { None };
+        self.eat(&TokenKind::Semicolon);
+        let condition = Expr::BinOp(Box::new(Expr::Ident(reg)), BinOp::Eq, Box::new(val));
+        Ok(Stmt::If(IfStmt { condition, then_body, else_body, span }))
+    }
+
+    fn parse_loop_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.span();
+        self.expect(&TokenKind::OpLoop)?;
+        let reg = self.parse_reg_ref()?;
+        self.expect(&TokenKind::Comma)?;
+        let _target = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let _cond = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        self.expect(&TokenKind::LBrace)?;
+        let body = self.parse_stmt_block()?;
+        self.expect(&TokenKind::RBrace)?;
+        self.eat(&TokenKind::Semicolon);
+        let condition = Expr::Ident(reg);
+        Ok(Stmt::While(WhileStmt { condition, body, span }))
+    }
+
     fn parse_opcode_stmt(&mut self) -> PResult<Stmt> {
         let op = self.peek().clone();
         self.advance();
@@ -1046,7 +1210,10 @@ impl Parser {
             TokenKind::OpCreate => {
                 let reg = self.expect_ident()?;
                 self.expect(&TokenKind::Colon)?;
-                let ty = self.expect_ident()?;
+                // Accept full type exprs (array<str>, map<k,v>, tuple<...>), not
+                // just bare idents. Stringify to the canonical name for emit_type.
+                let ty_expr = self.parse_type()?;
+                let ty = type_expr_to_string(&ty_expr);
                 OpcodeStmt::Create { reg, ty }
             }
             TokenKind::OpAssign => {
@@ -1081,9 +1248,9 @@ impl Parser {
             }
             TokenKind::OpSum      => OpcodeStmt::Sum { reg: self.expect_ident()? },
             TokenKind::OpPush     => OpcodeStmt::Push { reg: self.expect_ident()? },
-            TokenKind::OpPop      => OpcodeStmt::Pop { reg: self.expect_ident()? },
-            TokenKind::OpQuery    => OpcodeStmt::Query { reg: self.expect_ident()? },
-            TokenKind::OpRemember => OpcodeStmt::Remember { reg: self.expect_ident()? },
+            TokenKind::OpPop      => OpcodeStmt::Pop { reg: self.parse_reg_ref()? },
+            TokenKind::OpQuery    => OpcodeStmt::Query { reg: self.parse_reg_ref()? },
+            TokenKind::OpRemember => OpcodeStmt::Remember { reg: self.parse_reg_ref()? },
             TokenKind::OpStore => {
                 let reg = self.expect_ident()?;
                 self.expect(&TokenKind::Comma)?;
@@ -1091,8 +1258,20 @@ impl Parser {
                 OpcodeStmt::Store { reg, key }
             }
             TokenKind::OpRecall => {
+                // recall "key"  |  recall reg, "key"
+                let mut reg = None;
+                if let TokenKind::Ident(name) = self.peek().clone() {
+                    let save = self.pos;
+                    self.advance(); // consume the ident
+                    if self.at(&TokenKind::Comma) {
+                        self.advance(); // consume the comma → 2-arg form
+                        reg = Some(name);
+                    } else {
+                        self.pos = save; // single-arg form; ident is the key expr
+                    }
+                }
                 let key = self.parse_expr()?;
-                OpcodeStmt::Recall { key }
+                OpcodeStmt::Recall { reg, key }
             }
             TokenKind::OpBind => {
                 let reg = self.expect_ident()?;
@@ -1108,10 +1287,225 @@ impl Parser {
                 let b = self.expect_ident()?;
                 OpcodeStmt::Unify { a, b }
             }
+            TokenKind::OpBindRole => {
+                // bind_role reg, ROLE  (2-arg; filler defaults to the register itself)
+                let reg = self.parse_reg_ref()?;
+                self.expect(&TokenKind::Comma)?;
+                let role = self.expect_ident()?;
+                OpcodeStmt::BindRole { reg, role }
+            }
+            TokenKind::OpTransfer => {
+                // transfer src, dst, amount
+                let src = self.parse_reg_ref()?;
+                self.expect(&TokenKind::Comma)?;
+                let dst = self.parse_reg_ref()?;
+                self.expect(&TokenKind::Comma)?;
+                let amount = self.parse_expr()?;
+                OpcodeStmt::Transfer { src, dst, amount }
+            }
+            TokenKind::OpCompare => {
+                // compare a, b  (b may be a register or a value expression)
+                let a = self.parse_reg_ref()?;
+                self.expect(&TokenKind::Comma)?;
+                let save = self.pos;
+                if let Some(b) = self.try_parse_reg_ref() {
+                    if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RBrace)
+                        || self.at(&TokenKind::Eof) || self.at(&TokenKind::Comma) {
+                        if self.at(&TokenKind::Comma) {
+                            // 3+ args -> Extended
+                            self.advance();
+                            let mut args = vec![ExtArg::Reg(a), ExtArg::Reg(b)];
+                            args.extend(self.parse_ext_args()?);
+                            OpcodeStmt::Extended { op: ExtOp::Compare, args }
+                        } else {
+                            OpcodeStmt::Compare { a, b }
+                        }
+                    } else {
+                        self.pos = save;
+                        let v = self.parse_expr()?;
+                        OpcodeStmt::Extended { op: ExtOp::Compare, args: vec![ExtArg::Reg(a), ExtArg::Val(v)] }
+                    }
+                } else {
+                    self.pos = save;
+                    let v = self.parse_expr()?;
+                    OpcodeStmt::Extended { op: ExtOp::Compare, args: vec![ExtArg::Reg(a), ExtArg::Val(v)] }
+                }
+            }
+            TokenKind::OpInfer => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Infer, args }
+            }
+            TokenKind::OpMapRoles => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::MapRoles, args }
+            }
+            TokenKind::OpFilter => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Filter, args }
+            }
+            TokenKind::OpScore => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Score, args }
+            }
+            TokenKind::OpDetectPattern => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::DetectPattern, args }
+            }
+            TokenKind::OpDecode => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Decode, args }
+            }
+            TokenKind::OpReduce => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Reduce, args }
+            }
+            TokenKind::OpMerge => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Merge, args }
+            }
+            TokenKind::OpSplit => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Split, args }
+            }
+            TokenKind::OpDebate => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Debate, args }
+            }
+            TokenKind::OpPredict => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Predict, args }
+            }
+            TokenKind::OpDiscover => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Discover, args }
+            }
+            TokenKind::OpDiff => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Diff, args }
+            }
+            TokenKind::OpSeq => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Seq, args }
+            }
+            TokenKind::OpSpecialize => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Specialize, args }
+            }
+            TokenKind::OpReward => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Reward, args }
+            }
+            TokenKind::OpTemporalBind => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::TemporalBind, args }
+            }
+            TokenKind::OpAnalogy => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Analogy, args }
+            }
+            TokenKind::OpGen => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Gen, args }
+            }
+            TokenKind::OpInst => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Inst, args }
+            }
+            TokenKind::OpBroadcast => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Broadcast, args }
+            }
+            TokenKind::OpExplore => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Explore, args }
+            }
+            TokenKind::OpForge => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Forge, args }
+            }
+            TokenKind::OpAsk => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Ask, args }
+            }
+            TokenKind::OpSync => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Sync, args }
+            }
+            TokenKind::OpForget => {
+                let args = self.parse_ext_args()?;
+                OpcodeStmt::Extended { op: ExtOp::Forget, args }
+            }
             _ => return Err(self.err(format!("unknown opcode: {:?}", op))),
         };
         self.eat(&TokenKind::Semicolon);
         Ok(Stmt::Opcode(stmt))
+    }
+
+    /// Parse a register reference: a name (identifier or contextual keyword)
+    /// optionally followed by positional/field access (`input.0`, `obj.field`).
+    /// Returns the rendered dotted name. Used for opcode register operands so
+    /// reserved words (event, response) and tuple access work as register names.
+    fn parse_reg_ref(&mut self) -> PResult<String> {
+        let mut name = self.expect_ident()?;
+        loop {
+            if self.at(&TokenKind::Dot) {
+                self.advance();
+                if let TokenKind::IntLit(n) = self.peek().clone() {
+                    self.advance();
+                    name = format!("{}.{}", name, n);
+                } else {
+                    let field = self.expect_ident()?;
+                    name = format!("{}.{}", name, field);
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(name)
+    }
+
+    /// Like parse_reg_ref but returns None instead of erroring (no rewind side
+    /// effects beyond what the caller saves/restores).
+    fn try_parse_reg_ref(&mut self) -> Option<String> {
+        let save = self.pos;
+        match self.parse_reg_ref() {
+            Ok(n) => Some(n),
+            Err(_) => { self.pos = save; None }
+        }
+    }
+
+    /// Parse comma-separated arguments for an extended opcode statement.
+    /// Each argument is a bare identifier (treated as a register/role name) or
+    /// a value expression (string, int, array, field access, etc.). Stops at
+    /// the statement terminator (`;`) or end of the enclosing block.
+    fn parse_ext_args(&mut self) -> PResult<Vec<ExtArg>> {
+        let mut args = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RBrace)
+                || self.at(&TokenKind::Eof) {
+                break;
+            }
+            // A register reference (name, possibly with .field/.0 access) is a
+            // Reg arg when it is immediately followed by an argument boundary;
+            // anything else (operators, literals, arrays, calls) is a Val expr.
+            let save = self.pos;
+            let reg = self.try_parse_reg_ref();
+            match reg {
+                Some(name) if self.at(&TokenKind::Comma)
+                    || self.at(&TokenKind::Semicolon)
+                    || self.at(&TokenKind::RBrace)
+                    || self.at(&TokenKind::Eof) => {
+                    args.push(ExtArg::Reg(name));
+                }
+                _ => {
+                    self.pos = save;
+                    args.push(ExtArg::Val(self.parse_expr()?));
+                }
+            }
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        Ok(args)
     }
 
     // ── Expressions ─────────────────────────────────────────────────────
@@ -1228,6 +1622,13 @@ impl Parser {
             match self.peek() {
                 TokenKind::Dot => {
                     self.advance();
+                    // Tuple/positional field access: expr.0, expr.1 (the int lexes
+                    // as IntLit after the dot). Otherwise a normal named field.
+                    if let TokenKind::IntLit(n) = self.peek().clone() {
+                        self.advance();
+                        expr = Expr::Field(Box::new(expr), n.to_string());
+                        continue;
+                    }
                     let field = self.expect_ident()?;
                     // Check for method call: expr.method(args)
                     if self.at(&TokenKind::LParen) {
@@ -1355,6 +1756,14 @@ impl Parser {
                 Ok(Expr::Call(Box::new(Expr::Ident(name)), args))
             }
 
+            // Opcode keywords (and other contextual keywords) used as a value
+            // in expression position — treat as an identifier reference, then
+            // allow normal postfix (.field / call / index) via the caller.
+            tok if self.kind_is_ident_like(&tok) => {
+                let name = self.expect_ident()?;
+                Ok(Expr::Ident(name))
+            }
+
             _ => Err(self.err(format!("unexpected token in expression: {:?}", self.peek()))),
         }
     }
@@ -1429,6 +1838,33 @@ impl Parser {
                 _ => {}
             }
             self.pos += 1;
+        }
+    }
+}
+
+/// Render a TypeExpr to its canonical name string (for opcode type operands,
+/// which are stored as String and hashed at compile time).
+fn type_expr_to_string(ty: &TypeExpr) -> String {
+    match ty {
+        TypeExpr::Named(n) => n.clone(),
+        TypeExpr::Void => "void".into(),
+        TypeExpr::Array(inner) => format!("array<{}>", type_expr_to_string(inner)),
+        TypeExpr::Set(inner) => format!("set<{}>", type_expr_to_string(inner)),
+        TypeExpr::Promise(inner) => format!("promise<{}>", type_expr_to_string(inner)),
+        TypeExpr::Channel(inner) => format!("channel<{}>", type_expr_to_string(inner)),
+        TypeExpr::Nullable(inner) => format!("{}?", type_expr_to_string(inner)),
+        TypeExpr::Map(k, v) => format!("map<{},{}>", type_expr_to_string(k), type_expr_to_string(v)),
+        TypeExpr::Tuple(ts) => {
+            let parts: Vec<String> = ts.iter().map(type_expr_to_string).collect();
+            format!("tuple<{}>", parts.join(","))
+        }
+        TypeExpr::Union(ts) => {
+            let parts: Vec<String> = ts.iter().map(type_expr_to_string).collect();
+            parts.join("|")
+        }
+        TypeExpr::Fn(args, ret) => {
+            let parts: Vec<String> = args.iter().map(type_expr_to_string).collect();
+            format!("({})->{}", parts.join(","), type_expr_to_string(ret))
         }
     }
 }

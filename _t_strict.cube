@@ -1,0 +1,10 @@
+program StrictTest implements ISolver {
+  type Input = quantity; type Output = quantity;
+  @external public function parse(raw: str): Input { return raw; }
+  @external public function solve(input: Input): Output {
+    create a : quantity; assign a = 1;
+    predict a;
+    sum a; return a;
+  }
+  @external public pure function verify(i: Input, o: Output): bool { return true; }
+}

@@ -1,0 +1,95 @@
+# qc_decision.cube — auditable QC decision rule (SAFE-SUBSET ONLY).
+#
+# Purpose: take a perception result (defect class + confidence) and emit a
+# deterministic, inspectable disposition: PASS / REJECT / REVIEW.
+#
+# This program uses ONLY the executing half of the CubeLang VM:
+#   create, assign(literal), add, sub, store, remember, query, sum,
+#   if/else, compare(register-or-literal). Flat operands only.
+# It deliberately avoids: for, match, return-as-branch, and every extended
+# reasoning opcode (predict/match/score/...), which currently trace but do
+# NOT compute a value (see CUBELANG_FIXES.md P0-1).
+#
+# HOST SHIM CONTRACT (Rust/Python caller):
+#   1. vm.load(program); vm.init("QCDecision")   # constructor sets thresholds
+#   2. inject inputs as REGISTERS *before* calling solve:
+#        vm.registers.insert("in_class", Value::Int(<class_id>))   # 0 = no defect
+#        vm.registers.insert("in_conf",  Value::Int(<confidence_pct>)) # 0..100 INT
+#      NOTE: confidence MUST be an integer percent. The VM compares via i64;
+#      a float like 0.87 resolves to 0. Convert in the shim: round(conf*100).
+#   3. vm.call("QCDecision", "solve", vec![])
+#   4. read disposition from vm.result()  -> 0=PASS, 1=REJECT, 2=REVIEW
+#      read audit counters from vm.storage (pass_count/reject_count/review_count/total_count)
+#   IMPORTANT: do NOT `create in_class`/`create in_conf` inside solve() — that
+#   resets them to null and clobbers the injected inputs.
+
+interface ISolver {
+    type Input;
+    type Output;
+    abstract public function parse(raw: str): Input;
+    abstract public function solve(input: Input): Output;
+    abstract public function verify(input: Input, output: Output): bool;
+}
+
+program QCDecision implements ISolver {
+    type Input = quantity;
+    type Output = quantity;
+
+    storage {
+        min_confidence: mutable u64 = 0;
+        pass_count:     mutable u64 = 0;
+        reject_count:   mutable u64 = 0;
+        review_count:   mutable u64 = 0;
+        total_count:    mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        # Disposition policy lives here — the one line a plant manager signs off.
+        assign min_confidence = 70;   # below this, route to a human (REVIEW)
+        assign pass_count = 0;
+        assign reject_count = 0;
+        assign review_count = 0;
+        assign total_count = 0;
+    }
+
+    @external
+    public function parse(raw: str): Input {
+        return raw;
+    }
+
+    @external
+    public function solve(input: Input): Output {
+        # in_class / in_conf are injected as registers by the host shim.
+        create decision : quantity;
+        assign decision = 0;            # default PASS
+
+        if (in_conf < min_confidence) {
+            # Not confident enough to act automatically — send to a human.
+            assign decision = 2;        # REVIEW
+            add review_count, 1;
+            store decision, "last_review";
+        } else {
+            if (in_class > 0) {
+                assign decision = 1;    # REJECT (in_class 0 = no defect)
+                add reject_count, 1;
+                store in_class, "last_defect_class";
+                remember in_class;
+            } else {
+                assign decision = 0;    # PASS
+                add pass_count, 1;
+            }
+        }
+
+        add total_count, 1;
+        query decision;
+        remember decision;
+        sum decision;                   # accumulator = disposition code
+        return decision;
+    }
+
+    @external
+    public pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}
