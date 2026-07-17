@@ -1,0 +1,471 @@
+# Instincts generated from https://github.com/Grillcheese-AI/cubelang
+# Generated: 2026-07-17T02:23:33.107Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: cubelang-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Commit Length
+
+## Action
+
+Write detailed commit messages (~189 characters for first line)
+
+## Evidence
+
+- Average commit message length: 189 chars
+- Based on 25 commits
+
+---
+id: cubelang-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: cubelang-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: cubelang-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: cubelang-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: cubelang-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: cubelang-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~14x per month
+- Files: **/*.test.*
+
+---
+id: cubelang-workflow-add-or-extend-opcodes-in-parser-and-compiler
+trigger: "when doing add or extend opcodes in parser and compiler"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Workflow Add Or Extend Opcodes In Parser And Compiler
+
+## Action
+
+Follow the add-or-extend-opcodes-in-parser-and-compiler workflow:
+1. Edit src/ast.rs to define new AST node(s) or update existing ones.
+2. Edit src/lexer.rs and src/token.rs to add new tokens or keywords.
+3. Edit src/parser.rs to parse new syntax or statements.
+4. Edit src/compiler.rs to lower new AST nodes to bytecode/opcodes.
+5. Optionally update docs/SPEC.md to document new opcodes.
+6. Test new opcodes via examples or regression tests.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/ast.rs, src/compiler.rs, src/lexer.rs
+
+---
+id: cubelang-workflow-add-example-cube-program
+trigger: "when doing add example cube program"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Workflow Add Example Cube Program
+
+## Action
+
+Follow the add-example-cube-program workflow:
+1. Create a new .cube file in examples/ with a descriptive name.
+2. Optionally add a corresponding .cubebin or .jsonl file if needed.
+3. Optionally add or update a Rust runner (e.g., run_conversation_min.rs) for integration or regression testing.
+4. Document or describe the example in commit message or documentation.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: examples/*.cube, examples/*.cubebin, examples/*.jsonl
+
+---
+id: cubelang-workflow-vm-and-compiler-feature-codesign
+trigger: "when doing vm and compiler feature codesign"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Workflow Vm And Compiler Feature Codesign
+
+## Action
+
+Follow the vm-and-compiler-feature-codesign workflow:
+1. Edit src/compiler.rs to emit new bytecode or handle new feature.
+2. Edit src/vm/engine.rs (and possibly src/vm/mod.rs or other VM files) to interpret new bytecode.
+3. Update or add relevant tests in tests/ or examples/ to cover the new feature.
+4. Optionally update documentation (docs/ or commit message) to describe semantics.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/compiler.rs, src/vm/engine.rs, src/vm/mod.rs
+
+---
+id: cubelang-workflow-update-or-sync-example-and-test-assets
+trigger: "when doing update or sync example and test assets"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Grillcheese-AI/cubelang
+---
+
+# Cubelang Workflow Update Or Sync Example And Test Assets
+
+## Action
+
+Follow the update-or-sync-example-and-test-assets workflow:
+1. Edit or add multiple .cube, .cubebin, .jsonl, .ps1, or test files.
+2. Update .gitignore or documentation if new files are added.
+3. Optionally update source files if test/validation logic changes.
+4. Commit with a message indicating asset or test update.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: examples/*.cube, examples/*.cubebin, examples/*.jsonl
+
+---
+id: cubelang-instinct-naming-conventions
+trigger: "When creating or renaming files, functions, classes, or constants"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Naming Conventions
+
+## Action
+
+Use snake_case for files, camelCase for functions, PascalCase for classes, and SCREAMING_SNAKE_CASE for constants
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions
+- Files like src/ast.rs, src/compiler.rs
+
+---
+id: cubelang-instinct-import-style
+trigger: "When importing modules in Rust source files"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+- Seen in src/*.rs files
+
+---
+id: cubelang-instinct-export-style
+trigger: "When exporting functions or types from modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: cubelang-instinct-test-file-location
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Test File Location
+
+## Action
+
+Place test files in the tests/ directory, using Rust source files (*.rs)
+
+## Evidence
+
+- Pattern in architecture.testLocation
+- Pattern in workflows.filesInvolved
+
+---
+id: cubelang-instinct-test-type
+trigger: "When writing tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Test Type
+
+## Action
+
+Write unit tests for new features or modules
+
+## Evidence
+
+- Pattern in testing.testTypes
+- Seen in workflows (feature-development, vm-and-compiler-feature-codesign)
+
+---
+id: cubelang-instinct-commit-prefix
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Commit Prefix
+
+## Action
+
+Prefix the message with the affected area (e.g., vm, parser, examples, spec, feat, lang)
+
+## Evidence
+
+- Pattern in commits.prefixes
+- Seen in commit: 'parser: add bind_role, transfer, compare opcode statements'
+
+---
+id: cubelang-instinct-commit-detail
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Commit Detail
+
+## Action
+
+Include a concise summary of the change and mention affected features or files
+
+## Evidence
+
+- Pattern in commits.averageLength
+- Seen in commit: 'vm: consolidate into src/vm/ module; add 'run' subcommand...'
+
+---
+id: cubelang-instinct-add-or-extend-opcode-workflow
+trigger: "When introducing new language features or reasoning operations"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Add Or Extend Opcode Workflow
+
+## Action
+
+Edit src/ast.rs, src/lexer.rs, src/token.rs, src/parser.rs, and src/compiler.rs to add or extend opcodes; optionally update docs/SPEC.md and test via examples or regression tests
+
+## Evidence
+
+- Workflow: add-or-extend-opcodes-in-parser-and-compiler
+- Commit sequence and files in workflow definition
+
+---
+id: cubelang-instinct-add-example-cube-program
+trigger: "When showcasing a new feature, kernel, or reasoning pattern"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Add Example Cube Program
+
+## Action
+
+Create a new .cube file in examples/ with a descriptive name; optionally add .cubebin, .jsonl, or Rust runner; document the example
+
+## Evidence
+
+- Workflow: add-example-cube-program
+- Commit sequence and files in workflow definition
+
+---
+id: cubelang-instinct-vm-compiler-feature-codesign
+trigger: "When adding a new execution feature requiring changes in both compiler and VM"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Vm Compiler Feature Codesign
+
+## Action
+
+Edit src/compiler.rs and src/vm/engine.rs (and possibly src/vm/mod.rs) to support the feature; update/add tests and examples; optionally update documentation
+
+## Evidence
+
+- Workflow: vm-and-compiler-feature-codesign
+- Commit sequence and files in workflow definition
+
+---
+id: cubelang-instinct-sync-examples-and-tests
+trigger: "When ensuring all examples and tests are up-to-date with latest changes"
+confidence: 0.8
+domain: workflow
+source: repo-analysis
+source_repo: Grillcheese-AI/cubelang
+---
+
+# Cubelang Instinct Sync Examples And Tests
+
+## Action
+
+Bulk edit or add .cube, .cubebin, .jsonl, .ps1, or test files; update .gitignore or docs as needed; commit with a message indicating asset or test update
+
+## Evidence
+
+- Workflow: update-or-sync-example-and-test-assets
+- Commit sequence and files in workflow definition
+
