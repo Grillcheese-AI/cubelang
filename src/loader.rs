@@ -49,9 +49,10 @@
 //! it's a genuine cycle (`a` imports `b` imports `a`) or an ordinary
 //! diamond (two different files both import the same third file) — is
 //! treated as already-loaded and silently skipped: a no-op, not an error.
-//! This is the brief's explicit instruction for cycles ("on revisit, treat
-//! as already-loaded (no-op), don't infinite-loop"); it happens to also be
-//! exactly the right behavior for diamonds (load the shared file's
+//! The design distinguishes "cycle detection" (this) from
+//! "error-on-duplicate-name" (below), reserving the hard error for the
+//! latter — a re-visited file is not itself a defect. This also happens to
+//! be exactly the right behavior for diamonds (load the shared file's
 //! declarations once, not once per importer) for free, via the same
 //! mechanism, with no special-casing needed.
 //!
@@ -59,17 +60,18 @@
 //!
 //! Two files — the entry included — declaring the same top-level NAME
 //! (interface, program, container, struct, enum, type alias, or event) is a
-//! hard error, by design: the brief calls this out explicitly as "a
-//! feature (it forces real de-duplication)", not a limitation to work
-//! around. `use` (a reference to a VM registry module, not a declaration of
+//! hard error, by design — it forces real de-duplication rather than a
+//! silent last-writer-wins merge, so it is a feature, not a limitation to
+//! work around. `use` (a reference to a VM registry module, not a declaration of
 //! a new name) and `extend` (extends an EXISTING target, doesn't introduce
 //! one) are exempt — see `declared_name`.
 //!
 //! ## What gets exposed on import — judgment call, documented here
 //!
-//! The brief asks for imported files to expose "interfaces, structs, enums,
-//! type aliases, AND helper functions/programs the user wants to reuse...
-//! not necessarily concrete `program` instances — use judgment." The
+//! The intent is for imported files to expose reusable declarations —
+//! interfaces, structs, enums, type aliases, and the helper functions or
+//! programs the user wants to reuse. The exact vehicle is a judgment call,
+//! resolved here by what the grammar actually allows. The
 //! current grammar has no free-standing top-level function: the only place
 //! a `fn` lives outside a `program`/`container`/`extend` body is inside one
 //! of those. So this loader merges every non-`Import`, non-`Use`-duplicate
