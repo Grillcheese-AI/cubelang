@@ -31,7 +31,8 @@ pub struct Codebook {
 }
 
 impl Codebook {
-    /// Create a codebook with the given seed and default dimension (4096).
+    /// Create a codebook with the given seed and default dimension (8192,
+    /// `hypervec::DEFAULT_DIM`).
     pub fn new(seed: u64) -> Self {
         Self { seed, dim: DEFAULT_DIM, cache: HashMap::new() }
     }

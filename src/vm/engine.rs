@@ -9,9 +9,11 @@ use crate::vm::memory::HippocampalMemory;
 use crate::vm::codebook::Codebook;
 use crate::vm::hypervec::Hypervec;
 
-/// Hypervector dimension for the VM's hippocampal memory. 4096 matches the
-/// codebook/index defaults ported from opcode-vsa-rs; quasi-orthogonality of
-/// distinct keys holds comfortably at this width.
+/// Hypervector dimension for the VM's hippocampal memory. This is CubeLang's
+/// own working value -- it does NOT match opcode-vsa-rs's own default (8192,
+/// `hypervec::DEFAULT_DIM`); cross-repo dimension reconciliation is out of
+/// scope here. Quasi-orthogonality of distinct keys holds comfortably at
+/// this width.
 const MEM_DIM: usize = 4096;
 /// Fixed codebook seed so memory addresses are reproducible across runs.
 const MEM_SEED: u64 = 0xC0DEB00C;
