@@ -500,18 +500,34 @@ impl Compiler {
         }
     }
 
-    // ── Strict-mode safety check (P0-1) ─────────────────────────────────
-
+    // ── Strict-mode safety check (P0-1, deny-by-default whitelist) ──────
+    //
+    // `--strict` is supposed to mean "verified" -- but a statement this
+    // function doesn't recognize used to fall through the trailing `_ => {}`
+    // and pass silently, even when it compiled to zero real bytecode. Live
+    // repro: `frobnicate d;` (not a real construct) compiled clean and ran.
+    //
+    // Fixed to deny-by-default: this match is now EXHAUSTIVE over `Stmt`
+    // (no trailing wildcard), so a future AST variant forces an explicit
+    // decision here instead of silently defaulting to "OK". A statement is
+    // valid under strict iff it is a recognized construct that compiles to
+    // >=1 real opcode, or is an explicitly-whitelisted no-op (commit /
+    // rollback). Everything else is a hard error naming the construct
+    // (+ source line when the statement's span carries one).
+    //
+    // Compound / control-flow statements (Let/If/For/While/Return/Atomic/
+    // Emit/TryCatch) always emit their own real scaffolding bytecode
+    // (CREATE/COMPARE/COND/LABEL/JMP/RETURN/STORE/...) regardless of what's
+    // nested inside them -- so no additional check is needed at THIS level;
+    // `compile_stmt` recurses into their bodies via `compile_stmt` again,
+    // which re-invokes this function on every nested statement.
     fn strict_check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            // Plan-4 lowered `for` to a real while+index loop, so it no longer
-            // counts as non-executing under strict mode.
+            // ── Known non-executing constructs (unchanged from before) ──
             Stmt::Match(m) => {
                 self.strict_violation("match (no arm selection at runtime)",
                     Some(m.span.line));
             }
-            // Plan-2: intra-program CALL now executes (snapshot/restore +
-            // stack-delivered return), so calls no longer trip strict mode.
             Stmt::Opcode(OpcodeStmt::Extended { op: ext, .. }) => {
                 if is_trace_only_ext_op(*ext) {
                     self.strict_violation(&format!("opcode {} (trace-only)", ext_name(*ext)), None);
@@ -520,7 +536,107 @@ impl Compiler {
             Stmt::Opcode(OpcodeStmt::Unify { .. }) => {
                 self.strict_violation("opcode unify (trace-only)", None);
             }
-            _ => {}
+            // Every other OpcodeStmt (Create/Assign/Add/Sub/Mul/Div/Sum/
+            // Push/Pop/Query/Remember/Store/Recall/Bind/BindRole/Transfer/
+            // Compare/Extended-non-trace-only) always emits a real opcode in
+            // compile_opcode -- nothing further to check.
+            Stmt::Opcode(_) => {}
+
+            // ── Real constructs: always compile to real bytecode ────────
+            Stmt::Let(_) | Stmt::If(_) | Stmt::For(_) | Stmt::While(_)
+            | Stmt::Return(_) | Stmt::Atomic(_) | Stmt::Emit(_) => {}
+            // try/catch bodies are real (LABEL/JMP scaffolding); nested
+            // statements are independently re-checked via recursion.
+            // NOTE: `finally_body` is a separate, pre-existing gap --
+            // compile_stmt's TryCatch arm never compiles it at all (not
+            // even to a SKIP), so no per-statement bytecode check can catch
+            // it here. Out of scope for this fix; see task report.
+            Stmt::TryCatch(_) => {}
+
+            // ── Explicitly-whitelisted no-ops ────────────────────────────
+            // commit/rollback deliberately compile to a single SKIP -- they
+            // are VM-level markers, not opcodes with their own semantics.
+            Stmt::Commit | Stmt::Rollback => {}
+
+            // ── Sub-classified: these wrap an inner Expr, and only compile
+            // to real bytecode for specific shapes of it ───────────────
+            Stmt::Assert(a) => {
+                // compile_expr_discard only emits real bytecode for a
+                // Call/MethodCall condition; any other shape (comparison,
+                // bare ident, ...) -- i.e. essentially every realistic
+                // assert today -- silently compiles to a single SKIP.
+                if !matches!(a.condition, Expr::Call(..) | Expr::MethodCall(..)) {
+                    self.strict_violation(
+                        "assert (condition does not compile to an executable check under the \
+                         current compiler -- only a call/method-call condition does)",
+                        Some(a.span.line));
+                }
+            }
+            Stmt::Assign(a) => {
+                // compile_stmt's Assign arm only handles `self.field` and a
+                // bare identifier target. An index target (`arr[0] = x`),
+                // nested field access, or anything else silently compiles
+                // to ZERO bytecode -- the sibling silent-drop from the audit.
+                if !matches!(a.target, Expr::SelfAccess(_) | Expr::Ident(_)) {
+                    self.strict_violation(
+                        &format!("assign (unsupported assignment target `{:?}` -- only \
+                         `self.field` and a bare identifier compile)", a.target),
+                        Some(a.span.line));
+                }
+            }
+            Stmt::Expr(e) => {
+                // compile_expr_discard only emits real bytecode (CALL+POP)
+                // for a Call/MethodCall; any other expression used as a
+                // bare statement (an unrecognized leading identifier, a
+                // literal, a comparison, ...) silently compiles to a single
+                // SKIP. This is the `frobnicate d;` hole: an unrecognized
+                // construct parses as an Ident expression-statement and
+                // never surfaces an error anywhere. (Stmt::Expr carries no
+                // span in the current AST, so no line number here.)
+                if !matches!(e, Expr::Call(..) | Expr::MethodCall(..)) {
+                    self.strict_violation(
+                        &format!("unrecognized or no-op statement (expression `{:?}` \
+                         has no compiled effect)", e),
+                        None);
+                }
+            }
+
+            // ── Parsed but never compiled at all: compile_stmt's own
+            // catch-all (`_ => emit SKIP`) silently no-ops these today.
+            // None of them execute anything in the VM yet (import's real
+            // loader, and any future asm/vsa hatch, are separately-scoped,
+            // not-yet-built work -- see the cubelang-foundation design doc).
+            Stmt::Throw(_) => {
+                self.strict_violation(
+                    "throw (not compiled -- falls through to a no-op under the current compiler)",
+                    None);
+            }
+            Stmt::Gate(g) => {
+                self.strict_violation(
+                    "gate (not compiled -- falls through to a no-op under the current compiler)",
+                    Some(g.span.line));
+            }
+            Stmt::BytecodeBlock(b) => {
+                self.strict_violation(
+                    "bytecode block (not compiled -- falls through to a no-op under the current compiler)",
+                    Some(b.span.line));
+            }
+            Stmt::Import(i) => {
+                self.strict_violation(
+                    "import (not compiled -- the import loader is not yet built; falls through \
+                     to a no-op under the current compiler)",
+                    Some(i.span.line));
+            }
+            Stmt::Export(exp) => {
+                self.strict_violation(
+                    "export (not compiled -- falls through to a no-op under the current compiler)",
+                    Some(exp.span.line));
+            }
+            Stmt::Exec(exc) => {
+                self.strict_violation(
+                    "exec (not compiled -- falls through to a no-op under the current compiler)",
+                    Some(exc.span.line));
+            }
         }
     }
 
@@ -1666,6 +1782,117 @@ mod tests {
         let low = err.to_lowercase();
         assert!(low.contains("predict"), "error must mention predict: {}", err);
         assert!(low.contains("infer"),   "error must mention infer: {}", err);
+    }
+
+    // ── Deny-by-default whitelist (Task 0, 2026-08-05) ──────────────────
+    // `--strict` was blacklist-shaped: strict_check_stmt only inspected
+    // Match/ExtOp/Unify, so any OTHER unrecognized statement fell through to
+    // `Stmt::Expr` -> `compile_expr_discard`'s catch-all (a silent SKIP) and
+    // strict never noticed. Live-reproduced: `frobnicate d;` compiled clean
+    // under --strict. These tests pin the fix: strict now denies by default.
+
+    #[test]
+    fn strict_rejects_unknown_statement() {
+        // `frobnicate` is not a real construct. It parses as a bare
+        // expression-statement (an unrecognized leading identifier), which
+        // compiled to a no-op SKIP with no error before this fix.
+        let source = r#"
+            program T {
+                public function solve(): number {
+                    frobnicate d;
+                    return 0;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err(
+            "an unrecognized statement must be rejected under --strict");
+        assert!(err.to_lowercase().contains("unrecognized")
+            || err.to_lowercase().contains("no compiled effect"),
+            "error should explain the statement has no compiled effect: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_unsupported_assign_target() {
+        // Stmt::Assign only handles `self.field` and a bare identifier
+        // target. An index target (`arr[0] = x`) or any other non-trivial
+        // target silently compiled to ZERO bytecode, with no error, before
+        // this fix — the sibling silent-drop named in the audit.
+        let source = r#"
+            program T {
+                public function run(): void {
+                    create arr : array<u64>;
+                    arr[0] = 5;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err(
+            "an unsupported assignment target must be rejected under --strict");
+        let low = err.to_lowercase();
+        assert!(low.contains("assign"), "error must name the assign statement: {}", err);
+        assert!(err.contains("line"), "error must include a source line: got: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_throw() {
+        // `Stmt::Throw` is parsed but never compiled — compile_stmt's own
+        // catch-all (`_ => emit SKIP`) silently no-ops it, same hole family
+        // as the Stmt::Expr fall-through above, just one enum variant over.
+        let source = r#"
+            program T {
+                public function run(): void {
+                    throw "boom";
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err("throw must be rejected under --strict");
+        assert!(err.to_lowercase().contains("throw"), "error must name throw: {}", err);
+    }
+
+    #[test]
+    fn strict_rejects_assert_with_non_call_condition() {
+        // Stmt::Assert compiles its condition via compile_expr_discard,
+        // which only emits real bytecode for a Call/MethodCall. A normal
+        // comparison condition (the overwhelmingly common case for a real
+        // assert) silently compiled to a single SKIP -- the assert never
+        // actually checked anything at runtime.
+        let source = r#"
+            program T {
+                public function run(): void {
+                    create x : quantity;
+                    assign x = 1;
+                    assert x > 0;
+                }
+            }
+        "#;
+        let err = compile_strict(source).expect_err(
+            "an assert whose condition compiles to no real check must be rejected");
+        assert!(err.to_lowercase().contains("assert"), "error must name assert: {}", err);
+    }
+
+    #[test]
+    fn strict_still_accepts_qc_decision_after_whitelist_flip() {
+        // Regression guard for the whitelist rewrite itself: the safe-subset
+        // reference program must still compile clean (duplicates
+        // strict_qc_decision_compiles but colocated with the new tests so a
+        // future edit to the whitelist trips this immediately too).
+        let source = include_str!("../examples/qc_decision.cube");
+        compile_strict(source).expect("qc_decision.cube must still compile under --strict");
+    }
+
+    #[test]
+    fn non_strict_compile_still_allows_unknown_statement_and_bad_assign() {
+        // Non-strict path is untouched by the whitelist flip (regression
+        // guard, mirrors non_strict_compile_still_allows_trace_only below).
+        let source = r#"
+            program T {
+                public function run(): void {
+                    create arr : array<u64>;
+                    frobnicate d;
+                    arr[0] = 5;
+                }
+            }
+        "#;
+        compile(source).expect("non-strict compile must still accept these");
     }
 
     #[test]
