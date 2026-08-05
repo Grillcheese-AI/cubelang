@@ -367,8 +367,40 @@ impl CompiledProgram {
     }
 
     /// Save to a `.cubebin` file.
+    ///
+    /// Fix-round-1 (Task 3): the binary format doesn't carry `used_modules`/
+    /// `is_override` (see those fields' docs on `CompiledProgram`/
+    /// `CompiledFunction`) -- serializing a program that uses either would
+    /// silently round-trip into a capability-free program with NO warning:
+    /// `use demo; return greet();` returns 42 run from source, but a
+    /// `compile foo.cube -o foo.cubebin` + `run foo.cubebin` of the exact
+    /// same program would error, because the reloaded program `use`s
+    /// nothing. Refuse instead of producing a binary that silently
+    /// disagrees with its own source. A program using neither is unaffected
+    /// -- `to_cubebin`/`from_cubebin` themselves are unchanged.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(reason) = self.capability_conflict() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, reason));
+        }
         std::fs::write(path, self.to_cubebin())
+    }
+
+    /// Fix-round-1 (Task 3): `Some(reason)` when this program can't be
+    /// faithfully represented by the current `.cubebin` format -- it `use`s
+    /// at least one module, or declares at least one `override` function --
+    /// `None` when it's safe to serialize as-is.
+    fn capability_conflict(&self) -> Option<String> {
+        let has_override = self.functions.iter().any(|f| f.is_override);
+        if self.used_modules.is_empty() && !has_override {
+            return None;
+        }
+        Some(format!(
+            "cannot serialize program `{}` to .cubebin: it uses `use`/`override` \
+             (used modules: [{}]) and the binary format does not yet carry \
+             capability info -- run from source instead",
+            self.name,
+            self.used_modules.join(", "),
+        ))
     }
 
     /// Load from a `.cubebin` file.
@@ -443,14 +475,23 @@ pub struct Compiler {
     /// program is compiled. Attached verbatim to every `CompiledProgram`
     /// this call produces, and consulted by `check_override_validity`.
     used_modules: Vec<String>,
-    /// Task 3: `use`/`override` misuse (an `override`-marked function whose
-    /// name isn't genuinely overridable in a `use`'d module). Unlike
-    /// `strict_errors` (only checked under `--strict`), these are always
-    /// checked -- an invalid `override` is a bug regardless of strict mode.
-    /// Reuses `parser::ParseError`'s shape (message + span) rather than
-    /// introducing a new error type for one more compile-time check; both
+    /// Task 3: `use`/`override`/registry misuse, two shapes: (1) an
+    /// `override`-marked function whose name isn't genuinely overridable in
+    /// a `use`'d module (`check_override_validity`); (2) a PLAIN
+    /// (non-`override`) function whose name collides with a SEALED
+    /// (non-overridable) export of a `use`'d module -- silently unreachable
+    /// otherwise, since the registry always wins there and a sealed name has
+    /// no `override` escape hatch (`check_sealed_collision`, fix round 1).
+    /// An overridable collision is deliberately NOT an error here -- the
+    /// registry winning is correct in that case, and `override` is the
+    /// discoverable escape.
+    ///
+    /// Unlike `strict_errors` (only checked under `--strict`), these are
+    /// always checked -- both are bugs regardless of strict mode. Reuses
+    /// `parser::ParseError`'s shape (message + span) rather than introducing
+    /// a new error type for a couple more compile-time checks; both
     /// free-function entry points (`compile`, `compile_strict`) surface it.
-    override_errors: Vec<ParseError>,
+    capability_errors: Vec<ParseError>,
 }
 
 impl Compiler {
@@ -466,7 +507,7 @@ impl Compiler {
             current_function: String::new(),
             symbol_names: Vec::new(),
             used_modules: Vec::new(),
-            override_errors: Vec::new(),
+            capability_errors: Vec::new(),
         }
     }
 
@@ -555,8 +596,16 @@ impl Compiler {
         // file with multiple violations reports all of them, matching how
         // `strict_errors` accumulates), but an invalid `override` always
         // surfaces as a compile error from the free-function entry points.
+        //
+        // Fix round 1: a PLAIN (non-`override`) function gets the opposite
+        // check -- does its name collide with a SEALED capability the
+        // program can never reach (registry-wins, no override escape)? An
+        // overridable collision is left alone (registry-wins is correct
+        // there; `override` is the discoverable fix).
         if func.sig.is_override {
             self.check_override_validity(&func.sig);
+        } else {
+            self.check_sealed_collision(&func.sig);
         }
 
         for stmt in &func.body {
@@ -577,7 +626,7 @@ impl Compiler {
     /// is exposed by SOME module in `self.used_modules` and marked
     /// `overridable` there. Anything else -- the name absent from every
     /// `use`'d module, present but sealed (`overridable: false`), or no
-    /// `use` at all -- is a compile error, pushed onto `self.override_errors`
+    /// `use` at all -- is a compile error, pushed onto `self.capability_errors`
     /// (checked regardless of `--strict`; see that field's doc).
     fn check_override_validity(&mut self, sig: &FunctionSig) {
         let registry = ModuleRegistry::new();
@@ -589,7 +638,7 @@ impl Compiler {
             } else {
                 self.used_modules.join(", ")
             };
-            self.override_errors.push(ParseError {
+            self.capability_errors.push(ParseError {
                 message: format!(
                     "function `{}` is declared `override`, but no `use`'d module exposes an \
                      overridable `{}` (used modules: {}; registry v{})",
@@ -598,6 +647,48 @@ impl Compiler {
                 span: sig.span,
             });
         }
+    }
+
+    /// Fix round 1 (Task 3 review): a PLAIN (no `override` marker) function
+    /// whose name collides with a SEALED (`overridable: false`) export of a
+    /// `use`'d module used to compile silently and just... never run --
+    /// `op::CALL`'s registry-wins-without-a-valid-override branch always
+    /// picks the registry impl, and a sealed name has no `override` escape
+    /// (declaring one is ALREADY a compile error, via
+    /// `check_override_validity`). That silent dead code is a compile error
+    /// instead: there is no way to reach a program function shadowed by a
+    /// sealed capability other than renaming it, so say so at compile time.
+    ///
+    /// Deliberately narrower than it might look: an OVERRIDABLE collision
+    /// (the module exposes `sig.name` with `overridable: true`) is NOT an
+    /// error here -- registry-wins is the correct, intended behaviour there,
+    /// and `override` is the discoverable way to reclaim the name. Only a
+    /// SEALED collision has no escape hatch at all, which is what makes it
+    /// worth failing loudly over.
+    ///
+    /// Uses `ModuleRegistry::resolve_named` rather than scanning
+    /// `used_modules` by hand, specifically so this asks the EXACT question
+    /// `op::CALL` will ask at runtime (first `use`'d module that exposes
+    /// `sig.name` at all, in `used_modules` order -- not "does any used
+    /// module have it sealed"). With today's single `demo` module those
+    /// questions have the same answer; they would not once a second module
+    /// could also expose `sig.name`.
+    fn check_sealed_collision(&mut self, sig: &FunctionSig) {
+        let registry = ModuleRegistry::new();
+        let Some((module, entry)) = registry.resolve_named(&self.used_modules, &sig.name) else {
+            return;
+        };
+        if entry.overridable {
+            return;
+        }
+        self.capability_errors.push(ParseError {
+            message: format!(
+                "function `{}` collides with sealed capability `{}` from use'd module \
+                 `{}`; rename it (sealed capabilities cannot be overridden or shadowed)",
+                sig.name, sig.name, module,
+            ),
+            span: sig.span,
+        });
     }
 
     // ── Strict-mode safety check (P0-1, deny-by-default whitelist) ──────
@@ -1501,15 +1592,17 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 /// Compile CubeLang source to bytecode programs.
 ///
 /// Task 3: an invalid `override` (a name that isn't genuinely overridable in
-/// a `use`'d module) is a compile error here too, not just under `--strict`
-/// -- `check_override_validity` always runs. Reuses `ParseError`'s shape
-/// (message + span) for that error rather than widening this function's
-/// return type; see `Compiler::override_errors`'s doc for why.
+/// a `use`'d module), or a plain function name colliding with a `use`'d
+/// module's SEALED capability, is a compile error here too, not just under
+/// `--strict` -- `check_override_validity`/`check_sealed_collision` always
+/// run. Reuses `ParseError`'s shape (message + span) for these rather than
+/// widening this function's return type; see `Compiler::capability_errors`'s
+/// doc for why.
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
     let mut compiler = Compiler::new();
     let programs = compiler.compile(&ast);
-    if let Some(e) = compiler.override_errors.into_iter().next() {
+    if let Some(e) = compiler.capability_errors.into_iter().next() {
         return Err(e);
     }
     Ok(programs)
@@ -1520,14 +1613,14 @@ pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::Pars
 /// `for`, `match`, intra-program `call`. Returns one combined error string
 /// listing every violation (named construct + source line when available).
 ///
-/// Task 3: `override` validation errors are folded into the same combined
-/// string (before the strict-mode findings), since they are always checked,
-/// not a strict-only concern.
+/// Task 3: `use`/`override`/registry capability errors are folded into the
+/// same combined string (before the strict-mode findings), since they are
+/// always checked, not a strict-only concern.
 pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
     let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
     let mut compiler = Compiler::new_strict();
     let programs = compiler.compile(&ast);
-    let mut errors: Vec<String> = compiler.override_errors.iter().map(|e| e.to_string()).collect();
+    let mut errors: Vec<String> = compiler.capability_errors.iter().map(|e| e.to_string()).collect();
     errors.extend(compiler.strict_errors);
     if !errors.is_empty() {
         return Err(errors.join("\n"));

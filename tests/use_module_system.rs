@@ -214,9 +214,102 @@ fn a_plain_same_named_function_does_not_silently_shadow_a_used_module_without_ov
     // plain program fn > error), the registry wins -- a program cannot
     // accidentally shadow a used capability just by reusing its name; it
     // must opt in with `override`, which is itself validated at compile
-    // time. See the task report's CONCERNS for the reasoning.
+    // time. See the task report's CONCERNS for the reasoning. Review round 1
+    // ruled this correct and asked only for the SEALED variant (below) to
+    // become a compile error, since an overridable collision has a
+    // discoverable fix (`override`) and a sealed one does not.
     match run(PLAIN_SAME_NAME_AS_MODULE, "run") {
         ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 42),
         other => panic!("expected the registry's greet() (42) to win, got {:?}", other),
     }
+}
+
+// ── Fix round 1, item 2: a plain fn colliding with a SEALED capability ────
+// (as opposed to the overridable case just above, which stays as-is).
+
+// NOTE: no caller of `sealed()` here on purpose. `sealed` is itself a
+// reserved keyword (the `sealed { ... }` encrypted-storage block) that's a
+// soft keyword only in DECLARATION position (`expect_ident`, e.g. a
+// function name) -- not yet in `parse_primary_expr`'s expression-atom list,
+// so `return sealed();` fails to PARSE ("unexpected token in expression:
+// Sealed"), independent of anything Task 3 touches. `check_sealed_collision`
+// fires on the colliding DECLARATION alone, so this test doesn't need a
+// caller to exercise it -- and using one would conflate a pre-existing,
+// unrelated parser gap with the compile error under test.
+const SEALED_COLLISION: &str = r#"
+use demo;
+
+program CollidesWithSealed {
+    public function sealed(): number {
+        return 1;
+    }
+}
+"#;
+
+#[test]
+fn a_plain_function_colliding_with_a_sealed_capability_is_a_compile_error() {
+    // `sealed` is demo's non-overridable export. The program's own `sealed`
+    // (no `override` marker -- there's no valid one to give it, since
+    // `override` on a sealed name is itself already a compile error) would
+    // otherwise be silently unreachable: registry-wins picks demo's sealed()
+    // every time. That's dead code with no fix but renaming, so it's now a
+    // compile error instead of a silent trap.
+    let err = compiler::compile(SEALED_COLLISION)
+        .expect_err("a plain fn named `sealed` collides with demo's sealed capability");
+    let msg = err.to_string();
+    assert!(msg.contains("sealed"), "{}", msg);
+    assert!(msg.contains("demo"), "{}", msg);
+}
+
+// ── Fix round 1, item 1: .cubebin must not silently drop capability info ──
+//
+// The binary format doesn't carry `used_modules`/`is_override` (see those
+// fields' docs). Compiling a `use`/`override` program straight to .cubebin
+// used to succeed silently and then behave DIFFERENTLY once reloaded --
+// `use demo; return greet();` returns 42 run from source, but a save+load
+// round trip would drop the `use` and error at runtime instead, with no
+// warning anywhere. `CompiledProgram::save` now refuses instead.
+
+#[test]
+fn use_demo_program_refuses_to_serialize_to_cubebin() {
+    let progs = compiler::compile(USE_DEMO).expect("compile");
+    let path = std::env::temp_dir().join("use_demo_capability_guard_test.cubebin");
+    let _ = std::fs::remove_file(&path);
+
+    let err = progs[0].save(&path).expect_err(
+        "a program with a non-empty used_modules must refuse to serialize");
+    assert!(err.to_string().contains("use"), "{}", err);
+    assert!(!path.exists(), "save must refuse BEFORE writing anything, not after");
+}
+
+#[test]
+fn override_program_also_refuses_to_serialize_to_cubebin() {
+    // Distinct from the case above: this program's guard-relevant signal is
+    // an `is_override` function, checked independently of `used_modules`
+    // (USE_DEMO_OVERRIDE happens to carry both, but the guard is an OR).
+    let progs = compiler::compile(USE_DEMO_OVERRIDE).expect("compile");
+    let path = std::env::temp_dir().join("use_demo_override_capability_guard_test.cubebin");
+    let _ = std::fs::remove_file(&path);
+
+    let err = progs[0].save(&path).expect_err("an override-marked function must also refuse");
+    assert!(!path.exists(), "save must refuse BEFORE writing anything, not after");
+    drop(err);
+}
+
+#[test]
+fn a_plain_program_still_round_trips_through_cubebin_unchanged() {
+    // No `use`, no `override` anywhere: the new guard must be a complete
+    // no-op for this program. Round-trips through a REAL save+load (not
+    // just to_cubebin/from_cubebin in memory) and still runs identically.
+    let progs = compiler::compile(PLAIN_CALL_NO_USE).expect("compile");
+    let path = std::env::temp_dir().join("plain_call_capability_guard_round_trip_test.cubebin");
+    progs[0].save(&path).expect("a plain program must still serialize fine");
+
+    let mut vm = VM::new();
+    let name = vm.load_file(&path).expect("must still load fine");
+    match vm.call(&name, "run", vec![]) {
+        ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 5),
+        other => panic!("round-tripped plain program should behave identically: {:?}", other),
+    }
+    let _ = std::fs::remove_file(&path);
 }

@@ -103,8 +103,26 @@ impl ModuleRegistry {
     /// declaration order), returning the first hit. DENY BY DEFAULT: a
     /// module absent from `used` is invisible here even if the registry
     /// otherwise knows it — `get` is the only way to reach it un-gated.
+    ///
+    /// First hit, not best hit: if more than one `use`'d module happened to
+    /// expose the same `name` (impossible with today's single `demo`
+    /// module, but not once a second module exists), this — like
+    /// `op::CALL` — stops at whichever comes first in `used`'s order and
+    /// never looks at the rest, regardless of what they'd say.
     pub fn resolve<'a>(&'a self, used: &[String], name: &str) -> Option<&'a ModuleFn> {
         used.iter().find_map(|m| self.get(m, name))
+    }
+
+    /// Same lookup as `resolve`, but also names the module that won.
+    /// `resolve` stays reference-returning and allocation-free for
+    /// `op::CALL`'s hot path; this clones the module name for callers that
+    /// need it for a diagnostic (e.g. `Compiler::check_sealed_collision`)
+    /// and can afford to. Must agree with `resolve` on WHICH module wins —
+    /// same `used`-order, first-hit-not-best-hit semantics — or a
+    /// diagnostic could name a different module than the one that will
+    /// actually be reached at runtime.
+    pub fn resolve_named(&self, used: &[String], name: &str) -> Option<(String, ModuleFn)> {
+        used.iter().find_map(|m| self.get(m, name).map(|f| (m.clone(), *f)))
     }
 
     /// Every function name exposed by any module, across the whole
@@ -181,6 +199,16 @@ mod tests {
         assert!(reg.resolve(&["other".to_string()], "greet").is_none());
         let hit = reg.resolve(&["demo".to_string()], "greet");
         assert!(hit.is_some_and(|f| f.overridable));
+    }
+
+    #[test]
+    fn resolve_named_agrees_with_resolve() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.resolve_named(&[], "greet").is_none());
+        let (module, entry) = reg.resolve_named(&["demo".to_string()], "sealed")
+            .expect("demo.sealed exists");
+        assert_eq!(module, "demo");
+        assert!(!entry.overridable);
     }
 
     #[test]
