@@ -1,0 +1,16 @@
+syntax = "proto3";
+package reasoning;
+
+message RunRequest {
+  string program = 1;   // CubeLang source (source on the wire, not bytecode)
+  repeated string args = 2;
+  string fn_name = 3;    // 'fn' is a Rust keyword; field is fn_name
+}
+
+message RunResult {
+  bool ok = 1;
+  oneof result {
+    string symbol = 2;   // the recovered symbol (similarity deferred, spec §8.1)
+    string error = 3;
+  }
+}
