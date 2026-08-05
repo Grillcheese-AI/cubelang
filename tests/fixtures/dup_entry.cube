@@ -1,0 +1,11 @@
+# dup_entry.cube -- Task 5 import fixture (b): imports two files that both
+# declare `struct Shared` -- must fail to load with a duplicate-name error,
+# not silently pick one.
+
+import "dup_a.cube";
+import "dup_b.cube";
+
+program DupEntry {
+    public function run(): void {
+    }
+}

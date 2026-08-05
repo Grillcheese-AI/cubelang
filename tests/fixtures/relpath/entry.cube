@@ -1,0 +1,14 @@
+# relpath/entry.cube -- Task 5 import fixture (d). Imports sub/mid.cube,
+# which itself imports "leaf.cube" with NO subdirectory prefix. There is
+# deliberately no tests/fixtures/relpath/leaf.cube -- only
+# tests/fixtures/relpath/sub/leaf.cube. If path resolution were (incorrectly)
+# always relative to the ENTRY file instead of the file that DECLARES the
+# import, mid.cube's import would 404 against this directory. A clean load
+# proves resolution is relative to the importing file.
+
+import "sub/mid.cube";
+
+program RelEntry {
+    public function run(): void {
+    }
+}

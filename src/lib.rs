@@ -16,3 +16,4 @@ pub mod parser;
 pub mod compiler;
 pub mod validate;
 pub mod vm;
+pub mod loader;

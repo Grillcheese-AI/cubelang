@@ -1,0 +1,10 @@
+# uses_lib.cube -- Task 5 import fixture (a): imports lib.cube and uses
+# both of its declarations (see tests/file_import.rs case (a)).
+
+import "lib.cube";
+
+program UsesLib implements ILib {
+    public function helper(): number {
+        return 42;
+    }
+}

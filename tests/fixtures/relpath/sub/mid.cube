@@ -1,0 +1,9 @@
+# relpath/sub/mid.cube -- part of Task 5 import fixture (d). This bare
+# "leaf.cube" must resolve to relpath/sub/leaf.cube (this file's own
+# directory), not relpath/leaf.cube (the entry's directory).
+
+import "leaf.cube";
+
+struct FromMid {
+    v: number;
+}

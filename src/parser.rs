@@ -330,10 +330,32 @@ impl Parser {
                 TokenKind::Event => items.push(TopLevel::EventDecl(self.parse_event()?)),
                 TokenKind::Extend => items.push(TopLevel::ExtendBlock(self.parse_extend()?)),
                 TokenKind::Use => items.push(TopLevel::Use(self.parse_use()?)),
+                TokenKind::Import => items.push(TopLevel::Import(self.parse_import()?)),
                 _ => return Err(self.err(format!("unexpected token at top level: {:?}", self.peek()))),
             }
         }
         Ok(SourceFile { items })
+    }
+
+    // ── Import (Task 5: external user-file modularity) ────────────────────
+
+    /// `import "path.cube";` — a top-level declaration naming another user
+    /// file whose top-level declarations should be pulled into this
+    /// compilation. Just the path: resolution (relative to the FILE THAT
+    /// DECLARES THIS import, not necessarily the entry file), cycle
+    /// detection, and the actual AST-level merge are the loader's job
+    /// (`crate::loader`), not the parser's — mirrors how `parse_use` only
+    /// extracts the bare name and leaves registry resolution to
+    /// `compiler.rs`. The old in-body `import "x" as y` / `import {a,b}
+    /// from "x"` ES-module shape (`Stmt::Import`/`ImportStmt`) was deleted
+    /// in Task 1 for being the wrong shape (a statement can't introduce new
+    /// top-level names) — this is intentionally simpler: one bare string,
+    /// top-level only, no `as`/`from`/selective-import syntax.
+    fn parse_import(&mut self) -> PResult<String> {
+        self.expect(&TokenKind::Import)?;
+        let path = self.expect_string()?;
+        self.eat(&TokenKind::Semicolon);
+        Ok(path)
     }
 
     // ── Use (Task 3: VM-internal capability/module system) ────────────────
@@ -2011,6 +2033,37 @@ mod tests {
             other => panic!("expected TopLevel::Use, got {:?}", other),
         }
         assert!(matches!(&ast.items[1], TopLevel::Program(_)));
+    }
+
+    #[test]
+    fn test_parse_import_declaration() {
+        // Task 5: `import "path";` is a TOP-LEVEL decl, a sibling of
+        // `program`/`use` — not the old in-body ES-module `Stmt::Import`
+        // deleted in Task 1. This test only covers the parser's shape; the
+        // loader that actually resolves/merges the path lives in
+        // `crate::loader` and is exercised by `tests/file_import.rs`.
+        let ast = parse(r#"
+            import "lib.cube";
+
+            program UsesLib {
+                public function run(): void {}
+            }
+        "#).unwrap();
+        assert_eq!(ast.items.len(), 2);
+        match &ast.items[0] {
+            TopLevel::Import(path) => assert_eq!(path, "lib.cube"),
+            other => panic!("expected TopLevel::Import, got {:?}", other),
+        }
+        assert!(matches!(&ast.items[1], TopLevel::Program(_)));
+    }
+
+    #[test]
+    fn test_parse_import_without_trailing_semicolon() {
+        // Mirrors `parse_use`'s tolerance: the trailing `;` is eaten if
+        // present, not required (`self.eat`, not `self.expect`).
+        let ast = parse(r#"import "lib.cube""#).unwrap();
+        assert_eq!(ast.items.len(), 1);
+        assert!(matches!(&ast.items[0], TopLevel::Import(p) if p == "lib.cube"));
     }
 
     #[test]

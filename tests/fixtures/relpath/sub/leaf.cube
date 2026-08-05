@@ -1,0 +1,6 @@
+# relpath/sub/leaf.cube -- the innermost file of Task 5 import fixture (d),
+# only reachable if "leaf.cube" resolved relative to mid.cube's directory.
+
+struct FromLeaf {
+    v: number;
+}

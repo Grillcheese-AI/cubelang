@@ -24,6 +24,24 @@ pub enum TopLevel {
     /// `SourceFile`). See `compiler::Compiler::compile` (gathers these
     /// before compiling any program) and `vm::registry::ModuleRegistry`.
     Use(String),
+    /// `import "path.cube";` — Task 5: pulls another user file's top-level
+    /// declarations into this compilation. Unlike `Use` (a VM-internal
+    /// registry module, name-addressed, no filesystem involved), `Import`
+    /// carries a filesystem path (relative to whichever file declares it)
+    /// that a loader pre-pass resolves BEFORE compilation ever sees a
+    /// `SourceFile` — see `crate::loader`. By the time `compiler::compile`
+    /// (or `compile_ast`) runs, every `Import` a `loader::load` pass
+    /// produced has already been expanded away; a bare `parser::parse` on a
+    /// single file's text (as every `&str`-input free function still does)
+    /// can still leave `Import` items in `SourceFile::items` — those are
+    /// simply not visited by `Compiler::compile` (mirrors how it already
+    /// ignores `ExtendBlock`/etc.), so parsing a file with an `import` in
+    /// isolation is harmless, just incomplete without the loader.
+    ///
+    /// NOT the old in-body ES-module `Stmt::Import`/`ImportStmt` (deleted in
+    /// Task 1 as the wrong shape for real file import — an in-body
+    /// statement can't express "pull in these top-level declarations").
+    Import(String),
 }
 
 // ── Interfaces ──────────────────────────────────────────────────────────────

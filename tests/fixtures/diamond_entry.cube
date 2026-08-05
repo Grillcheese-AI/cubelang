@@ -1,0 +1,7 @@
+import "diamond_x.cube";
+import "diamond_y.cube";
+
+program DiamondEntry {
+    public function run(): void {
+    }
+}

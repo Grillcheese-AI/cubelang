@@ -1,0 +1,7 @@
+# cycle_b.cube -- the other half of the Task 5 import fixture (c) cycle.
+
+import "cycle_a.cube";
+
+struct FromB {
+    v: number;
+}

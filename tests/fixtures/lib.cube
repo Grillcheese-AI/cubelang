@@ -1,0 +1,20 @@
+# lib.cube -- a reusable "library" file for Task 5 import fixture (a).
+# Declares an interface AND a helper program, both meant to be pulled into
+# another file via `import "lib.cube";`. See tests/file_import.rs case (a)
+# and src/loader.rs's module doc ("What gets exposed on import") for why
+# "using" Lib's helper() from an importing program's OWN function body isn't
+# how this is exercised -- cross-program calls aren't a real language
+# feature yet, so the fixture instead: (1) implements ILib against the
+# merged-in interface (a genuinely load-bearing use of the AST merge), and
+# (2) runs Lib's own helper() directly after merge+compile, proving it
+# round-tripped intact.
+
+interface ILib {
+    abstract public function helper(): number;
+}
+
+program Lib {
+    public function helper(): number {
+        return 42;
+    }
+}

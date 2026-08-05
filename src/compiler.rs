@@ -1755,8 +1755,21 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 /// accumulator needs to interleave with the other.
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
+    compile_ast(&ast)
+}
+
+/// Compile an already-parsed `SourceFile` — the AST-input sibling of
+/// `compile(source: &str)` above, factored out so Task 5's import loader
+/// (`crate::loader`) has somewhere to hand its AST-merged `SourceFile`
+/// without round-tripping back through source text (which would either
+/// require an unparser that doesn't exist, or re-lexing concatenated text
+/// and losing each declaration's OWN file's line numbers — exactly what
+/// "AST-level merge, not textual concatenation" is for). `compile(&str)`
+/// now just parses and delegates here; behavior is unchanged, this only
+/// factors out the part that doesn't actually need source text.
+pub fn compile_ast(source: &SourceFile) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let mut compiler = Compiler::new();
-    let programs = compiler.compile(&ast);
+    let programs = compiler.compile(source);
     if let Some(e) = compiler.capability_errors.into_iter().next() {
         return Err(e);
     }
@@ -1779,8 +1792,18 @@ pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::Pars
 /// after the capability errors and before the strict-mode findings.
 pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
     let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
+    compile_ast_strict(&ast)
+}
+
+/// Strict-mode sibling of `compile_ast` above, for the same reason: the
+/// import loader produces a `SourceFile`, not source text, and strict
+/// validation (P0-1) needs to run over the FULL merged compilation unit —
+/// imported code is real code, checked exactly like the entry file's own
+/// (see the Task 5 brief: "imported code is verified like any code").
+/// `compile_strict(&str)` now just parses and delegates here.
+pub fn compile_ast_strict(source: &SourceFile) -> Result<Vec<CompiledProgram>, String> {
     let mut compiler = Compiler::new_strict();
-    let programs = compiler.compile(&ast);
+    let programs = compiler.compile(source);
     let mut errors: Vec<String> = compiler.capability_errors.iter().map(|e| e.to_string()).collect();
     errors.extend(compiler.interface_errors.iter().map(|e| e.to_string()));
     errors.extend(compiler.strict_errors);

@@ -1,0 +1,10 @@
+# strict_violation_lib.cube -- bonus Task 5 fixture proving imported code is
+# verified like any code: `unify` is a trace-only opcode (compiler.rs's
+# strict_check_stmt), so this must surface as a --strict violation even
+# though it only reaches the compile via an `import`, not the entry file.
+
+program StrictViolationLib {
+    public function bad(): void {
+        unify a, b;
+    }
+}

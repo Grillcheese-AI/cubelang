@@ -1,0 +1,5 @@
+import "diamond_common.cube";
+
+struct FromY {
+    v: number;
+}

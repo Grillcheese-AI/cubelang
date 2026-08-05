@@ -1,0 +1,11 @@
+# strict_violation_entry.cube -- pairs with strict_violation_lib.cube: a
+# clean entry file that imports code containing a real strict-mode
+# violation. `import` must not be a way to launder non-executing constructs
+# past `--strict`.
+
+import "strict_violation_lib.cube";
+
+program StrictViolationEntry {
+    public function run(): void {
+    }
+}

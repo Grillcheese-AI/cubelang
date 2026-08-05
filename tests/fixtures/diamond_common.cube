@@ -1,0 +1,8 @@
+# diamond_common.cube -- bonus Task 5 fixture: imported by BOTH diamond_x.cube
+# and diamond_y.cube. Proves the visited-set dedups an ordinary diamond
+# (not just a true a<->b cycle) via the exact same no-op-on-revisit
+# mechanism -- see tests/file_import.rs's diamond test.
+
+struct FromCommon {
+    v: number;
+}

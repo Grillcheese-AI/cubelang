@@ -1,0 +1,9 @@
+# cycle_a.cube -- Task 5 import fixture (c): a <-> b import cycle. Loading
+# either as the entry must terminate cleanly (visited-set no-op on revisit),
+# not hang, and must not error -- a cycle is a no-op, not a failure.
+
+import "cycle_b.cube";
+
+struct FromA {
+    v: number;
+}

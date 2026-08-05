@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use cubelang::compiler::{self, CompiledProgram, op};
+use cubelang::loader;
 use cubelang::vm::{VM, ExecResult, Value};
 
 fn main() {
@@ -99,18 +100,22 @@ fn cmd_compile(args: &[String]) {
         Path::new(input).with_extension("cubebin")
     };
 
-    // Read source
-    let source = match std::fs::read_to_string(input) {
-        Ok(s) => s,
+    // Load `input` and everything it (transitively) `import`s into one
+    // merged AST (Task 5) -- replaces the old bare read_to_string+parse,
+    // since a single source string can't carry more than one file.
+    let merged = match loader::load(Path::new(input)) {
+        Ok(ast) => ast,
         Err(e) => {
-            eprintln!("error: cannot read {}: {}", input, e);
+            eprintln!("error: {}", e);
             process::exit(1);
         }
     };
 
     // Compile (--strict surfaces non-executing constructs as hard errors).
+    // Imported code goes through the exact same check as the entry file's
+    // own -- `import` is modularity, never a verification bypass.
     let programs = if strict {
-        match compiler::compile_strict(&source) {
+        match compiler::compile_ast_strict(&merged) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error (--strict): {}", e);
@@ -118,7 +123,7 @@ fn cmd_compile(args: &[String]) {
             }
         }
     } else {
-        match compiler::compile(&source) {
+        match compiler::compile_ast(&merged) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -315,16 +320,9 @@ fn cmd_check(args: &[String]) {
         process::exit(1);
     }
 
-    let source = match std::fs::read_to_string(&args[0]) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {}", args[0], e);
-            process::exit(1);
-        }
-    };
-
-    // Parse
-    match cubelang::parser::parse(&source) {
+    // Load + merge (Task 5: `import`) instead of a bare parse -- `check`
+    // should see the whole compilation unit, imports included.
+    match loader::load(Path::new(&args[0])) {
         Ok(ast) => {
             let n_items = ast.items.len();
             let mut n_programs = 0;
@@ -446,11 +444,11 @@ fn cmd_run(args: &[String]) {
             Err(e) => { eprintln!("error: cannot load {}: {}", input, e); process::exit(1); }
         }
     } else {
-        let source = match std::fs::read_to_string(input) {
-            Ok(s) => s,
-            Err(e) => { eprintln!("error: cannot read {}: {}", input, e); process::exit(1); }
+        let merged = match loader::load(Path::new(input)) {
+            Ok(ast) => ast,
+            Err(e) => { eprintln!("error: {}", e); process::exit(1); }
         };
-        let programs = match compiler::compile(&source) {
+        let programs = match compiler::compile_ast(&merged) {
             Ok(p) => p,
             Err(e) => { eprintln!("error: {}", e); process::exit(1); }
         };

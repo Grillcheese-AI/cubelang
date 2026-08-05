@@ -1,0 +1,7 @@
+# dup_b.cube -- Task 5 import fixture (b): declares `Shared` again (see
+# dup_a.cube), a different field on purpose so a naive last-write-wins merge
+# couldn't accidentally look correct.
+
+struct Shared {
+    y: number;
+}

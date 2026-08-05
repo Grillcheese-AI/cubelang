@@ -1,0 +1,7 @@
+# dup_a.cube -- Task 5 import fixture (b): declares `Shared`, which
+# dup_b.cube ALSO declares. Both are imported by dup_entry.cube, so the
+# loader must reject the merge with a duplicate-name error.
+
+struct Shared {
+    x: number;
+}

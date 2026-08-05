@@ -1,0 +1,15 @@
+# dup_with_entry.cube -- Task 5 import fixture (b) variant: the ENTRY file
+# itself (not just two imports) declares a name that collides with an
+# imported file's. The brief is explicit this must ALSO be an error ("two
+# files (or a file and the entry)").
+
+import "dup_a.cube";
+
+struct Shared {
+    z: number;
+}
+
+program DupWithEntry {
+    public function run(): void {
+    }
+}
