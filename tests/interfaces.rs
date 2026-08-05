@@ -256,11 +256,12 @@ fn qc_decision_cube_example_still_compiles() {
 
 #[test]
 fn fibonacci_cube_example_still_compiles() {
-    // Fibonacci declared `implements ISolver` with no inline decl and no
-    // parse/verify -- true even before this task, just never checked. Fixed
-    // by dropping the inaccurate claim (see examples/fibonacci.cube) rather
-    // than backfilling stub methods nothing else needed; this test is the
-    // regression guard for that fix.
+    // Fibonacci once declared `implements ISolver` with no inline decl and no
+    // parse/verify -- inaccurate, just never checked before the registry
+    // existed. Task 7 corrected the claim to `implements ISolve` (its existing
+    // solve(input) already matches ISolve's arity-1 contract exactly), rather
+    // than backfilling stub parse/verify methods nothing else needed. This
+    // test is the regression guard for that conformance.
     let source = include_str!("../examples/fibonacci.cube");
     compiler::compile(source).expect("fibonacci.cube must still compile");
 }
