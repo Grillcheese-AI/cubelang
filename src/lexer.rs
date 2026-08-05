@@ -288,8 +288,7 @@ impl<'a> Lexer<'a> {
             "rollback"     => TokenKind::Rollback,
             "commit"       => TokenKind::Commit,
 
-            // Bytecode / low-level
-            "bytecode"     => TokenKind::BytecodeKw,
+            // Imports / low-level asm
             "import"       => TokenKind::Import,
             "asm"          => TokenKind::AsmKw,
 
@@ -731,16 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn test_lex_bytecode_keywords() {
-        let tokens = Lexer::new("bytecode import").tokenize();
-        assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
-        assert_eq!(tokens[1].kind, TokenKind::Import);
-    }
-
-    #[test]
     fn test_lex_asm_block() {
-        // Task 6: `asm` is its own keyword, distinct from `bytecode` — the
-        // mnemonics inside (BIND_ROLE, UNBIND, ...) are plain uppercase
+        // Task 6: `asm` is its own keyword — the mnemonics inside
+        // (BIND_ROLE, UNBIND, ...) are plain uppercase
         // identifiers (no keyword collision; every existing opcode keyword
         // is lowercase), and a comma-separated operand list mixes bareword
         // idents with a quoted string literal.

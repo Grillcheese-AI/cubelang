@@ -139,7 +139,6 @@ impl Parser {
             TokenKind::Actuators    => "actuators".into(),
             TokenKind::Safety       => "safety".into(),
             TokenKind::Modalities   => "modalities".into(),
-            TokenKind::BytecodeKw   => "bytecode".into(),
             TokenKind::AsmKw        => "asm".into(),
             // Opcodes used as method names (e.g. steps.push(), self.store())
             TokenKind::OpCreate     => "create".into(),

@@ -1065,11 +1065,6 @@ impl Compiler {
                     "throw (not compiled -- falls through to a no-op under the current compiler)",
                     None);
             }
-            Stmt::BytecodeBlock(b) => {
-                self.strict_violation(
-                    "bytecode block (not compiled -- falls through to a no-op under the current compiler)",
-                    Some(b.span.line));
-            }
         }
     }
 

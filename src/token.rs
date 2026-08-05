@@ -96,14 +96,12 @@ pub enum TokenKind {
     Rollback,       // rollback; — undo current atomic block
     Commit,         // commit; — finalize atomic block
 
-    // ── Keywords: bytecode / low-level ───────────────────────
-    BytecodeKw,     // bytecode { asm } — inline VM assembly
+    // ── Keywords: imports / low-level asm ─────────────────────
     Import,         // import "file" (reserved; real top-level import lands in a later task)
     AsmKw,          // asm { MNEMONIC operand,operand...; ... } — Task 6: raw
-                    // op-table-mnemonic escape hatch, distinct from
-                    // `BytecodeKw`'s existing (unwired) `BytecodeKind::Asm`
-                    // scaffold, which reuses CubeLang's own surface
-                    // statement forms instead of raw mnemonics.
+                    // op-table-mnemonic escape hatch: names a canonical VM
+                    // mnemonic directly, for opcodes (like UNBIND) that have
+                    // no surface statement at all.
 
     // ── Keywords: capability / module system (Task 3) ────────
     Use,            // use <module>; — top-level decl, brings a VM registry module into scope

@@ -383,8 +383,7 @@ pub enum Stmt {
     Rollback,
     Commit,
 
-    // Bytecode / low-level
-    BytecodeBlock(BytecodeBlock),
+    // Low-level asm
     Asm(AsmBlock),
 }
 
@@ -489,36 +488,15 @@ pub struct AtomicStmt {
     pub span: Span,
 }
 
-// ── Bytecode / low-level ────────────────────────────────────────────────────
-
-/// bytecode { ... } — inline VM assembly or raw bytecode.
-///
-/// Two forms:
-/// 1. Inline raw bytes: `bytecode { 0x00 0x02 0x01 0xf8 0x3c ... }`
-/// 2. Raw CubeLang asm:  `bytecode { create x : number; assign x = 16; }`
-#[derive(Debug, Clone)]
-pub struct BytecodeBlock {
-    pub kind: BytecodeKind,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub enum BytecodeKind {
-    /// Inline raw bytes: bytecode { 0x00 0x02 ... }
-    Inline(Vec<u8>),
-    /// Raw CubeLang asm: bytecode { create x : number; assign x = 16; }
-    Asm(Vec<OpcodeStmt>),
-}
+// ── Low-level asm ────────────────────────────────────────────────────────────
 
 /// `asm { MNEMONIC operand, operand, ...; ... }` — Task 6's raw
-/// bytecode-mnemonic escape hatch. One level lower than `BytecodeKind::Asm`
-/// above: that (still-unwired) scaffold reuses CubeLang's own SURFACE
-/// statement forms (`create`/`assign`/`bind`/...); this names a canonical
-/// VM mnemonic (`compiler::op`'s constant names, e.g. `BIND_ROLE`/`UNBIND`)
-/// directly, for opcodes — like `UNBIND` — that have no surface statement
-/// at all. Built to let the `vsa` registry module (`vm::registry`) reach
-/// real BIND_ROLE/UNBIND+cleanup; `asm` itself is a helper-building tool,
-/// not something a generated program calling `recover(...)` ever needs.
+/// bytecode-mnemonic escape hatch: names a canonical VM mnemonic
+/// (`compiler::op`'s constant names, e.g. `BIND_ROLE`/`UNBIND`) directly,
+/// for opcodes — like `UNBIND` — that have no surface statement at all.
+/// Built to let the `vsa` registry module (`vm::registry`) reach real
+/// BIND_ROLE/UNBIND+cleanup; `asm` itself is a helper-building tool, not
+/// something a generated program calling `recover(...)` ever needs.
 #[derive(Debug, Clone)]
 pub struct AsmBlock {
     pub instrs: Vec<AsmInstr>,
