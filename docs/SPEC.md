@@ -59,6 +59,19 @@ This is how programs hook into each other's lifecycle safely.
 | `@restricted(programs)` | Only callable by the listed programs |
 | `@ratelimit(n, period)` | Max n calls per period |
 
+**Ergonomics: both are optional.** The grammar's `function_decl = permission*
+modifier* "function" ...` (see the EBNF below) means every permission and
+modifier is zero-or-more, never required. This matters most for a program's
+`implements`-required methods: a method that satisfies a required interface
+member is externally callable *by definition* — that's the interface
+contract — so `@external public` on it is redundant ceremony and may be
+omitted. A bare `function solve(input: Input): Output { ... }` parses and
+compiles to byte-identical bytecode as the fully-annotated form (see
+`tests/interfaces.rs`'s Task 8 tests). The verbose form remains fully
+supported and is still worth writing wherever the annotation carries real
+information (`private`/`@internal` helpers, `@system`-only lifecycle hooks,
+`@restricted`/`@ratelimit`, etc.).
+
 ### Usage
 
 ```cubelang

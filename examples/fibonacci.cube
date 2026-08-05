@@ -18,8 +18,7 @@ program Fibonacci implements ISolve {
     type Input = number;
     type Output = number;
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         # a = fib(0), b = fib(1)
         create a : number;
         assign a = 0;

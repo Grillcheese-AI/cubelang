@@ -17,13 +17,11 @@ program RecallMin implements ISolver {
         assign corrections_applied = 0;
     }
 
-    @external
-    public function parse(raw: str): Input {
+    function parse(raw: str): Input {
         return raw;
     }
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         # initial (wrong) belief about a quantity
         create belief : number;
         assign belief = 40;
@@ -50,8 +48,7 @@ program RecallMin implements ISolver {
         return recalled;
     }
 
-    @external
-    public pure function verify(input: Input, output: Output): bool {
+    pure function verify(input: Input, output: Output): bool {
         return true;
     }
 }

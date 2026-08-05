@@ -18,13 +18,11 @@ program CompareMin implements ISolver {
         assign last_winner = "none";
     }
 
-    @external
-    public function parse(raw: str): Input {
+    function parse(raw: str): Input {
         return raw;
     }
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         create left : number;
         assign left = 34;
         store left, "candidate_left";
@@ -54,8 +52,7 @@ program CompareMin implements ISolver {
         return result;
     }
 
-    @external
-    public pure function verify(input: Input, output: Output): bool {
+    pure function verify(input: Input, output: Output): bool {
         return true;
     }
 }

@@ -18,13 +18,11 @@ program ConversationMin implements ISolver {
         assign success_count = 0;
     }
 
-    @external
-    public function parse(raw: str): Input {
+    function parse(raw: str): Input {
         return raw;
     }
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         create score : number;
         assign score = 0;
 
@@ -48,8 +46,7 @@ program ConversationMin implements ISolver {
         return score;
     }
 
-    @external
-    public pure function verify(input: Input, output: Output): bool {
+    pure function verify(input: Input, output: Output): bool {
         return true;
     }
 }

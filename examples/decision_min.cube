@@ -22,13 +22,11 @@ program DecisionMin implements ISolver {
         assign last_decision = "none";
     }
 
-    @external
-    public function parse(raw: str): Input {
+    function parse(raw: str): Input {
         return raw;
     }
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         # observation under evaluation
         create observation : number;
         assign observation = 72;
@@ -63,8 +61,7 @@ program DecisionMin implements ISolver {
         return confidence;
     }
 
-    @external
-    public pure function verify(input: Input, output: Output): bool {
+    pure function verify(input: Input, output: Output): bool {
         return true;
     }
 }

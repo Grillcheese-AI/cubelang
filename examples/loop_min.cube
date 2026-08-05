@@ -20,13 +20,11 @@ program LoopMin implements ISolver {
         assign last_total = 0;
     }
 
-    @external
-    public function parse(raw: str): Input {
+    function parse(raw: str): Input {
         return raw;
     }
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         # accumulate `step` per iteration over `count` iterations
         create total : number;
         assign total = 0;
@@ -54,8 +52,7 @@ program LoopMin implements ISolver {
         return total;
     }
 
-    @external
-    public pure function verify(input: Input, output: Output): bool {
+    pure function verify(input: Input, output: Output): bool {
         return true;
     }
 }

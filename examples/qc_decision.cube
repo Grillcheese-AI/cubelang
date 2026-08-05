@@ -45,13 +45,11 @@ program QCDecision implements ISolver {
         assign total_count = 0;
     }
 
-    @external
-    public function parse(raw: str): Input {
+    function parse(raw: str): Input {
         return raw;
     }
 
-    @external
-    public function solve(input: Input): Output {
+    function solve(input: Input): Output {
         # in_class / in_conf are injected as registers by the host shim.
         create decision : number;
         assign decision = 0;            # default PASS
@@ -80,8 +78,7 @@ program QCDecision implements ISolver {
         return decision;
     }
 
-    @external
-    public pure function verify(input: Input, output: Output): bool {
+    pure function verify(input: Input, output: Output): bool {
         return true;
     }
 }

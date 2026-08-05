@@ -288,3 +288,87 @@ fn conversation_agent_cube_example_still_compiles() {
     let source = include_str!("../examples/conversation_agent/conversation_agent.cube");
     compiler::compile(source).expect("conversation_agent.cube must still compile");
 }
+
+// ── Task 8: `@external public` is redundant ceremony on interface members ──
+// A method that satisfies a required member of the program's `implements`
+// interface is externally callable BY DEFINITION -- that's what conforming
+// to the interface means. Investigation (src/parser.rs's `permission*
+// modifier*`, both zero-or-more already; every consumer of
+// `FunctionSig.permissions`/`.modifiers` -- there is exactly one, and it
+// only reads `Modifier::Abstract`/`Optional` on INTERFACE-DECL members, not
+// program methods; `.cubebin`'s to_cubebin/from_cubebin never serializes
+// either field) found the terse (bare) form was already fully equivalent to
+// the verbose `@external public` form, with zero parser/compiler changes
+// needed -- these tests are the regression guard that pins the guarantee
+// down, so it can't silently regress if that ever changes.
+
+const VERBOSE_ISOLVE_SOLVE: &str = r#"
+program VerboseSolve implements ISolve {
+    @external
+    public function solve(input: str): number {
+        create x : number;
+        assign x = 42;
+        return x;
+    }
+}
+"#;
+
+const TERSE_ISOLVE_SOLVE: &str = r#"
+program TerseSolve implements ISolve {
+    function solve(input: str): number {
+        create x : number;
+        assign x = 42;
+        return x;
+    }
+}
+"#;
+
+#[test]
+fn terse_interface_member_needs_no_external_or_public_and_still_satisfies_implements() {
+    // Same shape as `a_implements_isolver_missing_verify_is_a_compile_error`
+    // above, just proving the positive case: dropping `@external public`
+    // entirely still resolves `solve` against ISolve's required (name,
+    // arity) member -- `check_implements` never looks at permissions or
+    // modifiers, only name + param count.
+    compiler::compile(TERSE_ISOLVE_SOLVE)
+        .expect("a bare `function solve` still satisfies `implements ISolve`");
+}
+
+#[test]
+fn terse_and_verbose_solve_compile_to_byte_identical_bytecode() {
+    let verbose = compiler::compile(VERBOSE_ISOLVE_SOLVE).expect("verbose form must compile");
+    let terse = compiler::compile(TERSE_ISOLVE_SOLVE).expect("terse form must compile");
+
+    assert_eq!(verbose[0].implements, terse[0].implements);
+    assert_eq!(verbose[0].functions.len(), terse[0].functions.len());
+    assert_eq!(
+        verbose[0].functions[0].bytecode, terse[0].functions[0].bytecode,
+        "@external/public must not change a single compiled byte -- they are \
+         parsed and then never read again by anything compiling this function"
+    );
+}
+
+#[test]
+fn terse_and_verbose_solve_run_to_the_same_result() {
+    let verbose_bin = compiler::compile(VERBOSE_ISOLVE_SOLVE).unwrap();
+    let terse_bin = compiler::compile(TERSE_ISOLVE_SOLVE).unwrap();
+
+    let mut vm_verbose = cubelang::vm::VM::new();
+    vm_verbose.load(verbose_bin[0].clone());
+    let mut vm_terse = cubelang::vm::VM::new();
+    vm_terse.load(terse_bin[0].clone());
+
+    let verbose_result = vm_verbose.call("VerboseSolve", "solve", vec![cubelang::vm::Value::Str("ignored".into())]);
+    let terse_result = vm_terse.call("TerseSolve", "solve", vec![cubelang::vm::Value::Str("ignored".into())]);
+
+    assert_eq!(format!("{:?}", verbose_result), format!("{:?}", terse_result));
+}
+
+#[test]
+fn terse_solve_also_compiles_under_strict() {
+    // The strict whitelist (compiler.rs's `strict_check_stmt`) is keyed on
+    // `Stmt` shape, never on `FunctionSig.permissions`/`.modifiers` -- strict
+    // status is unaffected by dropping `@external public` too.
+    compiler::compile_strict(TERSE_ISOLVE_SOLVE)
+        .expect("terse form must still compile under --strict");
+}
