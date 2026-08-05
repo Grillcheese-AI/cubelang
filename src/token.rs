@@ -95,14 +95,10 @@ pub enum TokenKind {
     Atomic,         // atomic { ... } — all-or-nothing execution
     Rollback,       // rollback; — undo current atomic block
     Commit,         // commit; — finalize atomic block
-    Gate,           // gate("reason") { ... } — sensitive operation fence
 
     // ── Keywords: bytecode / low-level ───────────────────────
     BytecodeKw,     // bytecode { asm } — inline VM assembly
-    Import,         // import "file" or bytecode wasm import "file.wasm"
-    Export,         // export codebook / export bytecode
-    Exec,           // exec var(params) — run bytecode variable
-    Codebook,       // codebook.load("file.bin") / codebook.export("file.bin")
+    Import,         // import "file" (reserved; real top-level import lands in a later task)
 
     // ── Keywords: encryption / security ────────────────────────
     Encrypt,        // encrypt(data, key) — encrypt data at rest or in transit

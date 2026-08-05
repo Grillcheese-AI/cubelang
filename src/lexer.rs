@@ -287,14 +287,10 @@ impl<'a> Lexer<'a> {
             "atomic"       => TokenKind::Atomic,
             "rollback"     => TokenKind::Rollback,
             "commit"       => TokenKind::Commit,
-            "gate"         => TokenKind::Gate,
 
             // Bytecode / low-level
             "bytecode"     => TokenKind::BytecodeKw,
             "import"       => TokenKind::Import,
-            "export"       => TokenKind::Export,
-            "exec"         => TokenKind::Exec,
-            "codebook"     => TokenKind::Codebook,
 
             // Encryption / security
             "encrypt"      => TokenKind::Encrypt,
@@ -724,21 +720,17 @@ mod tests {
 
     #[test]
     fn test_lex_acid_keywords() {
-        let tokens = Lexer::new("atomic rollback commit gate").tokenize();
+        let tokens = Lexer::new("atomic rollback commit").tokenize();
         assert_eq!(tokens[0].kind, TokenKind::Atomic);
         assert_eq!(tokens[1].kind, TokenKind::Rollback);
         assert_eq!(tokens[2].kind, TokenKind::Commit);
-        assert_eq!(tokens[3].kind, TokenKind::Gate);
     }
 
     #[test]
     fn test_lex_bytecode_keywords() {
-        let tokens = Lexer::new("bytecode import export exec codebook").tokenize();
+        let tokens = Lexer::new("bytecode import").tokenize();
         assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
         assert_eq!(tokens[1].kind, TokenKind::Import);
-        assert_eq!(tokens[2].kind, TokenKind::Export);
-        assert_eq!(tokens[3].kind, TokenKind::Exec);
-        assert_eq!(tokens[4].kind, TokenKind::Codebook);
     }
 
     #[test]
@@ -759,16 +751,6 @@ mod tests {
         let tokens = Lexer::new(src).tokenize();
         assert_eq!(tokens[0].kind, TokenKind::Try);
         assert_eq!(tokens[1].kind, TokenKind::LBrace);
-    }
-
-    #[test]
-    fn test_lex_bytecode_wasm_import() {
-        let src = r#"bytecode import "solver.wasm";"#;
-        let tokens = Lexer::new(src).tokenize();
-        assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
-        assert_eq!(tokens[1].kind, TokenKind::Import);
-        assert_eq!(tokens[2].kind, TokenKind::StringLit("solver.wasm".into()));
-        assert_eq!(tokens[3].kind, TokenKind::Semicolon);
     }
 
     #[test]

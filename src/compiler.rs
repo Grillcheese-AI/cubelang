@@ -611,31 +611,10 @@ impl Compiler {
                     "throw (not compiled -- falls through to a no-op under the current compiler)",
                     None);
             }
-            Stmt::Gate(g) => {
-                self.strict_violation(
-                    "gate (not compiled -- falls through to a no-op under the current compiler)",
-                    Some(g.span.line));
-            }
             Stmt::BytecodeBlock(b) => {
                 self.strict_violation(
                     "bytecode block (not compiled -- falls through to a no-op under the current compiler)",
                     Some(b.span.line));
-            }
-            Stmt::Import(i) => {
-                self.strict_violation(
-                    "import (not compiled -- the import loader is not yet built; falls through \
-                     to a no-op under the current compiler)",
-                    Some(i.span.line));
-            }
-            Stmt::Export(exp) => {
-                self.strict_violation(
-                    "export (not compiled -- falls through to a no-op under the current compiler)",
-                    Some(exp.span.line));
-            }
-            Stmt::Exec(exc) => {
-                self.strict_violation(
-                    "exec (not compiled -- falls through to a no-op under the current compiler)",
-                    Some(exc.span.line));
             }
         }
     }
