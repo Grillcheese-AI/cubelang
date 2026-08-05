@@ -76,7 +76,7 @@ delivers a callee's return value via `stack.push(v)` + a compiler-emitted `POP`.
 
 ```
 ask "...", luna, apollo;   # suspends
-create chosen : quantity;
+create chosen : number;
 pop chosen;                # the answer
 sum chosen;
 return chosen;

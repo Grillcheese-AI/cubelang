@@ -454,7 +454,7 @@ pub struct AtomicStmt {
 ///
 /// Two forms:
 /// 1. Inline raw bytes: `bytecode { 0x00 0x02 0x01 0xf8 0x3c ... }`
-/// 2. Raw CubeLang asm:  `bytecode { create x : quantity; assign x = 16; }`
+/// 2. Raw CubeLang asm:  `bytecode { create x : number; assign x = 16; }`
 #[derive(Debug, Clone)]
 pub struct BytecodeBlock {
     pub kind: BytecodeKind,
@@ -465,14 +465,14 @@ pub struct BytecodeBlock {
 pub enum BytecodeKind {
     /// Inline raw bytes: bytecode { 0x00 0x02 ... }
     Inline(Vec<u8>),
-    /// Raw CubeLang asm: bytecode { create x : quantity; assign x = 16; }
+    /// Raw CubeLang asm: bytecode { create x : number; assign x = 16; }
     Asm(Vec<OpcodeStmt>),
 }
 
 /// VM opcode statements — compile directly to bytecodes.
 #[derive(Debug, Clone)]
 pub enum OpcodeStmt {
-    Create { reg: String, ty: String },         // create x : quantity
+    Create { reg: String, ty: String },         // create x : number
     Assign { reg: String, value: Expr },        // assign x = 16
     Add { reg: String, value: Expr },           // add x, 3
     Sub { reg: String, value: Expr },           // sub x, 3

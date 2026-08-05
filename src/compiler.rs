@@ -1420,7 +1420,7 @@ mod tests {
         let programs = compile(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 42;
                     add x, 10;
                     sub x, 5;
@@ -1449,7 +1449,7 @@ mod tests {
         let programs = compile(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 16;
                     sub x, 3;
                     sum x;
@@ -1563,7 +1563,7 @@ mod tests {
         let programs = compile(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 16;
                     add x, 3;
                     sum x;
@@ -1593,7 +1593,7 @@ mod tests {
 
                 @external
                 public function solve(input: Input): Output {
-                    create x : quantity;
+                    create x : number;
                     assign x = 16;
                     sub x, 3;
                     sub x, 4;
@@ -1630,7 +1630,7 @@ mod tests {
         let programs = compile(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 42;
                     sum x;
                 }
@@ -1671,7 +1671,7 @@ mod tests {
             program Test implements ISolver {
                 public function run(): void {
                     let xs = [1, 2, 3];
-                    create total : quantity;
+                    create total : number;
                     assign total = 0;
                     for (let x of xs) {
                         add total, x;
@@ -1734,7 +1734,7 @@ mod tests {
         // should now compile under --strict.
         let source = r#"
             program Test implements ISolver {
-                public function helper(): quantity {
+                public function helper(): number {
                     return 1;
                 }
                 public function run(): void {
@@ -1837,7 +1837,7 @@ mod tests {
         let source = r#"
             program T {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 1;
                     assert x > 0;
                 }

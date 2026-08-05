@@ -1365,7 +1365,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 16;
                     sub x, 3;
                     sub x, 4;
@@ -1399,13 +1399,13 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 16;
                     sub x, 3;
                     sub x, 4;
                     sum x;
                     push x;
-                    create y : quantity;
+                    create y : number;
                     pop y;
                     mul y, 2;
                     sum y;
@@ -1433,7 +1433,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 42;
                     div x, 0;
                 }
@@ -1452,7 +1452,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 42;
                     remember x;
                 }
@@ -1470,13 +1470,13 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program Calc implements ISolver {
                 public function add_numbers(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 10;
                     add x, 20;
                     sum x;
                 }
                 public function mul_numbers(): void {
-                    create y : quantity;
+                    create y : number;
                     assign y = 5;
                     mul y, 6;
                     sum y;
@@ -1503,7 +1503,7 @@ mod tests {
         let programs = crate::compiler::compile(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 100;
                     sub x, 37;
                     sum x;
@@ -1535,8 +1535,8 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create r : quantity;
-                    create poison : quantity;
+                    create r : number;
+                    create poison : number;
                     assign r = 1;
                     assign poison = 99;
                     return r;
@@ -1557,8 +1557,8 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create r : quantity;
-                    create poison : quantity;
+                    create r : number;
+                    create poison : number;
                     assign r = 5;
                     assign poison = 99;
                     if (r > 0) {
@@ -1581,8 +1581,8 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create x : quantity;
-                    create poison : quantity;
+                    create x : number;
+                    create poison : number;
                     assign x = 7;
                     assign poison = 99;
                     sum x;
@@ -1607,7 +1607,7 @@ mod tests {
             program T implements ISolver {
                 public function run(): void {
                     let xs = [10, 20, 30];
-                    create total : quantity;
+                    create total : number;
                     assign total = 0;
                     for (let x of xs) {
                         add total, x;
@@ -1628,7 +1628,7 @@ mod tests {
             program T implements ISolver {
                 public function run(): void {
                     let xs = [];
-                    create total : quantity;
+                    create total : number;
                     assign total = 0;
                     for (let x of xs) {
                         add total, 999;
@@ -1652,7 +1652,7 @@ mod tests {
                 public function run(): void {
                     let xs = [1, 2];
                     let ys = [10, 20];
-                    create total : quantity;
+                    create total : number;
                     assign total = 0;
                     for (let x of xs) {
                         for (let y of ys) {
@@ -1732,8 +1732,8 @@ mod tests {
     fn call_returns_value_via_stack() {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
-                public function dbl(): quantity {
-                    create r : quantity;
+                public function dbl(): number {
+                    create r : number;
                     assign r = 0;
                     add r, arg0;
                     add r, arg0;
@@ -1758,13 +1758,13 @@ mod tests {
         // After return, the caller's value must be intact.
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
-                public function helper(): quantity {
-                    create r : quantity;
+                public function helper(): number {
+                    create r : number;
                     assign r = 99;
                     return r;
                 }
                 public function run(): void {
-                    create r : quantity;
+                    create r : number;
                     assign r = 7;
                     let _t = helper();
                     sum r;
@@ -1784,17 +1784,17 @@ mod tests {
         // fact(n) = if n <= 1 then 1 else n * fact(n-1)
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
-                public function fact(): quantity {
-                    create n : quantity;
+                public function fact(): number {
+                    create n : number;
                     assign n = 0;
                     add n, arg0;
                     if (n > 1) {
-                        create m : quantity;
+                        create m : number;
                         assign m = 0;
                         add m, n;
                         sub m, 1;
                         let sub = fact(m);
-                        create out : quantity;
+                        create out : number;
                         assign out = 0;
                         add out, n;
                         mul out, sub;
@@ -1821,7 +1821,7 @@ mod tests {
         // stack overflow. fact() without a base case keeps calling.
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
-                public function loop_forever(): quantity {
+                public function loop_forever(): number {
                     let r = loop_forever();
                     return r;
                 }
@@ -1846,8 +1846,8 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create a : quantity;
-                    create b : quantity;
+                    create a : number;
+                    create b : number;
                     assign a = 5;
                     assign b = a;
                     sum b;
@@ -1867,8 +1867,8 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create a : quantity;
-                    create b : quantity;
+                    create a : number;
+                    create b : number;
                     assign a = 7;
                     assign b = a;
                     add b, 3;
@@ -1888,7 +1888,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create a : quantity;
+                    create a : number;
                     assign a = 42;
                     sum a;
                 }
@@ -1905,7 +1905,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program Test implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 5;
                     add x, 3;
                     sum x;
@@ -1928,7 +1928,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 5;
                     if (x > 3) { assign x = 100; } else { assign x = 200; }
                     sum x;
@@ -1946,7 +1946,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 2;
                     if (x > 3) { assign x = 100; } else { assign x = 200; }
                     sum x;
@@ -1964,9 +1964,9 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create total : quantity;
+                    create total : number;
                     assign total = 0;
-                    create i : quantity;
+                    create i : number;
                     assign i = 5;
                     while (i > 0) { add total, 10; sub i, 1; }
                     sum total;
@@ -1984,9 +1984,9 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create a : quantity;
+                    create a : number;
                     assign a = 7;
-                    create b : quantity;
+                    create b : number;
                     assign b = 7;
                     compare a, b;
                 }
@@ -2002,7 +2002,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create v : quantity;
+                    create v : number;
                     assign v = 80000;
                     mul v, 1.5;
                     sum v;
@@ -2021,7 +2021,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create v : quantity;
+                    create v : number;
                     assign v = 7;
                     div v, 2.0;
                     sum v;
@@ -2040,7 +2040,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create v : quantity;
+                    create v : number;
                     assign v = 60;
                     div v, 100;
                     sum v;
@@ -2059,7 +2059,7 @@ mod tests {
         let mut vm = compile_and_load(r#"
             program T implements ISolver {
                 public function run(): void {
-                    create v : quantity;
+                    create v : number;
                     assign v = 16;
                     div v, 2;
                     sum v;

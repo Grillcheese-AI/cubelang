@@ -222,7 +222,7 @@ mod tests {
             program Test implements ISolver {
                 public function run(): void {
                     let xs = [1, 2, 3];
-                    create total : quantity;
+                    create total : number;
                     assign total = 0;
                     for (let x of xs) {
                         add total, x;
@@ -261,7 +261,7 @@ mod tests {
         let source = r#"
             program Test implements ISolver {
                 public function solve(input: Input): Output {
-                    create x : quantity;
+                    create x : number;
                     assign x = 5;
                     if (x > 0) {
                         return x;
@@ -282,7 +282,7 @@ mod tests {
         // are no longer stubs.
         let source = r#"
             program Test implements ISolver {
-                public function helper(): quantity {
+                public function helper(): number {
                     return 1;
                 }
                 public function run(): void {

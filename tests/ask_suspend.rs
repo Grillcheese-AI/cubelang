@@ -21,13 +21,13 @@ program AskMin {
     public function constructor() { assign asked = 0; }
 
     @external
-    public function solve(): quantity {
-        create luna : quantity;
+    public function solve(): number {
+        create luna : number;
         assign luna = 1959;
-        create apollo : quantity;
+        create apollo : number;
         assign apollo = 1969;
         ask "which moon landing did you mean", luna, apollo;
-        create chosen : quantity;
+        create chosen : number;
         pop chosen;
         sum chosen;
         return chosen;

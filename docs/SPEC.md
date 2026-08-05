@@ -271,6 +271,7 @@ interface ISecureSolver {
 
 ```cubelang
 # Primitives
+number                       # untyped numeric register (supertype of int/float — see Type System)
 u8, u16, u32, u64           # unsigned integers
 i8, i16, i32, i64           # signed integers
 f32, f64                    # floating point
@@ -467,7 +468,7 @@ let sandbox: ctx = ctx.isolated();
 
 # It has its own registers, stack, history — nothing shared
 sandbox.run(() => {
-    create x : quantity;
+    create x : number;
     assign x = 42;
     # Cannot see parent registers, storage, or history
 });
@@ -2251,7 +2252,7 @@ program GSM8K implements IMathSolver, IDeployable {
             let step = input.steps[i];
 
             # CREATE register with semantic name
-            create step.label : quantity;
+            create step.label : number;
 
             # Chain from previous step or fresh assign
             if (prev_result != null && approx_eq(step.lhs, prev_result)) {
@@ -2537,7 +2538,7 @@ Programs can grow new capabilities without redeployment.
 extend GSM8K {
 
     public function handle_percentage(step: ArithStep): f64 {
-        create pct_result : quantity;
+        create pct_result : number;
         assign pct_result = step.lhs;
         mul pct_result, step.ops[0][1];
         div pct_result, 100;

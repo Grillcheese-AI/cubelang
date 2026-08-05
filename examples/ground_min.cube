@@ -22,17 +22,17 @@ program Ground {
     }
 
     @external
-    public function solve(mention: str): quantity {
+    public function solve(mention: str): number {
         query mention;
 
         # `ctx` is the SPEC's own name for this.
-        create ctx : quantity;
+        create ctx : number;
         # use `pop` to get the ctx variable properly
         pop ctx;
 
         let n = ctx.len();
 
-        create outcome : quantity;
+        create outcome : number;
         assign outcome = 0;
 
         if (n == 0) {

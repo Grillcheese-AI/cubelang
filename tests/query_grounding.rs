@@ -43,9 +43,9 @@ program Ground {
     public function constructor() { assign queries = 0; }
 
     @external
-    public function solve(mention: str): quantity {
+    public function solve(mention: str): number {
         query mention;
-        create hits : quantity;
+        create hits : number;
         pop hits;
         return hits;
     }
@@ -193,9 +193,9 @@ fn argN_alias_still_works_for_backwards_compatibility() {
     const BY_ARGN: &str = r#"
 program ByArgN {
     @external
-    public function solve(mention: str): quantity {
+    public function solve(mention: str): number {
         query arg0;
-        create hits : quantity;
+        create hits : number;
         pop hits;
         return hits;
     }
@@ -249,12 +249,12 @@ fn params_survive_the_cubebin_round_trip() {
 const GROUND: &str = r#"
 program Ground {
     @external
-    public function solve(mention: str): quantity {
+    public function solve(mention: str): number {
         query mention;
-        create ctx : quantity;
+        create ctx : number;
         pop ctx;
         let n = ctx.len();
-        create outcome : quantity;
+        create outcome : number;
         assign outcome = 0;
         if (n == 0) {
             assign outcome = 0;
@@ -289,11 +289,11 @@ fn REGRESSION_type_keywords_are_usable_as_identifiers() {
     const NAMES: &str = r#"
 program Names {
     @external
-    public function solve(): quantity {
-        create ctx : quantity;   assign ctx = 1;
-        create map : quantity;   assign map = 2;
-        create role : quantity;  assign role = 3;
-        create request : quantity; assign request = 4;
+    public function solve(): number {
+        create ctx : number;   assign ctx = 1;
+        create map : number;   assign map = 2;
+        create role : number;  assign role = 3;
+        create request : number; assign request = 4;
         return ctx;
     }
 }

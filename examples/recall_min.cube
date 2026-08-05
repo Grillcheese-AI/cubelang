@@ -13,8 +13,8 @@ interface ISolver {
 }
 
 program RecallMin implements ISolver {
-    type Input = quantity;
-    type Output = quantity;
+    type Input = number;
+    type Output = number;
 
     storage {
         corrections_applied: mutable u64 = 0;
@@ -33,13 +33,13 @@ program RecallMin implements ISolver {
     @external
     public function solve(input: Input): Output {
         # initial (wrong) belief about a quantity
-        create belief : quantity;
+        create belief : number;
         assign belief = 40;
         store belief, "estimate";
         remember belief;
 
         # a correction arrives; overwrite the same memory key
-        create correction : quantity;
+        create correction : number;
         assign correction = 65;
         store correction, "estimate";
         add corrections_applied, 1;
@@ -48,7 +48,7 @@ program RecallMin implements ISolver {
         recall estimate;
 
         # surface the recalled value as the result
-        create recalled : quantity;
+        create recalled : number;
         assign recalled = 0;
         add recalled, estimate;
 

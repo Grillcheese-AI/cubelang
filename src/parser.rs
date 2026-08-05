@@ -1953,7 +1953,7 @@ mod tests {
 
                 @external
                 public function solve(input: Input): Output {
-                    create x : quantity;
+                    create x : number;
                     assign x = 16;
                     sub x, 3;
                     sum x;
@@ -1979,7 +1979,7 @@ mod tests {
             program Test implements ISolver {
                 @external
                 public function run(): void {
-                    create x : quantity;
+                    create x : number;
                     assign x = 42;
                     add x, 10;
                     sub x, 5;

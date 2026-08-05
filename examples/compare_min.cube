@@ -12,8 +12,8 @@ interface ISolver {
 }
 
 program CompareMin implements ISolver {
-    type Input = quantity;
-    type Output = quantity;
+    type Input = number;
+    type Output = number;
 
     storage {
         comparisons_made: mutable u64 = 0;
@@ -33,16 +33,16 @@ program CompareMin implements ISolver {
 
     @external
     public function solve(input: Input): Output {
-        create left : quantity;
+        create left : number;
         assign left = 34;
         store left, "candidate_left";
 
-        create right : quantity;
+        create right : number;
         assign right = 58;
         store right, "candidate_right";
 
         # result holds the selected (larger) value
-        create result : quantity;
+        create result : number;
         assign result = 0;
 
         if (left > right) {

@@ -14,8 +14,8 @@ interface ISolver {
 }
 
 program LoopMin implements ISolver {
-    type Input = quantity;
-    type Output = quantity;
+    type Input = number;
+    type Output = number;
 
     storage {
         iterations_run: mutable u64 = 0;
@@ -36,14 +36,14 @@ program LoopMin implements ISolver {
     @external
     public function solve(input: Input): Output {
         # accumulate `step` per iteration over `count` iterations
-        create total : quantity;
+        create total : number;
         assign total = 0;
 
-        create count : quantity;
+        create count : number;
         assign count = 6;
         store count, "loop_count";
 
-        create step : quantity;
+        create step : number;
         assign step = 7;
 
         # ITERATE: while count > 0, add step to total and decrement count

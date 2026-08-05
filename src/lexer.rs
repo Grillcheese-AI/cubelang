@@ -688,12 +688,12 @@ mod tests {
 
     #[test]
     fn test_lex_opcode_statement() {
-        let src = "create x : quantity;\nassign x = 16;\nadd x, 3;";
+        let src = "create x : number;\nassign x = 16;\nadd x, 3;";
         let tokens = Lexer::new(src).tokenize();
         assert_eq!(tokens[0].kind, TokenKind::OpCreate);
         assert_eq!(tokens[1].kind, TokenKind::Ident("x".into()));
         assert_eq!(tokens[2].kind, TokenKind::Colon);
-        assert_eq!(tokens[3].kind, TokenKind::Ident("quantity".into()));
+        assert_eq!(tokens[3].kind, TokenKind::Ident("number".into()));
         assert_eq!(tokens[4].kind, TokenKind::Semicolon);
     }
 
@@ -778,7 +778,7 @@ mod tests {
                 @external
                 public function solve(input: Input): Output {
                     atomic {
-                        create x : quantity;
+                        create x : number;
                         assign x = 16;
                         sub x, 3;
                         sum x;

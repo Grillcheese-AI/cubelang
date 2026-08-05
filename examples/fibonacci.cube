@@ -3,24 +3,24 @@
 # fib(10) = 55.  Sequence: 0 1 1 2 3 5 8 13 21 34 55
 
 program Fibonacci implements ISolver {
-    type Input = quantity;
-    type Output = quantity;
+    type Input = number;
+    type Output = number;
 
     @external
     public function solve(input: Input): Output {
         # a = fib(0), b = fib(1)
-        create a : quantity;
+        create a : number;
         assign a = 0;
-        create b : quantity;
+        create b : number;
         assign b = 1;
 
         # n = number of iterations (compute fib(n))
-        create n : quantity;
+        create n : number;
         assign n = 10;
 
         # while (n > 0): (a, b) <- (b, a + b); n <- n - 1
         while (n > 0) {
-            create tmp : quantity;
+            create tmp : number;
             assign tmp = 0;
             add tmp, a;
             add tmp, b;

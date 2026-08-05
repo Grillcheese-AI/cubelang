@@ -12,7 +12,7 @@ interface ISolver {
 
 program ConversationMin implements ISolver {
     type Input = str;
-    type Output = quantity;
+    type Output = number;
 
     storage {
         last_intent: mutable str = "";
@@ -34,7 +34,7 @@ program ConversationMin implements ISolver {
 
     @external
     public function solve(input: Input): Output {
-        create score : quantity;
+        create score : number;
         assign score = 0;
 
         create mode : symbol;

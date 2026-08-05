@@ -20,11 +20,11 @@ program AskMin {
     }
 
     @external
-    public function solve(): quantity {
-        create luna : quantity;
+    public function solve(): number {
+        create luna : number;
         assign luna = 1959;
 
-        create apollo : quantity;
+        create apollo : number;
         assign apollo = 1969;
 
         # Two grounded candidates, no way to choose. Hand it outward.
@@ -33,7 +33,7 @@ program AskMin {
         ask "which moon landing did you mean", luna, apollo;
 
         # Execution RESUMES here.
-        create chosen : quantity;
+        create chosen : number;
         pop chosen;
         sum chosen;
         return chosen;

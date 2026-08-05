@@ -14,8 +14,8 @@ interface ISolver {
 }
 
 program DecisionMin implements ISolver {
-    type Input = quantity;
-    type Output = quantity;
+    type Input = number;
+    type Output = number;
 
     storage {
         threshold: mutable u64 = 0;
@@ -38,17 +38,17 @@ program DecisionMin implements ISolver {
     @external
     public function solve(input: Input): Output {
         # observation under evaluation
-        create observation : quantity;
+        create observation : number;
         assign observation = 72;
         store observation, "current_observation";
 
         # the decision threshold (recall the gating value)
-        create gate_value : quantity;
+        create gate_value : number;
         assign gate_value = 50;
         store gate_value, "gate_threshold";
 
         # confidence score accumulator
-        create confidence : quantity;
+        create confidence : number;
         assign confidence = 0;
 
         # DECISION: if observation exceeds the gate_value, approve; else reject.

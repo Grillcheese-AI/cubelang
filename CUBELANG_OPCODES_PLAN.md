@@ -104,7 +104,7 @@ Compiler changes (compiler.rs):
   (object becomes arg0). Document this; full method dispatch is later.
 
 Acceptance tests:
-- `function dbl(): quantity { create r; add r, arg0; add r, arg0; sum r; return r; }`
+- `function dbl(): number { create r; add r, arg0; add r, arg0; sum r; return r; }`
   + `solve` does `let y = dbl(21); sum y;` -> 42.
 - recursion: factorial(5) -> 120 (exercises RETURN + CALL + depth).
 - caller-locals-intact: a local set before a call has its value after the call,

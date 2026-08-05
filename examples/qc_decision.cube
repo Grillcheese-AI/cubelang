@@ -32,8 +32,8 @@ interface ISolver {
 }
 
 program QCDecision implements ISolver {
-    type Input = quantity;
-    type Output = quantity;
+    type Input = number;
+    type Output = number;
 
     storage {
         min_confidence: mutable u64 = 0;
@@ -61,7 +61,7 @@ program QCDecision implements ISolver {
     @external
     public function solve(input: Input): Output {
         # in_class / in_conf are injected as registers by the host shim.
-        create decision : quantity;
+        create decision : number;
         assign decision = 0;            # default PASS
 
         if (in_conf < min_confidence) {

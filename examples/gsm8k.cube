@@ -97,7 +97,7 @@ program GSM8K implements ISolver {
         atomic {
             for (let step of input.steps) {
                 let reg = step.label;
-                create reg : quantity;
+                create reg : number;
 
                 if (prev_result != null && approx_eq(step.lhs, prev_result)) {
                     pop reg;
