@@ -1,4 +1,5 @@
 /target
+/build
 Cargo.lock
 *.swp
 *.swo
@@ -10,3 +11,7 @@ examples/cd CUsersgrillDocumentsGitHubcubemi.txt
 examples/HAURA_MINDadversarial.txt
 _grepfor.ps1
 _svc.cube
+_t_*.cube
+_t_*.cubebin
+_verify*.ps1
+_testout.txt
