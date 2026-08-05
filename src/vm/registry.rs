@@ -30,11 +30,20 @@
 //! every registry function name into the hash-reversal table; `op::CALL`
 //! consults the registry on every call.
 //!
-//! This module seeds only a `demo` module, Task 3's own test fixture (an
-//! overridable `greet` and a sealed, non-overridable `sealed`). Tasks 4
-//! (standard interfaces) and 6 (the `vsa` helper) are expected to add real
-//! modules here, alongside `demo` — nothing about the registry shape is
-//! demo-specific.
+//! This module seeds a `demo` module (Task 3's own test fixture: an
+//! overridable `greet` and a sealed, non-overridable `sealed`) and, as of
+//! Task 6, a real `vsa` module — `recover(reg, role)`, which performs
+//! genuine UNBIND+cleanup (`VM::vsa_unbind_cleanup_known`) and returns the
+//! recovered `Value::Str` symbol, so a generated CubeLang program never
+//! needs an `asm` block itself to do real VSA recovery. (Task 4's standard
+//! interfaces, `ISolve`/`ISolver`, went into a separate sibling registry —
+//! `vm::interfaces::InterfaceRegistry` — not here; nothing about THIS
+//! registry's shape is demo-specific, or vsa-specific for that matter.)
+//! There is deliberately no registry-native `bind`/`plant` counterpart:
+//! `bind` is itself a reserved opcode keyword (`TokenKind::OpBind`) so a
+//! same-named registry function would be unreachable as a call expression,
+//! and the existing `bind`/`bind_role` statements already cover planting
+//! with no functional gap for `recover` to fill — see the Task 6 report.
 
 use std::collections::HashMap;
 
@@ -86,6 +95,7 @@ impl ModuleRegistry {
     pub fn new() -> Self {
         let mut modules = HashMap::new();
         modules.insert("demo".to_string(), demo_module());
+        modules.insert("vsa".to_string(), vsa_module());
         Self { version: REGISTRY_VERSION, modules }
     }
 
@@ -158,6 +168,43 @@ fn demo_module() -> Module {
     Module { functions }
 }
 
+/// Task 6: the `vsa` registry module — hides the VM's real VSA bind/unbind
+/// (BIND_ROLE/UNBIND's own primitives, already real: `VM::vsa_bind_into` /
+/// `VM::vsa_unbind_cleanup`) behind one ordinary-looking function call,
+/// `recover(reg, role)`, so a generated CubeLang program can do genuine
+/// role-filler recovery without ever writing an `asm` block itself — `asm`
+/// is for BUILDING helpers like this one; `recover` is what a generated
+/// program actually calls (this is what the separate reasoning-bridge slice
+/// writes against, per the design doc). `recover` is overridable, like
+/// `demo::greet` — there is no reason to seal a general-purpose helper the
+/// way `demo::sealed` intentionally is for Task 3's own test.
+fn vsa_module() -> Module {
+    let mut functions = HashMap::new();
+    functions.insert("recover".to_string(), ModuleFn {
+        overridable: true,
+        call: vsa_recover,
+    });
+    Module { functions }
+}
+
+/// `recover(reg, role)` — UNBIND + cosine cleanup against every symbol the
+/// VM currently knows (`VM::vsa_unbind_cleanup_known`), returned as
+/// `Value::Str`. Both arguments arrive by their NAME identity (a register
+/// key / a role symbol string) via `VM::resolve_registry_arg`, not by
+/// resolving to a register's current value — see that method's doc for why.
+/// `Value::Null` when `reg` never held a bound hypervector (nothing was
+/// ever planted there) or either argument didn't resolve to a string at all
+/// (a malformed call — e.g. an immediate where a name was expected).
+fn vsa_recover(vm: &mut VM, args: &[Value]) -> Value {
+    let (Some(Value::Str(reg)), Some(Value::Str(role))) = (args.get(0), args.get(1)) else {
+        return Value::Null;
+    };
+    match vm.vsa_unbind_cleanup_known(reg, role) {
+        Some((symbol, _similarity)) => Value::Str(symbol),
+        None => Value::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +264,52 @@ mod tests {
         let names: Vec<&str> = reg.all_function_names().collect();
         assert!(names.contains(&"greet"));
         assert!(names.contains(&"sealed"));
+        assert!(names.contains(&"recover"));
     }
+
+    // ── Task 6: `vsa` module ────────────────────────────────────────────
+
+    #[test]
+    fn vsa_module_is_seeded_and_recover_is_overridable() {
+        let reg = ModuleRegistry::new();
+        let recover = reg.get("vsa", "recover").expect("vsa.recover must exist");
+        assert!(recover.overridable, "recover should be a general-purpose, overridable helper");
+    }
+
+    #[test]
+    fn recover_is_deny_by_default_like_every_other_module() {
+        let reg = ModuleRegistry::new();
+        assert!(reg.resolve(&[], "recover").is_none());
+        assert!(reg.resolve(&["demo".to_string()], "recover").is_none());
+        assert!(reg.resolve(&["vsa".to_string()], "recover").is_some());
+    }
+
+    #[test]
+    fn recover_on_an_unbound_register_key_returns_null() {
+        // Unit-level check of `vsa_recover` in isolation (no compiler/CALL
+        // involved): a register key that was never bound to a hypervector
+        // recovers no symbol.
+        let reg = ModuleRegistry::new();
+        let recover = reg.get("vsa", "recover").expect("vsa.recover must exist");
+        let mut vm = VM::new();
+        let args = [Value::Str("r_never_bound".to_string()), Value::Str("SUBJECT".to_string())];
+        assert!(matches!((recover.call)(&mut vm, &args), Value::Null));
+    }
+
+    #[test]
+    fn recover_malformed_args_return_null_rather_than_panicking() {
+        let reg = ModuleRegistry::new();
+        let recover = reg.get("vsa", "recover").expect("vsa.recover must exist");
+        let mut vm = VM::new();
+        assert!(matches!((recover.call)(&mut vm, &[]), Value::Null), "zero args");
+        assert!(matches!((recover.call)(&mut vm, &[Value::Int(1), Value::Int(2)]), Value::Null),
+            "non-Str args");
+    }
+
+    // A full plant-then-recover round trip through REAL compiled source
+    // (`use vsa; ... bind frame, SUBJECT, "cat"; ... recover(frame,
+    // SUBJECT)`) is covered end-to-end by `tests/asm_vsa.rs` -- that path
+    // exercises the compiler's symbol recording too (`record_symbol` for
+    // the role, `emit_global` for the filler), which a registry-level unit
+    // test here would otherwise have to fake by hand.
 }

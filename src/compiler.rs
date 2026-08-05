@@ -141,6 +141,79 @@ fn ext_bytecode(o: ExtOp) -> u8 {
     }
 }
 
+/// Task 6: map an `asm { ... }` mnemonic (a raw source-text identifier,
+/// e.g. `"BIND_ROLE"`) to its `op` byte. Exhaustive over the FULL `op`
+/// table -- not narrowed to BIND_ROLE/UNBIND -- because `asm` is a general
+/// escape hatch (the brief: "compile each by mapping mnemonic->op byte via
+/// THE op table"), and every entry here just names an EXISTING `op::`
+/// constant rather than inventing a new byte value, so this carries no
+/// `opcode_sync` risk of its own (see `tests/opcode_sync.rs`): a mismatch
+/// there would mean `op`'s own constants disagree with the sibling repo,
+/// which is a pre-existing concern this table doesn't add to.
+fn asm_mnemonic_to_op(mnemonic: &str) -> Option<u8> {
+    Some(match mnemonic {
+        "CREATE" => op::CREATE,
+        "DESTROY" => op::DESTROY,
+        "ASSIGN" => op::ASSIGN,
+        "ADD" => op::ADD,
+        "SUB" => op::SUB,
+        "MUL" => op::MUL,
+        "DIV" => op::DIV,
+        "TRANSFER" => op::TRANSFER,
+        "COPY" => op::COPY,
+        "PUSH" => op::PUSH,
+        "POP" => op::POP,
+        "COMPARE" => op::COMPARE,
+        "QUERY" => op::QUERY,
+        "STORE" => op::STORE,
+        "RECALL" => op::RECALL,
+        "BIND_ROLE" => op::BIND_ROLE,
+        "UNBIND" => op::UNBIND,
+        "COND" => op::COND,
+        "LOOP" => op::LOOP,
+        "CALL" => op::CALL,
+        "JMP" => op::JMP,
+        "LABEL" => op::LABEL,
+        "REMEMBER" => op::REMEMBER,
+        "SUM" => op::SUM,
+        "UNIFY" => op::UNIFY,
+        "INST" => op::INST,
+        "GEN" => op::GEN,
+        "NEWVAR" => op::NEWVAR,
+        "RETURN" => op::RETURN,
+        "MAKE_ARRAY" => op::MAKE_ARRAY,
+        "LEN" => op::LEN,
+        "INDEX" => op::INDEX,
+        "SKIP" => op::SKIP,
+        "SEQ" => op::SEQ,
+        "DIFF" => op::DIFF,
+        "DETECT_PATTERN" => op::DETECT_PATTERN,
+        "PREDICT" => op::PREDICT,
+        "MATCH" => op::MATCH,
+        "DEBATE" => op::DEBATE,
+        "DISCOVER" => op::DISCOVER,
+        "DECODE" => op::DECODE,
+        "SCORE" => op::SCORE,
+        "SPECIALIZE" => op::SPECIALIZE,
+        "REWARD" => op::REWARD,
+        "INFER" => op::INFER,
+        "MERGE" => op::MERGE,
+        "SPLIT" => op::SPLIT,
+        "FILTER" => op::FILTER,
+        "MAP_ROLES" => op::MAP_ROLES,
+        "REDUCE" => op::REDUCE,
+        "TEMPORAL_BIND" => op::TEMPORAL_BIND,
+        "ANALOGY" => op::ANALOGY,
+        "BROADCAST" => op::BROADCAST,
+        "EXPLORE" => op::EXPLORE,
+        "FORGE" => op::FORGE,
+        "ASK" => op::ASK,
+        "SYNC" => op::SYNC,
+        "FORGET" => op::FORGET,
+        _ => return None,
+    })
+}
+
 // ── Compiled output ─────────────────────────────────────────────────────────
 
 /// Magic bytes for .cubebin files.
@@ -519,6 +592,16 @@ pub struct Compiler {
     /// it obvious at a glance which check produced which error. Checked
     /// unconditionally, like `capability_errors`, not just under `--strict`.
     interface_errors: Vec<ParseError>,
+    /// Task 6: an `asm { ... }` instruction naming a mnemonic absent from
+    /// `asm_mnemonic_to_op`'s table. Kept separate from `capability_errors`/
+    /// `interface_errors` for the same reason those two are kept apart from
+    /// each other -- a distinct check, obvious at a glance which one fired
+    /// -- but folded into the exact same `compile`/`compile_strict` error
+    /// surface, checked unconditionally like its siblings, not just under
+    /// `--strict`. A raw mnemonic typo is source-level user error (unlike a
+    /// truly unknown *byte* reaching the VM, which is a bytecode invariant
+    /// violation the engine itself rejects) -- it belongs at compile time.
+    asm_errors: Vec<ParseError>,
 }
 
 impl Compiler {
@@ -537,6 +620,7 @@ impl Compiler {
             capability_errors: Vec::new(),
             inline_interfaces: HashMap::new(),
             interface_errors: Vec::new(),
+            asm_errors: Vec::new(),
         }
     }
 
@@ -881,8 +965,15 @@ impl Compiler {
             Stmt::Opcode(_) => {}
 
             // ── Real constructs: always compile to real bytecode ────────
+            // Task 6: `asm` always emits >=1 real opcode for every
+            // instruction it contains -- an unrecognized mnemonic is a
+            // compile ERROR (`asm_errors`, checked unconditionally, same as
+            // `capability_errors`/`interface_errors`) rather than a silent
+            // no-op, so by the time this runs on a program that compiled at
+            // all, every instruction here is real bytecode. No separate
+            // strict-mode check is needed on top of that.
             Stmt::Let(_) | Stmt::If(_) | Stmt::For(_) | Stmt::While(_)
-            | Stmt::Return(_) | Stmt::Atomic(_) | Stmt::Emit(_) => {}
+            | Stmt::Return(_) | Stmt::Atomic(_) | Stmt::Emit(_) | Stmt::Asm(_) => {}
             // try/catch bodies are real (LABEL/JMP scaffolding); nested
             // statements are independently re-checked via recursion.
             // NOTE: `finally_body` is a separate, pre-existing gap --
@@ -1074,9 +1165,59 @@ impl Compiler {
             Stmt::Expr(e) => {
                 self.compile_expr_discard(e);
             }
+            Stmt::Asm(block) => self.compile_asm_block(block),
             _ => {
                 // Other statements: emit SKIP as placeholder
                 self.emit_byte(op::SKIP);
+            }
+        }
+    }
+
+    /// Task 6: compile an `asm { ... }` block. Each instruction maps its
+    /// mnemonic to an op byte (`asm_mnemonic_to_op`) and each operand to a
+    /// tagged byte pair via the SAME emitters every other surface construct
+    /// uses (`emit_named`/`emit_role`/`emit_global`/`emit_imm`/
+    /// `emit_float_imm`) -- producing exactly the layout the hand-assembled
+    /// `engine.rs` UNBIND test builds by hand, but from real source text.
+    /// An unrecognized mnemonic pushes onto `asm_errors` (checked
+    /// unconditionally by `compile_ast`/`compile_ast_strict`) and is
+    /// skipped rather than emitted as malformed bytecode.
+    fn compile_asm_block(&mut self, block: &AsmBlock) {
+        for instr in &block.instrs {
+            let Some(opcode) = asm_mnemonic_to_op(&instr.mnemonic) else {
+                self.asm_errors.push(ParseError {
+                    message: format!(
+                        "asm: unknown mnemonic `{}` -- not a name in the op table \
+                         (check spelling and case; mnemonics are the exact `op::` \
+                         constant names, e.g. BIND_ROLE, UNBIND, CREATE)",
+                        instr.mnemonic,
+                    ),
+                    span: instr.span,
+                });
+                continue;
+            };
+            self.emit_debug(opcode, &format!(
+                "asm {} ({} operand(s))", instr.mnemonic, instr.operands.len()));
+            self.emit_byte(opcode);
+            self.emit_byte(instr.operands.len() as u8);
+            for operand in &instr.operands {
+                match operand {
+                    AsmOperand::Named(name) => self.emit_named(name),
+                    // Roles need an explicit `record_symbol` the same way
+                    // `OpcodeStmt::Bind`'s own compile arm gives its role
+                    // argument -- `emit_role` (unlike `emit_global`) doesn't
+                    // record on its own, so without this the VM's name
+                    // table would have no entry and BIND_ROLE/UNBIND would
+                    // fall back to an opaque `role_xxyy` token instead of
+                    // the real role string.
+                    AsmOperand::Role(name) => {
+                        self.record_symbol(name);
+                        self.emit_role(name);
+                    }
+                    AsmOperand::Global(s) => self.emit_global(s),
+                    AsmOperand::Imm(n) => self.emit_imm(*n),
+                    AsmOperand::FloatImm(f) => self.emit_float_imm(*f),
+                }
             }
         }
     }
@@ -1753,6 +1894,11 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 /// `capability_errors` -- an arbitrary but harmless ordering choice, since a
 /// single program triggering both in this task's tests is not a case either
 /// accumulator needs to interleave with the other.
+///
+/// Task 6: an `asm { ... }` instruction naming a mnemonic the op table
+/// doesn't recognize is a compile error here too (`asm_mnemonic_to_op`,
+/// always checked -- see `Compiler::asm_errors`'s doc), folded in after
+/// `interface_errors`.
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
     compile_ast(&ast)
@@ -1774,6 +1920,12 @@ pub fn compile_ast(source: &SourceFile) -> Result<Vec<CompiledProgram>, crate::p
         return Err(e);
     }
     if let Some(e) = compiler.interface_errors.into_iter().next() {
+        return Err(e);
+    }
+    // Task 6: an unknown `asm` mnemonic, folded in after capability/
+    // interface errors -- same "always checked, not just under --strict"
+    // treatment as those two.
+    if let Some(e) = compiler.asm_errors.into_iter().next() {
         return Err(e);
     }
     Ok(programs)
@@ -1806,6 +1958,9 @@ pub fn compile_ast_strict(source: &SourceFile) -> Result<Vec<CompiledProgram>, S
     let programs = compiler.compile(source);
     let mut errors: Vec<String> = compiler.capability_errors.iter().map(|e| e.to_string()).collect();
     errors.extend(compiler.interface_errors.iter().map(|e| e.to_string()));
+    // Task 6: same treatment as capability/interface errors -- folded in
+    // before the strict-mode findings, always checked.
+    errors.extend(compiler.asm_errors.iter().map(|e| e.to_string()));
     errors.extend(compiler.strict_errors);
     if !errors.is_empty() {
         return Err(errors.join("\n"));

@@ -140,6 +140,7 @@ impl Parser {
             TokenKind::Safety       => "safety".into(),
             TokenKind::Modalities   => "modalities".into(),
             TokenKind::BytecodeKw   => "bytecode".into(),
+            TokenKind::AsmKw        => "asm".into(),
             // Opcodes used as method names (e.g. steps.push(), self.store())
             TokenKind::OpCreate     => "create".into(),
             TokenKind::OpAssign     => "assign".into(),
@@ -972,6 +973,7 @@ impl Parser {
             TokenKind::Throw => { self.advance(); let e = self.parse_expr()?; self.eat(&TokenKind::Semicolon); Ok(Stmt::Throw(e)) }
             TokenKind::Emit => self.parse_emit_stmt(),
             TokenKind::Atomic => self.parse_atomic_stmt(),
+            TokenKind::AsmKw => self.parse_asm_stmt(),
             TokenKind::Rollback => { self.advance(); self.eat(&TokenKind::Semicolon); Ok(Stmt::Rollback) }
             TokenKind::Commit => { self.advance(); self.eat(&TokenKind::Semicolon); Ok(Stmt::Commit) }
             TokenKind::Assert => self.parse_assert_stmt(),
@@ -1155,6 +1157,70 @@ impl Parser {
         let body = self.parse_stmt_block()?;
         self.expect(&TokenKind::RBrace)?;
         Ok(Stmt::Atomic(AtomicStmt { body, span }))
+    }
+
+    // ── Task 6: `asm { MNEMONIC operand, ...; ... }` ─────────────────────
+
+    /// `asm { ... }` — a flat sequence of `MNEMONIC operand, operand, ...`
+    /// lines, each terminated by an optional `;` (the brief's own example
+    /// omits the trailing one before the closing `}`, matching every other
+    /// block-statement's tolerance for a missing final semicolon).
+    fn parse_asm_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.span();
+        self.expect(&TokenKind::AsmKw)?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut instrs = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) { break; }
+            instrs.push(self.parse_asm_instr()?);
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Stmt::Asm(AsmBlock { instrs, span }))
+    }
+
+    /// One `MNEMONIC operand, operand, ...` line. The mnemonic is not
+    /// validated here — an unrecognized one is a COMPILE error from
+    /// `compiler.rs`'s mnemonic table (which can name the exact bad
+    /// spelling with a span), not a parse error, so `asm` stays a single,
+    /// uniform grammar regardless of how many mnemonics the op table knows.
+    fn parse_asm_instr(&mut self) -> PResult<AsmInstr> {
+        let span = self.span();
+        let mnemonic = self.expect_ident()?;
+        let mut operands = Vec::new();
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::RBrace) {
+            loop {
+                operands.push(self.parse_asm_operand()?);
+                if self.eat(&TokenKind::Comma) { continue; }
+                break;
+            }
+        }
+        self.eat(&TokenKind::Semicolon);
+        Ok(AsmInstr { mnemonic, operands, span })
+    }
+
+    /// Classify one `asm` operand by its own lexical form (see
+    /// `ast::AsmOperand`'s doc for the exact rule) — independent of the
+    /// mnemonic it belongs to.
+    fn parse_asm_operand(&mut self) -> PResult<AsmOperand> {
+        match self.peek().clone() {
+            TokenKind::StringLit(s) => { self.advance(); Ok(AsmOperand::Global(s)) }
+            TokenKind::IntLit(n) => { self.advance(); Ok(AsmOperand::Imm(n)) }
+            TokenKind::FloatLit(f) => { self.advance(); Ok(AsmOperand::FloatImm(f)) }
+            _ => {
+                // Falls through to `expect_ident`, which also tolerates the
+                // same contextual keywords `parse_reg_ref` does (e.g. a
+                // register literally named `event`) -- an operand that is
+                // genuinely unparseable as any of the above surfaces as a
+                // normal parse error from there.
+                let name = self.expect_ident()?;
+                if is_role_bareword(&name) {
+                    Ok(AsmOperand::Role(name))
+                } else {
+                    Ok(AsmOperand::Named(name))
+                }
+            }
+        }
     }
 
     fn parse_assert_stmt(&mut self) -> PResult<Stmt> {
@@ -1906,6 +1972,27 @@ fn type_expr_to_string(ty: &TypeExpr) -> String {
             format!("({})->{}", parts.join(","), type_expr_to_string(ret))
         }
     }
+}
+
+/// True for an ALL-CAPS-with-underscores bareword (`SUBJECT`, `VERB_PHRASE`)
+/// — this codebase's unbroken convention for a VSA role symbol (every
+/// `bind`/`bind_role` example), distinct from a register name (always
+/// lower/mixed-case, e.g. `frame`) or a PascalCase type/program name (e.g.
+/// `DecisionMin`). Requires at least one alphabetic character so a token
+/// with none (digits/underscores only) falls back to `Named` rather than
+/// matching vacuously. Used by `Parser::parse_asm_operand` to classify a
+/// bareword `asm` operand as `Role` vs `Named`.
+fn is_role_bareword(name: &str) -> bool {
+    let mut has_alpha = false;
+    for c in name.chars() {
+        if c.is_ascii_alphabetic() {
+            has_alpha = true;
+            if !c.is_ascii_uppercase() {
+                return false;
+            }
+        }
+    }
+    has_alpha
 }
 
 // ── Public parse function ───────────────────────────────────────────────────

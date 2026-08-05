@@ -291,6 +291,7 @@ impl<'a> Lexer<'a> {
             // Bytecode / low-level
             "bytecode"     => TokenKind::BytecodeKw,
             "import"       => TokenKind::Import,
+            "asm"          => TokenKind::AsmKw,
 
             // Capability / module system (Task 3)
             "use"          => TokenKind::Use,
@@ -734,6 +735,25 @@ mod tests {
         let tokens = Lexer::new("bytecode import").tokenize();
         assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
         assert_eq!(tokens[1].kind, TokenKind::Import);
+    }
+
+    #[test]
+    fn test_lex_asm_block() {
+        // Task 6: `asm` is its own keyword, distinct from `bytecode` — the
+        // mnemonics inside (BIND_ROLE, UNBIND, ...) are plain uppercase
+        // identifiers (no keyword collision; every existing opcode keyword
+        // is lowercase), and a comma-separated operand list mixes bareword
+        // idents with a quoted string literal.
+        let src = r#"asm { BIND_ROLE frame, SUBJECT, "cat"; UNBIND frame, SUBJECT }"#;
+        let tokens = Lexer::new(src).tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::AsmKw);
+        assert_eq!(tokens[1].kind, TokenKind::LBrace);
+        assert_eq!(tokens[2].kind, TokenKind::Ident("BIND_ROLE".into()));
+        assert_eq!(tokens[3].kind, TokenKind::Ident("frame".into()));
+        assert_eq!(tokens[4].kind, TokenKind::Comma);
+        assert_eq!(tokens[5].kind, TokenKind::Ident("SUBJECT".into()));
+        assert_eq!(tokens[6].kind, TokenKind::Comma);
+        assert_eq!(tokens[7].kind, TokenKind::StringLit("cat".into()));
     }
 
     #[test]

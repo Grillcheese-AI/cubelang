@@ -385,6 +385,7 @@ pub enum Stmt {
 
     // Bytecode / low-level
     BytecodeBlock(BytecodeBlock),
+    Asm(AsmBlock),
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +508,53 @@ pub enum BytecodeKind {
     Inline(Vec<u8>),
     /// Raw CubeLang asm: bytecode { create x : number; assign x = 16; }
     Asm(Vec<OpcodeStmt>),
+}
+
+/// `asm { MNEMONIC operand, operand, ...; ... }` — Task 6's raw
+/// bytecode-mnemonic escape hatch. One level lower than `BytecodeKind::Asm`
+/// above: that (still-unwired) scaffold reuses CubeLang's own SURFACE
+/// statement forms (`create`/`assign`/`bind`/...); this names a canonical
+/// VM mnemonic (`compiler::op`'s constant names, e.g. `BIND_ROLE`/`UNBIND`)
+/// directly, for opcodes — like `UNBIND` — that have no surface statement
+/// at all. Built to let the `vsa` registry module (`vm::registry`) reach
+/// real BIND_ROLE/UNBIND+cleanup; `asm` itself is a helper-building tool,
+/// not something a generated program calling `recover(...)` ever needs.
+#[derive(Debug, Clone)]
+pub struct AsmBlock {
+    pub instrs: Vec<AsmInstr>,
+    pub span: Span,
+}
+
+/// One `MNEMONIC operand, operand, ...` line inside an `asm { ... }` block.
+#[derive(Debug, Clone)]
+pub struct AsmInstr {
+    pub mnemonic: String,
+    pub operands: Vec<AsmOperand>,
+    pub span: Span,
+}
+
+/// One `asm` operand, tagged by its OWN lexical form — not by which
+/// mnemonic it is an argument to; a generic escape hatch has no per-op
+/// operand schema to consult, unlike `OpcodeStmt`'s fixed per-statement
+/// shapes. Per the task brief's operand-tag rule:
+///   - a quoted string literal (`"cat"`) → `Global`, a literal/symbol,
+///     compiled via `emit_global` (which records it for name-table reversal)
+///   - an ALL-CAPS bareword with no lowercase letters (`SUBJECT`, `VERB`) →
+///     `Role`, matching this codebase's unbroken convention that role
+///     symbols are always spelled this way (every `bind`/`bind_role`
+///     example) — compiled via `emit_role`
+///   - any other identifier (`frame`, mixed/lower case) → `Named`, a
+///     register reference — compiled via `emit_named`
+///   - int/float literals pass through as immediates, for completeness
+///     (asm is a general opcode escape hatch, not narrowly scoped to
+///     BIND_ROLE/UNBIND's own operand shapes)
+#[derive(Debug, Clone)]
+pub enum AsmOperand {
+    Named(String),
+    Role(String),
+    Global(String),
+    Imm(i64),
+    FloatImm(f64),
 }
 
 /// VM opcode statements — compile directly to bytecodes.

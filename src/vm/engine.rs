@@ -830,9 +830,22 @@ impl VM {
                             return err;
                         }
                     } else if let Some((_, native)) = module_hit {
+                        // Task 6: a registry (native) function gets its OWN
+                        // argument resolution, `resolve_registry_arg` --
+                        // deliberately NOT the shared `arg_values` above
+                        // (still used unchanged by the other two branches).
+                        // See that method's doc for why: a native module
+                        // like `vsa` is symbol- and register-KEY aware by
+                        // nature (`recover(frame, SUBJECT)` names a
+                        // register and a role, it does not want their
+                        // resolved VALUES), matching how BIND_ROLE/UNBIND's
+                        // own bytecode arms already read their operands.
+                        let native_args: Vec<Value> = (1..operands.len())
+                            .map(|i| self.resolve_registry_arg(Some(&operands[i])))
+                            .collect();
                         self.trace_op(pc, &format!(
-                            "CALL {} (registry impl, {} arg(s))", fn_name, arg_values.len()));
-                        let result = native(self, &arg_values);
+                            "CALL {} (registry impl, {} arg(s))", fn_name, native_args.len()));
+                        let result = native(self, &native_args);
                         self.stack.push(result);
                     } else if let Some(callee) = own_fn {
                         self.trace_op(pc, &format!("CALL {} ({} arg(s))", fn_name, arg_values.len()));
@@ -1141,6 +1154,38 @@ impl VM {
         }
     }
 
+    /// Task 6: resolve a CALL argument bound for a REGISTRY (native)
+    /// function -- distinct from `resolve_assign_rhs` (still used, unchanged,
+    /// for ASSIGN and for intra-program/`override` CALL args -- see
+    /// `op::CALL`'s dispatch, which computes a SEPARATE argument list only
+    /// for the registry-native branch via this method).
+    ///
+    /// A native module is symbol- and register-KEY aware by nature:
+    /// `recover(frame, SUBJECT)` means "the register named frame, the role
+    /// named SUBJECT", not "frame's current value, SUBJECT's current
+    /// value" -- exactly how `BIND_ROLE`/`UNBIND`'s own bytecode arms
+    /// already read their operands (`resolve_symbol_name`, never a
+    /// register-value lookup, for a role/reg operand). Reusing that same
+    /// resolution here is what lets `vsa::recover` genuinely perform
+    /// UNBIND+cleanup instead of receiving `Value::Null` for a bareword
+    /// like `SUBJECT` that was never meant to be a register in the first
+    /// place -- `resolve_assign_rhs`'s plain register-value lookup has no
+    /// way to produce that string, since nothing ever binds a register
+    /// literally named `SUBJECT`.
+    ///
+    /// Imm/FloatImm literals still pass through as real Int/Float values
+    /// (unlike `resolve_symbol_name` alone, whose fallback would stringify
+    /// them as `imm_5`/`fimm_5`) -- kept general enough for a future
+    /// registry function that wants an actual number, not just names.
+    fn resolve_registry_arg(&self, op: Option<&Operand>) -> Value {
+        match op {
+            Some(Operand::Imm(n)) => Value::Int(*n),
+            Some(Operand::FloatImm(f)) => Value::Float(*f),
+            Some(o) => Value::Str(self.resolve_symbol_name(Some(o))),
+            None => Value::Null,
+        }
+    }
+
     /// Get the value of a register.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.registers.get(name)
@@ -1226,6 +1271,21 @@ impl VM {
             }
         }
         best
+    }
+
+    /// Task 6: `vsa_unbind_cleanup` against every symbol the VM currently
+    /// knows -- the same candidate pool `op::UNBIND`'s own bytecode arm
+    /// builds inline (`self.name_table.values()`). For callers, like the
+    /// `vsa` registry module's `recover`, that have no curated candidate
+    /// list of their own and just want "the real answer, if the VM has
+    /// ever seen it as a name" -- exposed as its own method (rather than
+    /// making `registry.rs` reach into the private `name_table` field
+    /// directly) so the "candidates = every known symbol" policy stays
+    /// defined in one place.
+    pub fn vsa_unbind_cleanup_known(&mut self, reg: &str, role: &str) -> Option<(String, f64)> {
+        let candidates: Vec<String> = self.name_table.values().cloned().collect();
+        let cand_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        self.vsa_unbind_cleanup(reg, role, &cand_refs)
     }
 }
 
