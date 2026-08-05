@@ -1,8 +1,17 @@
 # fibonacci.cube - iterative Fibonacci via while-loop control flow.
 # Exercises: COMPARE / COND / JMP back-edge, register-to-register ADD, accumulator.
 # fib(10) = 55.  Sequence: 0 1 1 2 3 5 8 13 21 34 55
+#
+# `implements ISolver` was dropped here (Task 4, VM interface foundation
+# cycle): this program only ever defined `solve`, never `parse`/`verify`, so
+# the claim was already false -- just never checked, since `implements` was
+# pure decoration before Task 4 added real validation against the VM
+# interface registry. Dropping the inaccurate claim rather than backfilling
+# stub parse/verify methods this file never needed; `implements` isn't
+# required yet (Task 7), so an empty one is the honest state until/unless
+# this example is deliberately migrated to a real ISolver shape.
 
-program Fibonacci implements ISolver {
+program Fibonacci {
     type Input = number;
     type Output = number;
 

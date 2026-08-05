@@ -1424,6 +1424,12 @@ fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
 mod tests {
     use super::*;
 
+    // Task 4: these fixtures dropped a decorative `implements ISolver` that
+    // predates real `implements` validation -- every test here exercises VM
+    // opcode/execution semantics unrelated to interfaces, and none defined
+    // parse/verify, so the claim was already false before this task, just
+    // never checked.
+
     fn compile_and_load(source: &str) -> VM {
         let programs = crate::compiler::compile(source).unwrap();
         let mut vm = VM::new();
@@ -1436,7 +1442,7 @@ mod tests {
     #[test]
     fn test_vm_basic_arithmetic() {
         let mut vm = compile_and_load(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 16;
@@ -1470,7 +1476,7 @@ mod tests {
     #[test]
     fn test_vm_push_pop_chain() {
         let mut vm = compile_and_load(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 16;
@@ -1504,7 +1510,7 @@ mod tests {
     #[test]
     fn test_vm_division_by_zero() {
         let mut vm = compile_and_load(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 42;
@@ -1523,7 +1529,7 @@ mod tests {
     #[test]
     fn test_vm_store_recall() {
         let mut vm = compile_and_load(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 42;
@@ -1541,7 +1547,7 @@ mod tests {
     #[test]
     fn test_vm_multiple_functions() {
         let mut vm = compile_and_load(r#"
-            program Calc implements ISolver {
+            program Calc {
                 public function add_numbers(): void {
                     create x : number;
                     assign x = 10;
@@ -1574,7 +1580,7 @@ mod tests {
     fn test_vm_load_cubebin() {
         // Compile, save to cubebin, load from cubebin, execute
         let programs = crate::compiler::compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 100;
@@ -1606,7 +1612,7 @@ mod tests {
     #[test]
     fn return_early_halts_with_value() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create r : number;
                     create poison : number;
@@ -1628,7 +1634,7 @@ mod tests {
     #[test]
     fn return_early_inside_if_skips_rest() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create r : number;
                     create poison : number;
@@ -1652,7 +1658,7 @@ mod tests {
     #[test]
     fn return_bare_yields_current_accumulator() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create x : number;
                     create poison : number;
@@ -1677,7 +1683,7 @@ mod tests {
     #[test]
     fn for_each_sums_three_elements() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     let xs = [10, 20, 30];
                     create total : number;
@@ -1698,7 +1704,7 @@ mod tests {
     #[test]
     fn for_each_empty_array_runs_zero_iterations() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     let xs = [];
                     create total : number;
@@ -1721,7 +1727,7 @@ mod tests {
         // sum over (xi + yj) for xi in [1,2], yj in [10,20] = 4*1 + 4*2 ... actually
         // = (1+10)+(1+20)+(2+10)+(2+20) = 11+21+12+22 = 66.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     let xs = [1, 2];
                     let ys = [10, 20];
@@ -1749,7 +1755,7 @@ mod tests {
     #[test]
     fn array_literal_len_is_three() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     let xs = [10, 20, 30];
                     let n = xs.len();
@@ -1766,7 +1772,7 @@ mod tests {
     #[test]
     fn array_index_returns_element() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     let xs = [10, 20, 30];
                     let x = xs[1];
@@ -1784,7 +1790,7 @@ mod tests {
     fn array_index_out_of_range_is_null() {
         // Out-of-range indexing produces Null; sum yields 0 (as_i64 of Null).
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     let xs = [10, 20, 30];
                     let x = xs[99];
@@ -1804,7 +1810,7 @@ mod tests {
     #[test]
     fn call_returns_value_via_stack() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function dbl(): number {
                     create r : number;
                     assign r = 0;
@@ -1830,7 +1836,7 @@ mod tests {
         // The callee writes to a register with the same name as a caller local.
         // After return, the caller's value must be intact.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function helper(): number {
                     create r : number;
                     assign r = 99;
@@ -1856,7 +1862,7 @@ mod tests {
     fn call_recursion_factorial() {
         // fact(n) = if n <= 1 then 1 else n * fact(n-1)
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function fact(): number {
                     create n : number;
                     assign n = 0;
@@ -1893,7 +1899,7 @@ mod tests {
         // Unbounded self-recursion should produce a clean Error, not a native
         // stack overflow. fact() without a base case keeps calling.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function loop_forever(): number {
                     let r = loop_forever();
                     return r;
@@ -1917,7 +1923,7 @@ mod tests {
     #[test]
     fn assign_register_to_register_copies_value() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create a : number;
                     create b : number;
@@ -1938,7 +1944,7 @@ mod tests {
     fn assign_register_to_register_then_arithmetic() {
         // Compose with arithmetic so a regression also breaks the chain.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create a : number;
                     create b : number;
@@ -1959,7 +1965,7 @@ mod tests {
     fn assign_literal_int_unchanged() {
         // Guard: the bug fix must NOT regress literal assignment.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create a : number;
                     assign a = 42;
@@ -1976,7 +1982,7 @@ mod tests {
     #[test]
     fn test_vm_trace() {
         let mut vm = compile_and_load(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 5;
@@ -1999,7 +2005,7 @@ mod tests {
     #[test]
     fn test_vm_if_then_branch() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create x : number;
                     assign x = 5;
@@ -2017,7 +2023,7 @@ mod tests {
     #[test]
     fn test_vm_if_else_branch() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create x : number;
                     assign x = 2;
@@ -2035,7 +2041,7 @@ mod tests {
     #[test]
     fn test_vm_while_loop_terminates_and_accumulates() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create total : number;
                     assign total = 0;
@@ -2055,7 +2061,7 @@ mod tests {
     #[test]
     fn test_vm_compare_sets_cmp_register() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create a : number;
                     assign a = 7;
@@ -2073,7 +2079,7 @@ mod tests {
     fn test_vm_float_arithmetic() {
         // 80000 * 1.5 = 120000 (real fractional multiply, integral result).
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create v : number;
                     assign v = 80000;
@@ -2092,7 +2098,7 @@ mod tests {
     fn test_vm_float_nonintegral_result() {
         // 7 / 2 = 3.5 — non-integral float preserved.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create v : number;
                     assign v = 7;
@@ -2111,7 +2117,7 @@ mod tests {
     fn test_vm_true_division_int_operands() {
         // 60 / 100 = 0.6 (true division on integer operands, not floor → 0).
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create v : number;
                     assign v = 60;
@@ -2130,7 +2136,7 @@ mod tests {
     fn test_vm_exact_int_division_stays_int() {
         // 16 / 2 = 8 stays integer.
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create v : number;
                     assign v = 16;
@@ -2297,7 +2303,7 @@ mod vsa_opcode_wiring_tests {
     #[test]
     fn bind_statement_produces_hypervector_register() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create sentence : frame;
                     bind sentence, SUBJECT, "cat";
@@ -2318,7 +2324,7 @@ mod vsa_opcode_wiring_tests {
     #[test]
     fn bound_frame_recovers_fillers_via_unbind() {
         let mut vm = compile_and_load(r#"
-            program T implements ISolver {
+            program T {
                 public function run(): void {
                     create frame : frame;
                     bind frame, SUBJECT, "cat";

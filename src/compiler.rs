@@ -4,12 +4,18 @@
 //! The output is a `CompiledProgram` containing the bytecode blob, metadata,
 //! and a symbol table for debugging.
 
+use std::collections::HashMap;
+
 use crate::ast::*;
 use crate::parser::ParseError;
 // The registry is a static, deterministic capability table (see its module
 // doc), not live VM execution state -- the compiler needs read-only access
 // to it purely to validate `override` declarations at compile time.
 use crate::vm::registry::ModuleRegistry;
+// Task 4: same "static, deterministic table" reasoning as ModuleRegistry
+// above, but for standard interfaces -- a separate registry (contracts, not
+// callable impls), consulted to validate `implements` declarations.
+use crate::vm::interfaces::InterfaceRegistry;
 
 // ── Opcode constants (match opcode-vsa-rs ir.rs) ────────────────────────────
 
@@ -492,6 +498,27 @@ pub struct Compiler {
     /// a new error type for a couple more compile-time checks; both
     /// free-function entry points (`compile`, `compile_strict`) surface it.
     capability_errors: Vec<ParseError>,
+    /// Task 4: every in-file `interface X { ... }` declaration
+    /// (`TopLevel::Interface`) this `SourceFile` carries, gathered once per
+    /// `compile()` call the same way `used_modules` is -- keyed by name (an
+    /// interface name repeated in one file overwrites the earlier entry; the
+    /// parser doesn't reject a duplicate name and no current program hits
+    /// this). Consulted by `check_implements` as the FALLBACK resolution
+    /// path for an `implements` name the VM `InterfaceRegistry` doesn't
+    /// recognize -- see that method's doc for why the registry is always
+    /// checked first, not the reverse.
+    inline_interfaces: HashMap<String, InterfaceDecl>,
+    /// Task 4: `implements X` misuse -- `X` resolves to neither the VM
+    /// interface registry nor an in-file inline `interface` decl, or it
+    /// resolves to one but the program is missing a required (abstract,
+    /// non-optional) same-name/same-arity member. Kept separate from
+    /// `capability_errors` even though both ultimately fold into the same
+    /// `compile`/`compile_strict` error surface -- interfaces are a
+    /// conceptually distinct, separate registry (contracts, not callable
+    /// impls) per the Task 4 brief, and keeping the accumulators apart keeps
+    /// it obvious at a glance which check produced which error. Checked
+    /// unconditionally, like `capability_errors`, not just under `--strict`.
+    interface_errors: Vec<ParseError>,
 }
 
 impl Compiler {
@@ -508,6 +535,8 @@ impl Compiler {
             symbol_names: Vec::new(),
             used_modules: Vec::new(),
             capability_errors: Vec::new(),
+            inline_interfaces: HashMap::new(),
+            interface_errors: Vec::new(),
         }
     }
 
@@ -542,6 +571,18 @@ impl Compiler {
             })
             .collect();
 
+        // Task 4: gather every in-file `interface` decl BEFORE compiling any
+        // program, mirroring `used_modules` just above -- an inline decl may
+        // sit anywhere in source order relative to the `program` block(s)
+        // that `implements` it (every current example declares it first, but
+        // nothing requires that).
+        self.inline_interfaces = source.items.iter()
+            .filter_map(|item| match item {
+                TopLevel::Interface(decl) => Some((decl.name.clone(), decl.clone())),
+                _ => None,
+            })
+            .collect();
+
         let mut programs = Vec::new();
         for item in &source.items {
             if let TopLevel::Program(p) = item {
@@ -558,6 +599,11 @@ impl Compiler {
         // Reset per-program symbol collection so bindings don't leak across
         // programs compiled in the same pass.
         self.symbol_names.clear();
+
+        // Task 4: validate `implements` against the VM interface registry or
+        // an in-file inline decl before compiling the body -- see
+        // check_implements's doc for the registry-first resolution order.
+        self.check_implements(prog);
 
         for item in &prog.body {
             match item {
@@ -689,6 +735,107 @@ impl Compiler {
             ),
             span: sig.span,
         });
+    }
+
+    // ── Standard interfaces (Task 4): validated `implements` ────────────
+    //
+    // `implements X` used to be pure decoration -- parsed into
+    // `ProgramDecl::implements`, round-tripped through `.cubebin`, never
+    // checked against anything. This makes it real: `X` must resolve to
+    // either a VM-internal interface (`vm::interfaces::InterfaceRegistry`)
+    // or an in-file inline `interface X { ... }` decl, and the program must
+    // provide a same-name/same-arity function for every required member of
+    // whichever one it resolved to.
+    //
+    // Deliberately NOT required yet: an empty (or absent) `implements` list
+    // is untouched by this check (Task 7 makes it required, once every
+    // example conforms) -- see the early return below.
+
+    /// For every name in `prog.implements`: resolve it, then confirm every
+    /// required member is satisfied. Pushes onto `self.interface_errors`
+    /// (checked unconditionally -- see that field's doc), exactly parallel
+    /// to how `check_override_validity`/`check_sealed_collision` push onto
+    /// `capability_errors`.
+    ///
+    /// **Resolution order: the VM interface registry FIRST, an in-file
+    /// inline `interface` decl only as a FALLBACK for a name the registry
+    /// doesn't recognize -- never the reverse, and never "whichever is
+    /// found first wins."** This is the one real design decision in this
+    /// method, so spelling out why: the entire point of Task 4 is that
+    /// `ISolve`/`ISolver` become VM-internal (Rust source, not `.cube`
+    /// source) so they're tamper-proof. If a program's OWN inline
+    /// `interface ISolver { ... }` block were allowed to win when its name
+    /// collides with a registry interface, a program could declare a
+    /// weaker local `ISolver` (say, `solve` only, dropping `parse`/`verify`)
+    /// and validate against that instead -- silently defeating the whole
+    /// mechanism. So a name the registry knows ALWAYS means the registry's
+    /// contract; an in-file decl is only ever consulted for a name the
+    /// registry does NOT recognize (e.g. `conversation_agent.cube`'s own
+    /// `IConversationAgent`), which is exactly the "existing programs that
+    /// declare inline interfaces MUST keep working" case the brief calls
+    /// out. This ordering is unobservable on every program in examples/
+    /// today -- the six inline `ISolver` decls this project's examples
+    /// carry are identical in shape to the registry's `ISolver` (Task 7
+    /// deletes them as redundant once `implements` is required) -- it only
+    /// matters once a program tries to shadow a registry name with a
+    /// weaker local one; `a_local_interface_block_cannot_redefine_a_registry_interface_to_something_weaker`
+    /// (tests/interfaces.rs) pins this down directly.
+    fn check_implements(&mut self, prog: &ProgramDecl) {
+        if prog.implements.is_empty() {
+            return; // Task 7 makes this required; Task 4 does not.
+        }
+
+        let registry = InterfaceRegistry::new();
+        for iface_name in &prog.implements {
+            let required: Vec<(String, usize)> = if let Some(members) = registry.get(iface_name) {
+                members.iter().map(|m| (m.name.clone(), m.arity)).collect()
+            } else if let Some(decl) = self.inline_interfaces.get(iface_name) {
+                // Fallback path: an in-file `interface` decl's own abstract,
+                // non-optional members are the required set. `type Input;`-
+                // style members carry no name/arity and aren't functions at
+                // all, so they're skipped (`filter_map` drops the `None`s).
+                decl.members.iter().filter_map(|m| match m {
+                    InterfaceMember::Function(sig)
+                        if sig.modifiers.contains(&Modifier::Abstract)
+                            && !sig.modifiers.contains(&Modifier::Optional) =>
+                    {
+                        Some((sig.name.clone(), sig.params.len()))
+                    }
+                    _ => None,
+                }).collect()
+            } else {
+                self.interface_errors.push(ParseError {
+                    message: format!(
+                        "program `{}` declares `implements {}`, but `{}` is neither a \
+                         VM interface nor an in-file `interface` declaration",
+                        prog.name, iface_name, iface_name,
+                    ),
+                    span: prog.span,
+                });
+                continue;
+            };
+
+            for (member_name, member_arity) in &required {
+                let provided = prog.body.iter().any(|item| {
+                    let sig = match item {
+                        ProgramItem::Function(f) | ProgramItem::Constructor(f) => &f.sig,
+                        _ => return false,
+                    };
+                    &sig.name == member_name && sig.params.len() == *member_arity
+                });
+                if !provided {
+                    self.interface_errors.push(ParseError {
+                        message: format!(
+                            "program `{}` declares `implements {}`, but does not provide a \
+                             matching `{}` function ({} parameter{}) required by that interface",
+                            prog.name, iface_name, member_name, member_arity,
+                            if *member_arity == 1 { "" } else { "s" },
+                        ),
+                        span: prog.span,
+                    });
+                }
+            }
+        }
     }
 
     // ── Strict-mode safety check (P0-1, deny-by-default whitelist) ──────
@@ -1598,11 +1745,22 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 /// run. Reuses `ParseError`'s shape (message + span) for these rather than
 /// widening this function's return type; see `Compiler::capability_errors`'s
 /// doc for why.
+///
+/// Task 4: an `implements X` naming neither a VM interface nor an in-file
+/// inline `interface` decl, or missing a required member of whichever it
+/// resolves to, is also a compile error here (`check_implements`, always
+/// checked -- see `Compiler::interface_errors`'s doc). Checked AFTER
+/// `capability_errors` -- an arbitrary but harmless ordering choice, since a
+/// single program triggering both in this task's tests is not a case either
+/// accumulator needs to interleave with the other.
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
     let mut compiler = Compiler::new();
     let programs = compiler.compile(&ast);
     if let Some(e) = compiler.capability_errors.into_iter().next() {
+        return Err(e);
+    }
+    if let Some(e) = compiler.interface_errors.into_iter().next() {
         return Err(e);
     }
     Ok(programs)
@@ -1616,11 +1774,15 @@ pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::Pars
 /// Task 3: `use`/`override`/registry capability errors are folded into the
 /// same combined string (before the strict-mode findings), since they are
 /// always checked, not a strict-only concern.
+///
+/// Task 4: `implements` interface errors are folded in the same way, right
+/// after the capability errors and before the strict-mode findings.
 pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
     let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
     let mut compiler = Compiler::new_strict();
     let programs = compiler.compile(&ast);
     let mut errors: Vec<String> = compiler.capability_errors.iter().map(|e| e.to_string()).collect();
+    errors.extend(compiler.interface_errors.iter().map(|e| e.to_string()));
     errors.extend(compiler.strict_errors);
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -1632,10 +1794,20 @@ pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
 mod tests {
     use super::*;
 
+    // Task 4: most fixtures below dropped a decorative `implements ISolver`
+    // that predates real `implements` validation -- these tests exercise
+    // bytecode/format/strict-mode concerns unrelated to interfaces, and none
+    // of them ever defined parse/verify, so the claim was already false
+    // before this task, just never checked. `test_compile_gsm8k` (a real
+    // `include_str!` of examples/gsm8k.cube) and `test_cubebin_roundtrip`
+    // (asserts on `.implements` content directly) are the two exceptions
+    // that keep it, and `test_cubebin_roundtrip`'s fixture now provides the
+    // full parse/solve/verify triad to match.
+
     #[test]
     fn test_compile_empty_program() {
         let programs = compile(r#"
-            program Empty implements ISolver {
+            program Empty {
                 public function run(): void {
                 }
             }
@@ -1650,7 +1822,7 @@ mod tests {
     #[test]
     fn test_compile_opcodes() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 42;
@@ -1679,7 +1851,7 @@ mod tests {
     #[test]
     fn test_compile_bytecode_format() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 16;
@@ -1711,7 +1883,7 @@ mod tests {
     #[test]
     fn test_compile_with_control_flow() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     if (x > 0) {
                         add x, 1;
@@ -1732,7 +1904,7 @@ mod tests {
     #[test]
     fn test_compile_atomic_block() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     atomic {
                         assign x = 12;
@@ -1754,7 +1926,7 @@ mod tests {
     #[test]
     fn test_compile_let_stmt() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     let x: f64 = 3.14;
                 }
@@ -1793,7 +1965,7 @@ mod tests {
     #[test]
     fn test_compile_debug_lines() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 16;
@@ -1834,6 +2006,16 @@ mod tests {
                     remember x;
                     return Output { result: 9 };
                 }
+
+                @external
+                public function parse(raw: str): Input {
+                    return raw;
+                }
+
+                @external
+                public pure function verify(input: Input, output: Output): bool {
+                    return true;
+                }
             }
         "#).unwrap();
 
@@ -1849,7 +2031,10 @@ mod tests {
         assert_eq!(loaded.name, "GSM8K");
         assert_eq!(loaded.implements, vec!["ISolver"]);
         assert_eq!(loaded.storage_fields, vec!["patterns", "count"]);
-        assert_eq!(loaded.functions.len(), 2);
+        // Task 4: `implements ISolver` is now VALIDATED, not decorative -- this
+        // program must provide parse/verify too, so 4 functions, not the
+        // original 2 (constructor + solve only).
+        assert_eq!(loaded.functions.len(), 4);
         assert_eq!(loaded.functions[0].name, "constructor");
         assert_eq!(loaded.functions[1].name, "solve");
 
@@ -1860,7 +2045,7 @@ mod tests {
     #[test]
     fn test_cubebin_file_roundtrip() {
         let programs = compile(r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     create x : number;
                     assign x = 42;
@@ -1900,7 +2085,7 @@ mod tests {
         // Plan-4: `for` lowers to while+index; it executes for real and is
         // no longer a strict-mode violation.
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     let xs = [1, 2, 3];
                     create total : number;
@@ -1918,7 +2103,7 @@ mod tests {
     #[test]
     fn strict_rejects_match() {
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     match (x) {
                         1 => { sum x; }
@@ -1936,7 +2121,7 @@ mod tests {
     #[test]
     fn strict_rejects_trace_only_predict() {
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     predict x;
                 }
@@ -1950,7 +2135,7 @@ mod tests {
     #[test]
     fn strict_rejects_trace_only_infer() {
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     infer x;
                 }
@@ -1965,7 +2150,7 @@ mod tests {
         // Plan-2: CALL is real. A program whose only "stub" risk is a call
         // should now compile under --strict.
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function helper(): number {
                     return 1;
                 }
@@ -1982,7 +2167,7 @@ mod tests {
     fn strict_reports_all_violations_not_just_first() {
         // Two distinct violations on different lines — both should be reported.
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     predict x;
                     infer y;
@@ -2110,7 +2295,7 @@ mod tests {
     fn non_strict_compile_still_allows_trace_only() {
         // Non-strict path must keep accepting these (regression guard).
         let source = r#"
-            program Test implements ISolver {
+            program Test {
                 public function run(): void {
                     predict x;
                     infer y;
