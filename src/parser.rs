@@ -106,6 +106,7 @@ impl Parser {
             TokenKind::Modal        => "modal".into(),
             TokenKind::Robot        => "robot".into(),
             TokenKind::Import       => "import".into(),
+            TokenKind::Use          => "use".into(),
             TokenKind::Log          => "log".into(),
             TokenKind::Debug        => "debug".into(),
             TokenKind::Warn         => "warn".into(),
@@ -328,10 +329,24 @@ impl Parser {
                 TokenKind::Type => items.push(TopLevel::TypeAlias(self.parse_type_alias()?)),
                 TokenKind::Event => items.push(TopLevel::EventDecl(self.parse_event()?)),
                 TokenKind::Extend => items.push(TopLevel::ExtendBlock(self.parse_extend()?)),
+                TokenKind::Use => items.push(TopLevel::Use(self.parse_use()?)),
                 _ => return Err(self.err(format!("unexpected token at top level: {:?}", self.peek()))),
             }
         }
         Ok(SourceFile { items })
+    }
+
+    // ── Use (Task 3: VM-internal capability/module system) ────────────────
+
+    /// `use <name>;` — a top-level declaration bringing a VM registry
+    /// module into scope. Just the module name: the registry itself is
+    /// name-addressed (`vm::registry::ModuleRegistry`), so there is nothing
+    /// else to parse here yet (no path, no selective import list).
+    fn parse_use(&mut self) -> PResult<String> {
+        self.expect(&TokenKind::Use)?;
+        let name = self.expect_ident()?;
+        self.eat(&TokenKind::Semicolon);
+        Ok(name)
     }
 
     // ── Interface ───────────────────────────────────────────────────────
@@ -682,7 +697,13 @@ impl Parser {
             TypeExpr::Void
         };
 
-        Ok(FunctionSig { permissions, modifiers, name, params, return_type, span })
+        // Task 3: POSTFIX `override` marker — `function name() override {`
+        // or `function name(): T override {`. See `FunctionSig::is_override`
+        // for why this is a distinct field/grammar position from the
+        // pre-existing PREFIX `override` in `modifiers`.
+        let is_override = self.eat(&TokenKind::Override);
+
+        Ok(FunctionSig { permissions, modifiers, name, params, return_type, is_override, span })
     }
 
     // ── Function declaration (with body) ────────────────────────────────
@@ -1968,6 +1989,54 @@ mod tests {
             assert_eq!(p.implements, vec!["ISolver"]);
             // 2 type aliases + constructor + solve = 4 items
             assert!(p.body.len() >= 4);
+        } else {
+            panic!("expected program");
+        }
+    }
+
+    #[test]
+    fn test_parse_use_declaration() {
+        // Task 3: `use <name>;` is a TOP-LEVEL decl, a sibling of `program`,
+        // not something nested inside a program body.
+        let ast = parse(r#"
+            use demo;
+
+            program UsesDemo {
+                public function run(): void {}
+            }
+        "#).unwrap();
+        assert_eq!(ast.items.len(), 2);
+        match &ast.items[0] {
+            TopLevel::Use(name) => assert_eq!(name, "demo"),
+            other => panic!("expected TopLevel::Use, got {:?}", other),
+        }
+        assert!(matches!(&ast.items[1], TopLevel::Program(_)));
+    }
+
+    #[test]
+    fn test_parse_function_override_marker() {
+        // Task 3: a POSTFIX `override` after the signature (params / return
+        // type), distinct from the pre-existing PREFIX `override` modifier.
+        let ast = parse(r#"
+            program UsesDemo {
+                public function greet() override {
+                    return 1;
+                }
+                public function plain(): void {}
+            }
+        "#).unwrap();
+        if let TopLevel::Program(p) = &ast.items[0] {
+            let greet = p.body.iter().find_map(|item| match item {
+                ProgramItem::Function(f) if f.sig.name == "greet" => Some(f),
+                _ => None,
+            }).expect("greet");
+            assert!(greet.sig.is_override, "postfix `override` must set is_override");
+
+            let plain = p.body.iter().find_map(|item| match item {
+                ProgramItem::Function(f) if f.sig.name == "plain" => Some(f),
+                _ => None,
+            }).expect("plain");
+            assert!(!plain.sig.is_override, "a function without the marker must not be flagged");
         } else {
             panic!("expected program");
         }

@@ -5,6 +5,11 @@
 //! and a symbol table for debugging.
 
 use crate::ast::*;
+use crate::parser::ParseError;
+// The registry is a static, deterministic capability table (see its module
+// doc), not live VM execution state -- the compiler needs read-only access
+// to it purely to validate `override` declarations at compile time.
+use crate::vm::registry::ModuleRegistry;
 
 // ── Opcode constants (match opcode-vsa-rs ir.rs) ────────────────────────────
 
@@ -186,6 +191,20 @@ pub struct CompiledProgram {
     /// real VSA codebook (which keys on the symbol strings). Empty for programs
     /// with no bindings; loaded-from-disk programs repopulate it from .cubebin.
     pub symbol_names: Vec<String>,
+    /// Task 3: VM registry module names this program's `SourceFile` brought
+    /// into scope with top-level `use <name>;` declarations, in declaration
+    /// order. Consulted by `op::CALL`'s override/registry/error resolution
+    /// (`vm::registry::ModuleRegistry::resolve`). Deny-by-default: a module
+    /// absent from this list is invisible to that program's calls even if
+    /// the registry itself knows it.
+    ///
+    /// NOT YET carried through the `.cubebin` binary format -- `to_cubebin`/
+    /// `from_cubebin` don't serialize it, so a save+load round trip silently
+    /// drops it (same forward-compatible-gap shape as `params` before
+    /// CUBEBIN_VERSION 3). Fine for in-memory compile+run, which is all
+    /// Task 3 exercises; a future task should decide whether shipping
+    /// `use`-dependent programs as `.cubebin` needs a version bump first.
+    pub used_modules: Vec<String>,
 }
 
 impl CompiledProgram {
@@ -320,6 +339,8 @@ impl CompiledProgram {
                 bytecode,
                 labels: Vec::new(),
                 debug_lines: Vec::new(),
+                // Task 3: not in the .cubebin format yet -- see the field doc.
+                is_override: false,
             });
         }
 
@@ -338,7 +359,11 @@ impl CompiledProgram {
             }
         }
 
-        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names })
+        // Task 3: `used_modules` isn't in the .cubebin format yet (see the
+        // field doc on `CompiledProgram`) -- a round-tripped program always
+        // comes back with none `use`'d, same forward-compatible shape as a
+        // pre-v3 file's empty `params`.
+        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules: Vec::new() })
     }
 
     /// Save to a `.cubebin` file.
@@ -368,6 +393,14 @@ pub struct CompiledFunction {
     pub bytecode: Vec<u8>,
     pub labels: Vec<(String, usize)>,   // label name → byte offset
     pub debug_lines: Vec<DebugLine>,    // source mapping
+    /// Task 3: was this function declared with the postfix `override`
+    /// marker (`ast::FunctionSig::is_override`)? Compile-time validation
+    /// (`Compiler::check_override_validity`) already confirmed the name is
+    /// legitimately overridable in a `use`'d module before this is ever
+    /// `true`, so `op::CALL` can trust it directly at resolution time
+    /// instead of re-checking. NOT carried through `.cubebin` yet (see
+    /// `CompiledProgram::used_modules`'s doc — same gap, same reason).
+    pub is_override: bool,
 }
 
 impl CompiledFunction {
@@ -405,6 +438,19 @@ pub struct Compiler {
     /// so the VM can reverse the bytecode's 2-byte hashes for genuine VSA
     /// binding. Deduplicated on insertion; attached to each CompiledProgram.
     symbol_names: Vec<String>,
+    /// Task 3: module names the current `SourceFile` `use`s, gathered once
+    /// per `compile()` call (from its `TopLevel::Use` items) before any
+    /// program is compiled. Attached verbatim to every `CompiledProgram`
+    /// this call produces, and consulted by `check_override_validity`.
+    used_modules: Vec<String>,
+    /// Task 3: `use`/`override` misuse (an `override`-marked function whose
+    /// name isn't genuinely overridable in a `use`'d module). Unlike
+    /// `strict_errors` (only checked under `--strict`), these are always
+    /// checked -- an invalid `override` is a bug regardless of strict mode.
+    /// Reuses `parser::ParseError`'s shape (message + span) rather than
+    /// introducing a new error type for one more compile-time check; both
+    /// free-function entry points (`compile`, `compile_strict`) surface it.
+    override_errors: Vec<ParseError>,
 }
 
 impl Compiler {
@@ -419,6 +465,8 @@ impl Compiler {
             current_program: String::new(),
             current_function: String::new(),
             symbol_names: Vec::new(),
+            used_modules: Vec::new(),
+            override_errors: Vec::new(),
         }
     }
 
@@ -441,6 +489,18 @@ impl Compiler {
 
     /// Compile a full source file.
     pub fn compile(&mut self, source: &SourceFile) -> Vec<CompiledProgram> {
+        // Task 3: gather every top-level `use` BEFORE compiling any program,
+        // so `compile_program`/`compile_function` can see the full set
+        // regardless of where a `use` sits relative to a `program` block in
+        // source order. "That compilation unit" (design doc) is the whole
+        // `SourceFile`: every program compiled from it shares one `use` list.
+        self.used_modules = source.items.iter()
+            .filter_map(|item| match item {
+                TopLevel::Use(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
         let mut programs = Vec::new();
         for item in &source.items {
             if let TopLevel::Program(p) = item {
@@ -478,6 +538,7 @@ impl Compiler {
             functions,
             storage_fields,
             symbol_names: std::mem::take(&mut self.symbol_names),
+            used_modules: self.used_modules.clone(),
         }
     }
 
@@ -486,6 +547,17 @@ impl Compiler {
         self.labels.clear();
         self.debug_lines.clear();
         self.current_function = func.sig.name.clone();
+
+        // Task 3: a postfix `override` is only meaningful -- and only
+        // compiles cleanly -- if the name it claims is genuinely overridable
+        // in a module this SourceFile `use`s. Check it before compiling the
+        // body: the function still compiles either way (so a single source
+        // file with multiple violations reports all of them, matching how
+        // `strict_errors` accumulates), but an invalid `override` always
+        // surfaces as a compile error from the free-function entry points.
+        if func.sig.is_override {
+            self.check_override_validity(&func.sig);
+        }
 
         for stmt in &func.body {
             self.compile_stmt(stmt);
@@ -497,6 +569,34 @@ impl Compiler {
             bytecode: self.bytecode.clone(),
             labels: self.labels.clone(),
             debug_lines: self.debug_lines.clone(),
+            is_override: func.sig.is_override,
+        }
+    }
+
+    /// Task 3: `function name() override { ... }` is only valid when `name`
+    /// is exposed by SOME module in `self.used_modules` and marked
+    /// `overridable` there. Anything else -- the name absent from every
+    /// `use`'d module, present but sealed (`overridable: false`), or no
+    /// `use` at all -- is a compile error, pushed onto `self.override_errors`
+    /// (checked regardless of `--strict`; see that field's doc).
+    fn check_override_validity(&mut self, sig: &FunctionSig) {
+        let registry = ModuleRegistry::new();
+        let valid = self.used_modules.iter()
+            .any(|m| registry.get(m, &sig.name).is_some_and(|f| f.overridable));
+        if !valid {
+            let used = if self.used_modules.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.used_modules.join(", ")
+            };
+            self.override_errors.push(ParseError {
+                message: format!(
+                    "function `{}` is declared `override`, but no `use`'d module exposes an \
+                     overridable `{}` (used modules: {}; registry v{})",
+                    sig.name, sig.name, used, registry.version,
+                ),
+                span: sig.span,
+            });
         }
     }
 
@@ -635,7 +735,30 @@ impl Compiler {
             Stmt::Return(value) => {
                 // Plan-1: real early return. Bare `return;` → 0 operands.
                 // `return <expr>;` → 1 operand resolved at runtime.
+                //
+                // Task 3: `return foo(args);` needs the SAME special case
+                // `compile_let` already gives `let x = foo(args);` --
+                // `Expr::Call` has no operand encoding (CALL always
+                // delivers its result on the STACK, never as something
+                // `compile_expr_operand` can express), so without this it
+                // fell through that function's opaque `_ => None` arm and
+                // silently returned Int(0) WITHOUT EVER CALLING `foo`. Emit
+                // the CALL, POP its stack result into a reserved register,
+                // then RETURN that register -- required for `use`'d-module
+                // resolution (Task 3) to be observable via `return greet();`
+                // at all, but not specific to it: any `return call(...)`.
                 match value {
+                    Some(Expr::Call(callee, args)) => {
+                        self.emit_call(callee, args);
+                        self.emit_debug(op::POP, "pop __return_call");
+                        self.emit_byte(op::POP);
+                        self.emit_byte(1);
+                        self.emit_named("__return_call");
+                        self.emit_debug(op::RETURN, "return value");
+                        self.emit_byte(op::RETURN);
+                        self.emit_byte(1);
+                        self.emit_named("__return_call");
+                    }
                     Some(expr) => {
                         self.emit_debug(op::RETURN, "return value");
                         self.emit_byte(op::RETURN);
@@ -1376,22 +1499,38 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Compile CubeLang source to bytecode programs.
+///
+/// Task 3: an invalid `override` (a name that isn't genuinely overridable in
+/// a `use`'d module) is a compile error here too, not just under `--strict`
+/// -- `check_override_validity` always runs. Reuses `ParseError`'s shape
+/// (message + span) for that error rather than widening this function's
+/// return type; see `Compiler::override_errors`'s doc for why.
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
     let mut compiler = Compiler::new();
-    Ok(compiler.compile(&ast))
+    let programs = compiler.compile(&ast);
+    if let Some(e) = compiler.override_errors.into_iter().next() {
+        return Err(e);
+    }
+    Ok(programs)
 }
 
 /// Compile in strict mode (P0-1): rejects any construct that compiles but does
 /// not execute under the safe-subset VM — extended trace-only opcodes,
 /// `for`, `match`, intra-program `call`. Returns one combined error string
 /// listing every violation (named construct + source line when available).
+///
+/// Task 3: `override` validation errors are folded into the same combined
+/// string (before the strict-mode findings), since they are always checked,
+/// not a strict-only concern.
 pub fn compile_strict(source: &str) -> Result<Vec<CompiledProgram>, String> {
     let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
     let mut compiler = Compiler::new_strict();
     let programs = compiler.compile(&ast);
-    if !compiler.strict_errors.is_empty() {
-        return Err(compiler.strict_errors.join("\n"));
+    let mut errors: Vec<String> = compiler.override_errors.iter().map(|e| e.to_string()).collect();
+    errors.extend(compiler.strict_errors);
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
     }
     Ok(programs)
 }

@@ -19,6 +19,11 @@ pub enum TopLevel {
     TypeAlias(TypeAliasDecl),
     EventDecl(EventDecl),
     ExtendBlock(ExtendBlock),
+    /// `use <name>;` — brings a VM-internal registry module into scope for
+    /// the whole compilation unit (every `Program` compiled from the same
+    /// `SourceFile`). See `compiler::Compiler::compile` (gathers these
+    /// before compiling any program) and `vm::registry::ModuleRegistry`.
+    Use(String),
 }
 
 // ── Interfaces ──────────────────────────────────────────────────────────────
@@ -146,6 +151,23 @@ pub struct FunctionSig {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
+    /// A POSTFIX `override` marker (`function name() override { ... }`,
+    /// parsed after the return type) — Task 3's capability/module system.
+    /// Deliberately a SEPARATE field from `modifiers`'s pre-existing PREFIX
+    /// `Modifier::Override` (`override function name() { ... }`, parsed
+    /// above in `modifiers`), which SPEC.md reserves for a different,
+    /// not-yet-built feature (inheritance-style overriding inside an
+    /// `extend` block). The two are unrelated mechanisms that happen to
+    /// share an English word; keeping them in separate fields means neither
+    /// implementation can silently start meaning the other.
+    ///
+    /// Only meaningful in a program-level `FunctionDecl`, and only valid
+    /// when `name` is exposed as `overridable` by a module the enclosing
+    /// `SourceFile` `use`s — `Compiler::check_override_validity` enforces
+    /// this at compile time (see `vm::registry::ModuleRegistry`); by the
+    /// time bytecode exists, `is_override == true` always means a
+    /// legitimate override.
+    pub is_override: bool,
     pub span: Span,
 }
 

@@ -167,6 +167,11 @@ pub struct VM {
     /// Plan-2: intra-program call recursion depth. Capped at MAX_CALL_DEPTH
     /// so runaway recursion surfaces as an Error rather than a native overflow.
     call_depth: u32,
+    /// Task 3: the VM-internal module/capability registry. Built once at
+    /// `VM::new` (cheap, deterministic) and consulted by `op::CALL` for
+    /// override/registry-impl resolution. See `vm::registry` for the
+    /// deny-by-default access model and the override precedence rule.
+    registry: crate::vm::registry::ModuleRegistry,
 }
 
 /// Conservative recursion cap. exec_function has a sizeable per-frame
@@ -177,7 +182,7 @@ const MAX_CALL_DEPTH: u32 = 64;
 
 impl VM {
     pub fn new() -> Self {
-        Self {
+        let mut vm = Self {
             registers: HashMap::new(),
             stack: Vec::new(),
             storage: HashMap::new(),
@@ -193,7 +198,21 @@ impl VM {
             call_depth: 0,
             resume_state: None,
             knowledge: crate::vm::knowledge::KnowledgeStore::new(),
+            registry: crate::vm::registry::ModuleRegistry::new(),
+        };
+        // Task 3: pre-register every registry function name into the
+        // hash-reversal table, regardless of which modules any given
+        // program `use`s. This is NOT a grant of access -- deny-by-default
+        // is enforced separately, by op::CALL gating resolution on the
+        // calling program's own `used_modules` -- it only makes a name the
+        // compiler already hashed (because the source literally called it)
+        // reversible to a string the VM can look up in the registry at all.
+        let registry_names: Vec<String> =
+            vm.registry.all_function_names().map(str::to_string).collect();
+        for name in &registry_names {
+            vm.register_name(name);
         }
+        vm
     }
 
     /// Resume a program suspended by ASK, supplying the caller's answer.
@@ -736,12 +755,24 @@ impl VM {
                 }
 
                 op::CALL => {
-                    // Plan-2: intra-program CALL v1.
+                    // Plan-2 intra-program CALL, extended by Task 3 with
+                    // `use`/`override` resolution.
                     //   operands[0] = global(fn_name); operands[1..] = arg values.
-                    //   semantics: snapshot caller registers, install fresh
-                    //   arg0..argN, exec callee, restore caller registers,
-                    //   push the return value onto the stack (caller delivers
-                    //   it into a binding via POP).
+                    //
+                    // Resolution precedence (design doc, "THE CRUX"):
+                    //   1. the program's own function, if it's a COMPILE-TIME-
+                    //      VALIDATED `override` (CompiledFunction::is_override)
+                    //      AND a `use`'d module still exposes `fn_name` as
+                    //      overridable  -> the program's override wins.
+                    //   2. else, a `use`'d module exposing `fn_name` at all
+                    //      -> the registry's native implementation.
+                    //   3. else, the program's own function (today's
+                    //      pre-Task-3 behaviour, unchanged) -> intra-program
+                    //      bytecode call.
+                    //   4. else -> error. Deny-by-default: a module NOT
+                    //      named in `prog.used_modules` is invisible at step
+                    //      2 even if the registry otherwise knows it
+                    //      (`ModuleRegistry::resolve`).
                     let key = operands.get(0).and_then(|o| match o {
                         Operand::Global(h) | Operand::Named(h) => Some(*h),
                         _ => None,
@@ -765,64 +796,53 @@ impl VM {
                         None => return ExecResult::Error(
                             "CALL: no current program context".into()),
                     };
-                    let callee = match self.programs.get(&prog_name)
-                        .and_then(|p| p.functions.iter().find(|f| f.name == fn_name))
-                    {
-                        Some(f) => f.clone(),
+                    let prog = match self.programs.get(&prog_name) {
+                        Some(p) => p.clone(),
                         None => return ExecResult::Error(format!(
-                            "CALL: function `{}` not found in program `{}`", fn_name, prog_name)),
+                            "CALL: program `{}` not loaded", prog_name)),
                     };
 
-                    // Resolve args. Each operand becomes a Value via the same
-                    // path used by ASSIGN's RHS (Imm/Float/Named/Global).
+                    // Resolve args up front -- shared by every branch below.
+                    // Each operand becomes a Value via the same path used by
+                    // ASSIGN's RHS (Imm/Float/Named/Global).
                     let mut arg_values: Vec<Value> = Vec::new();
                     for i in 1..operands.len() {
                         arg_values.push(self.resolve_assign_rhs(Some(&operands[i])));
                     }
 
-                    self.trace_op(pc, &format!("CALL {} ({} arg(s))", fn_name, arg_values.len()));
+                    let own_fn = prog.functions.iter().find(|f| f.name == fn_name).cloned();
+                    // (bool, fn ptr) is Copy: pulling both out of the
+                    // registry entry here ends the immutable borrow of
+                    // `self.registry` before any branch below needs
+                    // `&mut self` again.
+                    let module_hit: Option<(bool, crate::vm::registry::NativeFn)> = self
+                        .registry
+                        .resolve(&prog.used_modules, &fn_name)
+                        .map(|entry| (entry.overridable, entry.call));
+                    let is_valid_override = own_fn.as_ref().is_some_and(|f| f.is_override)
+                        && module_hit.is_some_and(|(overridable, _)| overridable);
 
-                    // Snapshot caller registers and install fresh arg scope.
-                    let caller_regs = std::mem::take(&mut self.registers);
-                    for (i, v) in arg_values.into_iter().enumerate() {
-                        let arg_name = format!("arg{}", i);
-                        self.register_name(&arg_name);
-                        let h = blake3::hash(arg_name.as_bytes());
-                        let key = format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1]);
-                        self.registers.insert(key, v);
-                    }
-
-                    self.call_depth += 1;
-                    let r = self.exec_function(&callee);
-                    self.call_depth -= 1;
-
-                    // Restore caller-visible registers.
-                    self.registers = caller_regs;
-
-                    match r {
-                        ExecResult::Ok(v) | ExecResult::Return(v) => {
-                            self.stack.push(v);
+                    if is_valid_override {
+                        let callee = own_fn.expect("is_valid_override implies own_fn is Some");
+                        self.trace_op(pc, &format!(
+                            "CALL {} (program override, {} arg(s))", fn_name, arg_values.len()));
+                        if let Some(err) = self.exec_intra_call(&callee, arg_values) {
+                            return err;
                         }
-                        ExecResult::Error(e) => return ExecResult::Error(e),
-                        // A callee cannot suspend: by this point we have already
-                        // restored the caller's registers and unwound call_depth,
-                        // so resuming would re-enter the callee with the caller's
-                        // frame. Propagating would corrupt state silently; this
-                        // fails loudly instead.
-                        //
-                        // Lifting this needs real call frames (the deferred
-                        // `v2` in CUBELANG_OPCODES_PLAN.md) so a Suspension can
-                        // capture the whole stack, not one function's locals.
-                        // ASK at the top level of `solve` works today.
-                        ExecResult::Suspend(s) => {
-                            return ExecResult::Error(format!(
-                                "ASK inside a CALL is not supported (in {}): the flat \
-                                 global-register model cannot capture a callee frame. \
-                                 Move the ASK to the top-level function, or implement \
-                                 real call frames.",
-                                s.function
-                            ))
+                    } else if let Some((_, native)) = module_hit {
+                        self.trace_op(pc, &format!(
+                            "CALL {} (registry impl, {} arg(s))", fn_name, arg_values.len()));
+                        let result = native(self, &arg_values);
+                        self.stack.push(result);
+                    } else if let Some(callee) = own_fn {
+                        self.trace_op(pc, &format!("CALL {} ({} arg(s))", fn_name, arg_values.len()));
+                        if let Some(err) = self.exec_intra_call(&callee, arg_values) {
+                            return err;
                         }
+                    } else {
+                        return ExecResult::Error(format!(
+                            "CALL: function `{}` not found in program `{}` (and no `use`'d \
+                             module exposes it)", fn_name, prog_name));
                     }
                 }
 
@@ -976,6 +996,59 @@ impl VM {
 
         // Return the accumulator as the result
         ExecResult::Ok(self.accumulator.clone())
+    }
+
+    /// Execute an intra-program bytecode callee exactly as `op::CALL` always
+    /// has (Plan-2, factored out unchanged by Task 3 so the SAME snapshot/
+    /// restore/depth-guard logic backs both call sites that need it now: a
+    /// program's own plain function, and a validated `override`). Installs a
+    /// fresh `arg0..argN` register scope, executes, restores the caller's
+    /// registers, and on success pushes the result onto `self.stack` (the
+    /// caller delivers it into a binding via POP) -- matching how CALL
+    /// always has.
+    ///
+    /// Returns `None` on success (result already on the stack). Returns
+    /// `Some(ExecResult::Error(..))` on failure -- the caller should
+    /// `return` it immediately, matching the early-return control flow this
+    /// replaces. A callee that suspends (ASK) is itself an error here, for
+    /// the same reason it always was: by the time it would propagate, the
+    /// caller's registers are already restored and call_depth already
+    /// unwound, so resuming would re-enter the callee with the wrong frame.
+    fn exec_intra_call(&mut self, callee: &CompiledFunction, arg_values: Vec<Value>) -> Option<ExecResult> {
+        let caller_regs = std::mem::take(&mut self.registers);
+        for (i, v) in arg_values.into_iter().enumerate() {
+            let arg_name = format!("arg{}", i);
+            self.register_name(&arg_name);
+            let h = blake3::hash(arg_name.as_bytes());
+            let key = format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1]);
+            self.registers.insert(key, v);
+        }
+
+        self.call_depth += 1;
+        let r = self.exec_function(callee);
+        self.call_depth -= 1;
+
+        // Restore caller-visible registers.
+        self.registers = caller_regs;
+
+        match r {
+            ExecResult::Ok(v) | ExecResult::Return(v) => {
+                self.stack.push(v);
+                None
+            }
+            ExecResult::Error(e) => Some(ExecResult::Error(e)),
+            // Lifting this needs real call frames (the deferred `v2` in
+            // CUBELANG_OPCODES_PLAN.md) so a Suspension can capture the
+            // whole stack, not one function's locals. ASK at the top level
+            // of `solve` works today.
+            ExecResult::Suspend(s) => Some(ExecResult::Error(format!(
+                "ASK inside a CALL is not supported (in {}): the flat \
+                 global-register model cannot capture a callee frame. \
+                 Move the ASK to the top-level function, or implement \
+                 real call frames.",
+                s.function
+            ))),
+        }
     }
 
     /// Trace a reasoning/VSA opcode as a well-formed structural step. The
@@ -2306,6 +2379,7 @@ mod vsa_opcode_wiring_tests {
             bytecode: bc,
             labels: Vec::new(),
             debug_lines: Vec::new(),
+            is_override: false,
         };
         let prog = CompiledProgram {
             name: "T".to_string(),
@@ -2315,6 +2389,7 @@ mod vsa_opcode_wiring_tests {
             symbol_names: vec![
                 "frame".to_string(), "SUBJECT".to_string(), "cat".to_string(),
             ],
+            used_modules: Vec::new(),
         };
 
         let mut vm = VM::new();

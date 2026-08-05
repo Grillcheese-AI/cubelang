@@ -292,6 +292,9 @@ impl<'a> Lexer<'a> {
             "bytecode"     => TokenKind::BytecodeKw,
             "import"       => TokenKind::Import,
 
+            // Capability / module system (Task 3)
+            "use"          => TokenKind::Use,
+
             // Encryption / security
             "encrypt"      => TokenKind::Encrypt,
             "decrypt"      => TokenKind::Decrypt,
@@ -731,6 +734,22 @@ mod tests {
         let tokens = Lexer::new("bytecode import").tokenize();
         assert_eq!(tokens[0].kind, TokenKind::BytecodeKw);
         assert_eq!(tokens[1].kind, TokenKind::Import);
+    }
+
+    #[test]
+    fn test_lex_use_and_override() {
+        // Task 3: `use <module>;` (top-level) and a postfix `override` marker
+        // on a function signature both need real tokens.
+        let tokens = Lexer::new("use demo; function greet() override {").tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Use);
+        assert_eq!(tokens[1].kind, TokenKind::Ident("demo".into()));
+        assert_eq!(tokens[2].kind, TokenKind::Semicolon);
+        assert_eq!(tokens[3].kind, TokenKind::Function);
+        assert_eq!(tokens[4].kind, TokenKind::Ident("greet".into()));
+        assert_eq!(tokens[5].kind, TokenKind::LParen);
+        assert_eq!(tokens[6].kind, TokenKind::RParen);
+        assert_eq!(tokens[7].kind, TokenKind::Override);
+        assert_eq!(tokens[8].kind, TokenKind::LBrace);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 //! - `index`     ? HammingIndex / LshIndex nearest-neighbour cleanup memory.
 //! - `engine`    ? the bytecode interpreter (registers, stack, control flow,
 //!                 and the opcode dispatch loop).
+//! - `registry`  ? the `use`/`override` capability/module registry (Task 3):
+//!                 module name -> {fn name -> (native impl, overridable)}.
 
 pub mod hypervec;
 pub mod codebook;
@@ -15,11 +17,13 @@ pub mod index;
 pub mod memory;
 pub mod knowledge;
 pub mod engine;
+pub mod registry;
 
 // Re-export the engine's public surface so existing `use cubelang::vm::{VM, ...}`
 // call sites keep working after the flat vm.rs -> vm/ split.
 pub use engine::{VM, ExecResult, Suspension, Value};
 pub use knowledge::{Fact, KnowledgeStore};
+pub use registry::{ModuleFn, ModuleRegistry, NativeFn, REGISTRY_VERSION};
 
 // Re-export the VSA memory primitives for use by the engine and externally.
 pub use hypervec::{Hypervec, DEFAULT_DIM};

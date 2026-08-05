@@ -100,6 +100,9 @@ pub enum TokenKind {
     BytecodeKw,     // bytecode { asm } — inline VM assembly
     Import,         // import "file" (reserved; real top-level import lands in a later task)
 
+    // ── Keywords: capability / module system (Task 3) ────────
+    Use,            // use <module>; — top-level decl, brings a VM registry module into scope
+
     // ── Keywords: encryption / security ────────────────────────
     Encrypt,        // encrypt(data, key) — encrypt data at rest or in transit
     Decrypt,        // decrypt(data, key) — decrypt
