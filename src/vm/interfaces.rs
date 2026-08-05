@@ -20,12 +20,21 @@
 //! resolves every `implements` name against it before falling back to an
 //! in-file inline `interface` decl.
 //!
-//! Only two interfaces are seeded today, exactly what the brief specifies:
-//! `ISolve` (one abstract fn, `solve`) and `ISolver` (three: `parse`, `solve`,
-//! `verify` — the shape every one of this project's `ISolver`-implementing
-//! examples already hand-declares inline; Task 7 deletes those six duplicate
-//! inline decls once `implements` becomes required and every program is
-//! confirmed to resolve against this registry instead).
+//! Three interfaces are seeded: `ISolve` (one abstract fn, `solve`), `ISolver`
+//! (three: `parse`, `solve`, `verify` — the shape every one of this project's
+//! `ISolver`-implementing examples already hand-declares inline; Task 7
+//! deletes those six duplicate inline decls now that `implements` is
+//! required and every program resolves against this registry instead), and
+//! `ISolverLearn` (Task 7: `ISolver`'s triad plus a fourth REQUIRED member,
+//! `learn` — for the two examples, `gsm8k.cube` and `conversation_agent.cube`,
+//! that were each carrying their own inline interface with `parse`/`solve`/
+//! `verify` abstract and `learn` merely `optional`. A registry interface has
+//! no optional-member concept (see `InterfaceFn`'s doc), so this is a
+//! DELIBERATELY stronger contract than either file's old inline one: both
+//! programs already provide a real, non-stub `learn`, so requiring it costs
+//! nothing here and is more honest than "optional" for two programs that
+//! never actually omit it. A program that genuinely wants parse/solve/verify
+//! without committing to learn still has plain `ISolver` available.
 
 use std::collections::HashMap;
 
@@ -79,6 +88,14 @@ impl InterfaceRegistry {
                 InterfaceFn { name: "verify".to_string(), arity: 2 },
             ],
         });
+        interfaces.insert("ISolverLearn".to_string(), Interface {
+            members: vec![
+                InterfaceFn { name: "parse".to_string(), arity: 1 },
+                InterfaceFn { name: "solve".to_string(), arity: 1 },
+                InterfaceFn { name: "verify".to_string(), arity: 2 },
+                InterfaceFn { name: "learn".to_string(), arity: 3 },
+            ],
+        });
         Self { interfaces }
     }
 
@@ -122,5 +139,20 @@ mod tests {
     fn unknown_interface_name_resolves_to_none() {
         let reg = InterfaceRegistry::new();
         assert!(reg.get("INotReal").is_none());
+    }
+
+    #[test]
+    fn isolverlearn_requires_parse_solve_verify_learn_in_order() {
+        let reg = InterfaceRegistry::new();
+        let members = reg.get("ISolverLearn").expect("ISolverLearn must be seeded");
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["parse", "solve", "verify", "learn"]);
+        assert_eq!(members.iter().find(|m| m.name == "parse").unwrap().arity, 1);
+        assert_eq!(members.iter().find(|m| m.name == "solve").unwrap().arity, 1);
+        assert_eq!(members.iter().find(|m| m.name == "verify").unwrap().arity, 2);
+        // Unlike the old inline `optional ... learn(...)` shape both gsm8k.cube
+        // and conversation_agent.cube used to carry, the registry has no
+        // optional-member concept -- learn is REQUIRED here, arity 3.
+        assert_eq!(members.iter().find(|m| m.name == "learn").unwrap().arity, 3);
     }
 }

@@ -14,14 +14,14 @@ use cubelang::compiler;
 use cubelang::vm::{ExecResult, Suspension, VM, Value};
 
 const ASK_PROGRAM: &str = r#"
-program AskMin {
+program AskMin implements ISolve {
     storage { asked: mutable u64 = 0; }
 
     @system @once
     public function constructor() { assign asked = 0; }
 
     @external
-    public function solve(): number {
+    public function solve(input: str): number {
         create luna : number;
         assign luna = 1959;
         create apollo : number;

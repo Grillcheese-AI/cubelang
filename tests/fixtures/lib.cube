@@ -13,7 +13,7 @@ interface ILib {
     abstract public function helper(): number;
 }
 
-program Lib {
+program Lib implements ILib {
     public function helper(): number {
         return 42;
     }

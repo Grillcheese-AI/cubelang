@@ -11,8 +11,12 @@
 //! non-optional) member must be provided by a same-name/same-arity function
 //! in the program body, or it's a compile error.
 //!
-//! `implements` is NOT required yet — an empty (or absent) `implements` list
-//! still compiles; Task 7 flips that switch once every example conforms.
+//! `implements` was NOT required when this test file was first built (Task
+//! 4) — an empty (or absent) `implements` list still compiled. Task 7 first
+//! migrated every program in this repo to a real, validated `implements`,
+//! THEN flipped that switch: `check_implements` now rejects an empty list
+//! too (case (e) below), so every `program` must declare at least one
+//! interface.
 //!
 //! These are the brief's required cases (a)-(e); the rest pin down supporting
 //! behaviour (arity mismatch, inline-decl fallback, registry-wins-over-inline
@@ -98,7 +102,7 @@ fn d_a_complete_isolve_implementer_compiles_ok() {
         .expect("solve present -- ISolve only requires that one fn");
 }
 
-// ── (e) a program with NO `implements` still compiles ─────────────────────
+// ── (e) a program with NO `implements` is now a compile error (Task 7) ────
 
 const NO_IMPLEMENTS: &str = r#"
 program NoImplements {
@@ -108,11 +112,16 @@ program NoImplements {
 "#;
 
 #[test]
-fn e_a_program_with_no_implements_still_compiles() {
-    // required-enforcement (rejecting an empty/absent `implements`) is
-    // deferred to Task 7 -- Task 4 must not newly reject this.
-    compiler::compile(NO_IMPLEMENTS)
-        .expect("no implements at all must still compile -- required isn't enforced yet");
+fn e_a_program_with_no_implements_is_now_a_compile_error() {
+    // Task 4 deliberately let this compile (required-enforcement was
+    // out of scope -- see that task's brief). Task 7 flips the switch: once
+    // every program in the repo was migrated to a real `implements`, an
+    // empty/absent one became a compile error, not a silent gap.
+    let err = compiler::compile(NO_IMPLEMENTS)
+        .expect_err("every program must now declare at least one interface");
+    let msg = err.to_string();
+    assert!(msg.contains("NoImplements"), "{}", msg);
+    assert!(msg.contains("implements"), "{}", msg);
 }
 
 // ── Supporting: arity, not just name, is checked ───────────────────────────
@@ -258,17 +267,23 @@ fn fibonacci_cube_example_still_compiles() {
 
 #[test]
 fn gsm8k_cube_example_still_compiles() {
-    // Exercises the `optional ... learn(...)` member alongside the required
-    // parse/solve/verify triad against a real file, not just the synthetic
-    // INLINE_INTERFACE_OPTIONAL_MEMBER_NOT_REQUIRED fixture above.
+    // Task 7: gsm8k.cube dropped its own inline `interface ISolver { ...
+    // optional ... learn(...) }` in favor of the registry's `ISolverLearn`
+    // (parse/solve/verify/learn, all four required -- the registry has no
+    // optional-member concept). gsm8k.cube already provides a real `learn`,
+    // so this is a real-file regression guard for that registry interface,
+    // not just the synthetic fixtures above.
     let source = include_str!("../examples/gsm8k.cube");
     compiler::compile(source).expect("gsm8k.cube must still compile");
 }
 
 #[test]
 fn conversation_agent_cube_example_still_compiles() {
-    // implements its OWN inline `IConversationAgent` -- not a registry name
-    // at all, so this is a pure inline-decl-fallback regression guard.
+    // Task 7: dropped its own inline `IConversationAgent` (identical shape to
+    // gsm8k.cube's old inline ISolver) in favor of the same registry
+    // `ISolverLearn` gsm8k.cube now implements -- both real 4-method
+    // implementers share one registry contract instead of two near-identical
+    // in-file ones.
     let source = include_str!("../examples/conversation_agent/conversation_agent.cube");
     compiler::compile(source).expect("conversation_agent.cube must still compile");
 }

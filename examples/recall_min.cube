@@ -4,14 +4,6 @@
 # hippocampal memory overwrite semantics (store under an existing key replaces
 # the payload). A genuine belief-revision / error-correction reasoning primitive.
 
-interface ISolver {
-    type Input;
-    type Output;
-    abstract public function parse(raw: str): Input;
-    abstract public function solve(input: Input): Output;
-    abstract public function verify(input: Input, output: Output): bool;
-}
-
 program RecallMin implements ISolver {
     type Input = number;
     type Output = number;

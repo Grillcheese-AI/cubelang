@@ -23,14 +23,6 @@
 #   IMPORTANT: do NOT `create in_class`/`create in_conf` inside solve() — that
 #   resets them to null and clobbers the injected inputs.
 
-interface ISolver {
-    type Input;
-    type Output;
-    abstract public function parse(raw: str): Input;
-    abstract public function solve(input: Input): Output;
-    abstract public function verify(input: Input, output: Output): bool;
-}
-
 program QCDecision implements ISolver {
     type Input = number;
     type Output = number;

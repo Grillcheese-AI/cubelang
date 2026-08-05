@@ -1,15 +1,6 @@
 # examples/conversation_min.cube
 # cubelang v0.1.0
 
-interface ISolver {
-    type Input;
-    type Output;
-
-    abstract public function parse(raw: str): Input;
-    abstract public function solve(input: Input): Output;
-    abstract public function verify(input: Input, output: Output): bool;
-}
-
 program ConversationMin implements ISolver {
     type Input = str;
     type Output = number;

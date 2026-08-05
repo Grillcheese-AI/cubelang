@@ -53,8 +53,8 @@ fn run(source: &str, func: &str) -> ExecResult {
 // minimal program/function shell it needs to compile and run -- the inner
 // three statements (create/asm/return) are verbatim.
 const ASM_UNBIND_ROUNDTRIP: &str = r#"
-program AsmUnbindRoundtrip {
-    public function run(): str {
+program AsmUnbindRoundtrip implements ISolve {
+    public function solve(input: str): str {
         create frame:number;
         asm { BIND_ROLE frame, SUBJECT, "cat"; UNBIND frame, SUBJECT }
         return frame;
@@ -64,7 +64,7 @@ program AsmUnbindRoundtrip {
 
 #[test]
 fn a1_asm_bind_unbind_roundtrip_recovers_cat_via_source() {
-    match run(ASM_UNBIND_ROUNDTRIP, "run") {
+    match run(ASM_UNBIND_ROUNDTRIP, "solve") {
         ExecResult::Return(Value::Str(s)) | ExecResult::Ok(Value::Str(s)) => {
             assert_eq!(s, "cat", "asm-compiled BIND_ROLE+UNBIND must recover the planted filler");
         }
@@ -99,8 +99,8 @@ fn a2_asm_compiles_to_the_same_bytecode_shape_as_the_hand_assembled_unbind_test(
     expected.push(0x04); expected.push(subj[0]); expected.push(subj[1]);
 
     let source = r#"
-        program AsmBytecodeShape {
-            public function run(): str {
+        program AsmBytecodeShape implements ISolve {
+            public function solve(input: str): str {
                 asm { BIND_ROLE frame, SUBJECT, "cat"; UNBIND frame, SUBJECT }
                 return frame;
             }
@@ -117,13 +117,18 @@ fn a2_asm_compiles_to_the_same_bytecode_shape_as_the_hand_assembled_unbind_test(
 #[test]
 fn a3_unknown_mnemonic_is_a_compile_error() {
     let source = r#"
-        program AsmBadMnemonic {
-            public function run(): str {
+        program AsmBadMnemonic implements ISolve {
+            public function solve(input: str): str {
                 asm { NOT_A_REAL_OP frame, SUBJECT }
                 return frame;
             }
         }
     "#;
+    // Needs a real `implements ISolve` (Task 7): the non-strict `compile_ast`
+    // returns on the FIRST non-empty error category, in order
+    // capability -> interface -> asm -- an empty `implements` here would
+    // surface as a missing-implements error and never reach asm_errors at
+    // all, silently defeating this test's actual point (the bad mnemonic).
     let err = compiler::compile(source).expect_err("an unrecognized asm mnemonic must not compile");
     assert!(err.to_string().contains("NOT_A_REAL_OP"), "{}", err);
 }
@@ -134,8 +139,8 @@ fn a4_asm_with_no_operands_and_multiple_instructions_compiles() {
     // BIND_ROLE/UNBIND test operands -- SUM takes one operand, RETURN
     // (via asm) can take zero.
     let source = r#"
-        program AsmGeneral {
-            public function run(): number {
+        program AsmGeneral implements ISolve {
+            public function solve(input: str): number {
                 create x : number;
                 assign x = 7;
                 asm { SUM x }
@@ -143,7 +148,7 @@ fn a4_asm_with_no_operands_and_multiple_instructions_compiles() {
             }
         }
     "#;
-    match run(source, "run") {
+    match run(source, "solve") {
         ExecResult::Return(Value::Int(n)) | ExecResult::Ok(Value::Int(n)) => assert_eq!(n, 7),
         other => panic!("expected Return/Ok(Int(7)), got {:?}", other),
     }
@@ -218,15 +223,15 @@ fn b5_calling_recover_without_use_vsa_is_a_runtime_error() {
     // Deny-by-default (Task 3's rule, reused as-is by Task 6): `vsa` must
     // actually be `use`'d, even though the registry always knows it.
     let source = r#"
-        program NoUseVsa {
-            public function run(): str {
+        program NoUseVsa implements ISolve {
+            public function solve(input: str): str {
                 create frame: number;
                 bind frame, SUBJECT, "cat";
                 return recover(frame, SUBJECT);
             }
         }
     "#;
-    match run(source, "run") {
+    match run(source, "solve") {
         ExecResult::Error(e) => assert!(e.contains("recover"), "{}", e),
         other => panic!("deny-by-default: expected an Error, got {:?}", other),
     }

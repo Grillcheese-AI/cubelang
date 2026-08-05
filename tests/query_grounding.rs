@@ -36,7 +36,7 @@ const FACTS: &str = concat!(
 ///   * `len` is not surface syntax. `op::LEN` is compiler-generated from `for`
 ///     and `let n = a.len()`. So this returns the array and Rust counts it.
 const PROGRAM: &str = r#"
-program Ground {
+program Ground implements ISolve {
     storage { queries: mutable u64 = 0; }
 
     @system @once
@@ -191,7 +191,7 @@ fn REGRESSION_host_args_bind_to_the_declared_name() {
 #[test]
 fn argN_alias_still_works_for_backwards_compatibility() {
     const BY_ARGN: &str = r#"
-program ByArgN {
+program ByArgN implements ISolve {
     @external
     public function solve(mention: str): number {
         query arg0;
@@ -247,7 +247,7 @@ fn params_survive_the_cubebin_round_trip() {
 /// name for the RAG context -- and was a reserved TYPE keyword, so the SPEC's
 /// example could not be written until type keywords became soft.
 const GROUND: &str = r#"
-program Ground {
+program Ground implements ISolve {
     @external
     public function solve(mention: str): number {
         query mention;
@@ -287,9 +287,9 @@ fn REGRESSION_type_keywords_are_usable_as_identifiers() {
     // words. Reserving them outright made the SPEC's own example unwritable:
     //     let ctx: rag = knowledge.query("...", top_k: 5);
     const NAMES: &str = r#"
-program Names {
+program Names implements ISolve {
     @external
-    public function solve(): number {
+    public function solve(input: str): number {
         create ctx : number;   assign ctx = 1;
         create map : number;   assign map = 2;
         create role : number;  assign role = 3;

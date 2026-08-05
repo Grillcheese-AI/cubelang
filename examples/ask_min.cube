@@ -7,8 +7,15 @@
 # Modelled on the measured DBpedia case: the "Moon landing" abstract cites BOTH
 # Luna 2 (13 September 1959) and Apollo 11 (20 July 1969). Only the user knows
 # which landing they meant. Picking silently would be a CITED FALSEHOOD.
+#
+# `implements ISolve` (Task 7): the registry's ISolve requires `solve` at
+# arity 1. This program's own scenario is fixed (luna/apollo are hardcoded,
+# not derived from a caller-supplied mention), so `input` below is declared
+# to satisfy the interface and otherwise unused -- the same shape
+# qc_decision.cube's `solve` already uses (its real inputs arrive via
+# injected registers, not the declared parameter either).
 
-program AskMin {
+program AskMin implements ISolve {
 
     storage {
         asked: mutable u64 = 0;
@@ -20,7 +27,7 @@ program AskMin {
     }
 
     @external
-    public function solve(): number {
+    public function solve(input: str): number {
         create luna : number;
         assign luna = 1959;
 

@@ -1,16 +1,13 @@
 # conversation_agent.cube
 # cubelang v0.1.0
 # conversational reasoning template
-
-interface IConversationAgent {
-    type Input;
-    type Output;
-
-    abstract public function parse(raw: str): Input;
-    abstract public function solve(input: Input): Output;
-    abstract public function verify(input: Input, output: Output): bool;
-    optional public function learn(input: Input, expected: Output, actual: Output): void;
-}
+#
+# Task 7: dropped the inline `interface IConversationAgent { ... }` decl --
+# identical in shape to gsm8k.cube's own old inline interface (parse/solve/
+# verify abstract, learn merely optional) -- in favor of the registry's
+# `ISolverLearn` (src/vm/interfaces.rs), which backs both examples now. This
+# program already provides a real, non-stub `learn`, so the registry's
+# stronger "learn is required, not optional" contract costs nothing here.
 
 event ReplyGenerated {
     program: str;
@@ -60,7 +57,7 @@ struct Reply {
     trace: array<str>;
 }
 
-program ConversationReasoner implements IConversationAgent {
+program ConversationReasoner implements ISolverLearn {
     type Input = Turn;
     type Output = Reply;
 

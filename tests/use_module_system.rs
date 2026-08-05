@@ -38,8 +38,8 @@ fn run(source: &str, func: &str) -> ExecResult {
 const USE_DEMO: &str = r#"
 use demo;
 
-program UsesDemo {
-    public function run(): number {
+program UsesDemo implements ISolve {
+    public function solve(input: str): number {
         return greet();
     }
 }
@@ -47,7 +47,7 @@ program UsesDemo {
 
 #[test]
 fn a_use_demo_resolves_bare_call_to_the_registry_impl() {
-    match run(USE_DEMO, "run") {
+    match run(USE_DEMO, "solve") {
         ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 42),
         other => panic!("expected the registry's greet() value (42), got {:?}", other),
     }
@@ -58,11 +58,11 @@ fn a_use_demo_resolves_bare_call_to_the_registry_impl() {
 const USE_DEMO_OVERRIDE: &str = r#"
 use demo;
 
-program UsesDemoOverride {
+program UsesDemoOverride implements ISolve {
     public function greet() override {
         return 999;
     }
-    public function run(): number {
+    public function solve(input: str): number {
         return greet();
     }
 }
@@ -70,7 +70,7 @@ program UsesDemoOverride {
 
 #[test]
 fn b_a_valid_program_override_wins_over_the_registry_impl() {
-    match run(USE_DEMO_OVERRIDE, "run") {
+    match run(USE_DEMO_OVERRIDE, "solve") {
         ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 999),
         other => panic!("expected the override's value (999), got {:?}", other),
     }
@@ -84,8 +84,8 @@ fn compiled_program_carries_used_modules_and_the_override_flag() {
     assert_eq!(progs[0].used_modules, vec!["demo".to_string()]);
     let greet = progs[0].functions.iter().find(|f| f.name == "greet").expect("greet");
     assert!(greet.is_override, "greet() override must set CompiledFunction::is_override");
-    let run_fn = progs[0].functions.iter().find(|f| f.name == "run").expect("run");
-    assert!(!run_fn.is_override, "run() has no override marker");
+    let solve_fn = progs[0].functions.iter().find(|f| f.name == "solve").expect("solve");
+    assert!(!solve_fn.is_override, "solve() has no override marker");
 }
 
 // ── (c) `override` on a non-overridable or absent name is a compile error ─
@@ -153,8 +153,8 @@ fn override_errors_also_surface_under_strict_mode() {
 // ── (d) calling `greet()` without `use demo;` is an error ─────────────────
 
 const NO_USE: &str = r#"
-program NoUse {
-    public function run(): number {
+program NoUse implements ISolve {
+    public function solve(input: str): number {
         return greet();
     }
 }
@@ -162,7 +162,7 @@ program NoUse {
 
 #[test]
 fn d_calling_a_module_fn_without_use_is_a_runtime_error() {
-    match run(NO_USE, "run") {
+    match run(NO_USE, "solve") {
         ExecResult::Error(e) => assert!(e.contains("greet"), "{}", e),
         other => panic!("deny-by-default: expected an Error, got {:?}", other),
     }
@@ -171,11 +171,11 @@ fn d_calling_a_module_fn_without_use_is_a_runtime_error() {
 // ── Supporting behaviour discovered while building the mechanism ──────────
 
 const PLAIN_CALL_NO_USE: &str = r#"
-program PlainCall {
+program PlainCall implements ISolve {
     public function helper(): number {
         return 5;
     }
-    public function run(): number {
+    public function solve(input: str): number {
         return helper();
     }
 }
@@ -187,7 +187,7 @@ fn plain_intra_program_call_is_unaffected_by_the_registry() {
     // completely untouched. Also exercises the `return foo();` compiler fix
     // (see task report) on the plain-program-function branch, not just the
     // registry branch.
-    match run(PLAIN_CALL_NO_USE, "run") {
+    match run(PLAIN_CALL_NO_USE, "solve") {
         ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 5),
         other => panic!("plain intra-program call regressed: {:?}", other),
     }
@@ -196,11 +196,11 @@ fn plain_intra_program_call_is_unaffected_by_the_registry() {
 const PLAIN_SAME_NAME_AS_MODULE: &str = r#"
 use demo;
 
-program ShadowsWithoutOverride {
+program ShadowsWithoutOverride implements ISolve {
     public function greet(): number {
         return 123;
     }
-    public function run(): number {
+    public function solve(input: str): number {
         return greet();
     }
 }
@@ -218,7 +218,7 @@ fn a_plain_same_named_function_does_not_silently_shadow_a_used_module_without_ov
     // ruled this correct and asked only for the SEALED variant (below) to
     // become a compile error, since an overridable collision has a
     // discoverable fix (`override`) and a sealed one does not.
-    match run(PLAIN_SAME_NAME_AS_MODULE, "run") {
+    match run(PLAIN_SAME_NAME_AS_MODULE, "solve") {
         ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 42),
         other => panic!("expected the registry's greet() (42) to win, got {:?}", other),
     }
@@ -307,7 +307,7 @@ fn a_plain_program_still_round_trips_through_cubebin_unchanged() {
 
     let mut vm = VM::new();
     let name = vm.load_file(&path).expect("must still load fine");
-    match vm.call(&name, "run", vec![]) {
+    match vm.call(&name, "solve", vec![]) {
         ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 5),
         other => panic!("round-tripped plain program should behave identically: {:?}", other),
     }

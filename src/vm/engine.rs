@@ -1502,8 +1502,8 @@ mod tests {
     #[test]
     fn test_vm_basic_arithmetic() {
         let mut vm = compile_and_load(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 16;
                     sub x, 3;
@@ -1516,7 +1516,7 @@ mod tests {
         "#);
 
         vm.trace_enabled = true;
-        let result = vm.call("Test", "run", Vec::new());
+        let result = vm.call("Test", "solve", Vec::new());
 
         // Print trace
         for line in &vm.trace {
@@ -1536,8 +1536,8 @@ mod tests {
     #[test]
     fn test_vm_push_pop_chain() {
         let mut vm = compile_and_load(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 16;
                     sub x, 3;
@@ -1554,7 +1554,7 @@ mod tests {
             }
         "#);
 
-        let result = vm.call("Test", "run", Vec::new());
+        let result = vm.call("Test", "solve", Vec::new());
 
         match result {
             ExecResult::Ok(val) => {
@@ -1570,8 +1570,8 @@ mod tests {
     #[test]
     fn test_vm_division_by_zero() {
         let mut vm = compile_and_load(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 42;
                     div x, 0;
@@ -1579,7 +1579,7 @@ mod tests {
             }
         "#);
 
-        let result = vm.call("Test", "run", Vec::new());
+        let result = vm.call("Test", "solve", Vec::new());
         match result {
             ExecResult::Error(e) => assert!(e.contains("division by zero")),
             _ => panic!("expected division by zero error"),
@@ -1589,8 +1589,8 @@ mod tests {
     #[test]
     fn test_vm_store_recall() {
         let mut vm = compile_and_load(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 42;
                     remember x;
@@ -1598,7 +1598,7 @@ mod tests {
             }
         "#);
 
-        vm.call("Test", "run", Vec::new());
+        vm.call("Test", "solve", Vec::new());
 
         // The register should be in storage after REMEMBER
         assert!(vm.storage.values().any(|v| v.as_i64() == 42));
@@ -1607,8 +1607,8 @@ mod tests {
     #[test]
     fn test_vm_multiple_functions() {
         let mut vm = compile_and_load(r#"
-            program Calc {
-                public function add_numbers(): void {
+            program Calc implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 10;
                     add x, 20;
@@ -1623,7 +1623,7 @@ mod tests {
             }
         "#);
 
-        let r1 = vm.call("Calc", "add_numbers", Vec::new());
+        let r1 = vm.call("Calc", "solve", Vec::new());
         match r1 {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 30),
             _ => panic!("expected ok"),
@@ -1640,8 +1640,8 @@ mod tests {
     fn test_vm_load_cubebin() {
         // Compile, save to cubebin, load from cubebin, execute
         let programs = crate::compiler::compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 100;
                     sub x, 37;
@@ -1657,7 +1657,7 @@ mod tests {
         let name = vm.load_file(&path).unwrap();
         assert_eq!(name, "Test");
 
-        let result = vm.call("Test", "run", Vec::new());
+        let result = vm.call("Test", "solve", Vec::new());
         match result {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 63, "100 - 37 = 63"),
             _ => panic!("expected ok"),
@@ -1672,8 +1672,8 @@ mod tests {
     #[test]
     fn return_early_halts_with_value() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create r : number;
                     create poison : number;
                     assign r = 1;
@@ -1683,7 +1683,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) =>
                 assert_eq!(v.as_i64(), 1,
                     "early return must yield 1, not the poisoned 99 (= fall-through)"),
@@ -1694,8 +1694,8 @@ mod tests {
     #[test]
     fn return_early_inside_if_skips_rest() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create r : number;
                     create poison : number;
                     assign r = 5;
@@ -1708,7 +1708,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 5,
                 "return inside if must halt before sum poison runs"),
             other => panic!("unexpected: {:?}", other),
@@ -1718,8 +1718,8 @@ mod tests {
     #[test]
     fn return_bare_yields_current_accumulator() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     create poison : number;
                     assign x = 7;
@@ -1730,7 +1730,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 7,
                 "bare return must yield the accumulator set by sum x, not the poisoned sum"),
             other => panic!("unexpected: {:?}", other),
@@ -1743,8 +1743,8 @@ mod tests {
     #[test]
     fn for_each_sums_three_elements() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     let xs = [10, 20, 30];
                     create total : number;
                     assign total = 0;
@@ -1755,7 +1755,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 60),
             other => panic!("unexpected: {:?}", other),
         }
@@ -1764,8 +1764,8 @@ mod tests {
     #[test]
     fn for_each_empty_array_runs_zero_iterations() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     let xs = [];
                     create total : number;
                     assign total = 0;
@@ -1776,7 +1776,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 0),
             other => panic!("unexpected: {:?}", other),
         }
@@ -1787,8 +1787,8 @@ mod tests {
         // sum over (xi + yj) for xi in [1,2], yj in [10,20] = 4*1 + 4*2 ... actually
         // = (1+10)+(1+20)+(2+10)+(2+20) = 11+21+12+22 = 66.
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     let xs = [1, 2];
                     let ys = [10, 20];
                     create total : number;
@@ -1803,7 +1803,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 66),
             other => panic!("unexpected: {:?}", other),
         }
@@ -1815,15 +1815,15 @@ mod tests {
     #[test]
     fn array_literal_len_is_three() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     let xs = [10, 20, 30];
                     let n = xs.len();
                     sum n;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 3),
             other => panic!("unexpected: {:?}", other),
         }
@@ -1832,15 +1832,15 @@ mod tests {
     #[test]
     fn array_index_returns_element() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     let xs = [10, 20, 30];
                     let x = xs[1];
                     sum x;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 20),
             other => panic!("unexpected: {:?}", other),
         }
@@ -1850,15 +1850,15 @@ mod tests {
     fn array_index_out_of_range_is_null() {
         // Out-of-range indexing produces Null; sum yields 0 (as_i64 of Null).
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     let xs = [10, 20, 30];
                     let x = xs[99];
                     sum x;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 0,
                 "out-of-range index must be Null, not panic"),
             other => panic!("unexpected: {:?}", other),
@@ -1870,7 +1870,7 @@ mod tests {
     #[test]
     fn call_returns_value_via_stack() {
         let mut vm = compile_and_load(r#"
-            program T {
+            program T implements ISolve {
                 public function dbl(): number {
                     create r : number;
                     assign r = 0;
@@ -1878,13 +1878,13 @@ mod tests {
                     add r, arg0;
                     return r;
                 }
-                public function run(): void {
+                public function solve(input: str): void {
                     let y = dbl(21);
                     sum y;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) =>
                 assert_eq!(v.as_i64(), 42, "dbl(21) must return 42"),
             other => panic!("unexpected: {:?}", other),
@@ -1896,13 +1896,13 @@ mod tests {
         // The callee writes to a register with the same name as a caller local.
         // After return, the caller's value must be intact.
         let mut vm = compile_and_load(r#"
-            program T {
+            program T implements ISolve {
                 public function helper(): number {
                     create r : number;
                     assign r = 99;
                     return r;
                 }
-                public function run(): void {
+                public function solve(input: str): void {
                     create r : number;
                     assign r = 7;
                     let _t = helper();
@@ -1910,7 +1910,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) =>
                 assert_eq!(v.as_i64(), 7,
                     "caller's local r must still be 7 after helper() (got {:?})", v),
@@ -1922,7 +1922,7 @@ mod tests {
     fn call_recursion_factorial() {
         // fact(n) = if n <= 1 then 1 else n * fact(n-1)
         let mut vm = compile_and_load(r#"
-            program T {
+            program T implements ISolve {
                 public function fact(): number {
                     create n : number;
                     assign n = 0;
@@ -1941,13 +1941,13 @@ mod tests {
                     }
                     return 1;
                 }
-                public function run(): void {
+                public function solve(input: str): void {
                     let r = fact(5);
                     sum r;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) | ExecResult::Return(v) =>
                 assert_eq!(v.as_i64(), 120, "fact(5) must return 120"),
             other => panic!("unexpected: {:?}", other),
@@ -1959,18 +1959,18 @@ mod tests {
         // Unbounded self-recursion should produce a clean Error, not a native
         // stack overflow. fact() without a base case keeps calling.
         let mut vm = compile_and_load(r#"
-            program T {
+            program T implements ISolve {
                 public function loop_forever(): number {
                     let r = loop_forever();
                     return r;
                 }
-                public function run(): void {
+                public function solve(input: str): void {
                     let r = loop_forever();
                     sum r;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Error(e) => assert!(e.to_lowercase().contains("depth"),
                 "expected depth-guard error, got: {}", e),
             other => panic!("expected depth-guard Error, got {:?}", other),
@@ -1983,8 +1983,8 @@ mod tests {
     #[test]
     fn assign_register_to_register_copies_value() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create a : number;
                     create b : number;
                     assign a = 5;
@@ -1993,7 +1993,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 5,
                 "assign b = a must propagate the value 5 (got {:?})", v),
             other => panic!("unexpected: {:?}", other),
@@ -2004,8 +2004,8 @@ mod tests {
     fn assign_register_to_register_then_arithmetic() {
         // Compose with arithmetic so a regression also breaks the chain.
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create a : number;
                     create b : number;
                     assign a = 7;
@@ -2015,7 +2015,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 10),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2025,15 +2025,15 @@ mod tests {
     fn assign_literal_int_unchanged() {
         // Guard: the bug fix must NOT regress literal assignment.
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create a : number;
                     assign a = 42;
                     sum a;
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 42),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2042,8 +2042,8 @@ mod tests {
     #[test]
     fn test_vm_trace() {
         let mut vm = compile_and_load(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 5;
                     add x, 3;
@@ -2053,7 +2053,7 @@ mod tests {
         "#);
 
         vm.trace_enabled = true;
-        vm.call("Test", "run", Vec::new());
+        vm.call("Test", "solve", Vec::new());
 
         assert!(!vm.trace.is_empty());
         assert!(vm.trace.iter().any(|t| t.contains("CREATE")));
@@ -2065,8 +2065,8 @@ mod tests {
     #[test]
     fn test_vm_if_then_branch() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 5;
                     if (x > 3) { assign x = 100; } else { assign x = 200; }
@@ -2074,7 +2074,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 100, "x=5, x>3 true → then-branch → 100"),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2083,8 +2083,8 @@ mod tests {
     #[test]
     fn test_vm_if_else_branch() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 2;
                     if (x > 3) { assign x = 100; } else { assign x = 200; }
@@ -2092,7 +2092,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 200, "x=2, x>3 false → else-branch → 200"),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2101,8 +2101,8 @@ mod tests {
     #[test]
     fn test_vm_while_loop_terminates_and_accumulates() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create total : number;
                     assign total = 0;
                     create i : number;
@@ -2112,7 +2112,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 50, "5 iterations × 10 = 50"),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2121,8 +2121,8 @@ mod tests {
     #[test]
     fn test_vm_compare_sets_cmp_register() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create a : number;
                     assign a = 7;
                     create b : number;
@@ -2131,7 +2131,7 @@ mod tests {
                 }
             }
         "#);
-        vm.call("T", "run", Vec::new());
+        vm.call("T", "solve", Vec::new());
         assert_eq!(vm.get("__cmp").map(|v| v.as_str()), Some("equal".to_string()));
     }
 
@@ -2139,8 +2139,8 @@ mod tests {
     fn test_vm_float_arithmetic() {
         // 80000 * 1.5 = 120000 (real fractional multiply, integral result).
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create v : number;
                     assign v = 80000;
                     mul v, 1.5;
@@ -2148,7 +2148,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 120000),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2158,8 +2158,8 @@ mod tests {
     fn test_vm_float_nonintegral_result() {
         // 7 / 2 = 3.5 — non-integral float preserved.
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create v : number;
                     assign v = 7;
                     div v, 2.0;
@@ -2167,7 +2167,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert!((v.as_f64() - 3.5).abs() < 1e-9, "got {}", v.as_f64()),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2177,8 +2177,8 @@ mod tests {
     fn test_vm_true_division_int_operands() {
         // 60 / 100 = 0.6 (true division on integer operands, not floor → 0).
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create v : number;
                     assign v = 60;
                     div v, 100;
@@ -2186,7 +2186,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert!((v.as_f64() - 0.6).abs() < 1e-9, "got {}", v.as_f64()),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2196,8 +2196,8 @@ mod tests {
     fn test_vm_exact_int_division_stays_int() {
         // 16 / 2 = 8 stays integer.
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create v : number;
                     assign v = 16;
                     div v, 2;
@@ -2205,7 +2205,7 @@ mod tests {
                 }
             }
         "#);
-        match vm.call("T", "run", Vec::new()) {
+        match vm.call("T", "solve", Vec::new()) {
             ExecResult::Ok(v) => assert_eq!(v.as_i64(), 8),
             other => panic!("unexpected: {:?}", other),
         }
@@ -2363,14 +2363,14 @@ mod vsa_opcode_wiring_tests {
     #[test]
     fn bind_statement_produces_hypervector_register() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create sentence : frame;
                     bind sentence, SUBJECT, "cat";
                 }
             }
         "#);
-        vm.call("T", "run", Vec::new());
+        vm.call("T", "solve", Vec::new());
         // The register key is the hashed name; find the single Hvec value.
         let has_hvec = vm.registers.values()
             .any(|v| matches!(v, Value::Hvec(_)));
@@ -2384,8 +2384,8 @@ mod vsa_opcode_wiring_tests {
     #[test]
     fn bound_frame_recovers_fillers_via_unbind() {
         let mut vm = compile_and_load(r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create frame : frame;
                     bind frame, SUBJECT, "cat";
                     bind frame, VERB, "chases";
@@ -2393,7 +2393,7 @@ mod vsa_opcode_wiring_tests {
                 }
             }
         "#);
-        vm.call("T", "run", Vec::new());
+        vm.call("T", "solve", Vec::new());
 
         // Resolve the register the compiler used for `frame` (hashed name key).
         let reg_key = vm.registers.iter()

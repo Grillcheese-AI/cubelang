@@ -821,19 +821,27 @@ impl Compiler {
         });
     }
 
-    // ── Standard interfaces (Task 4): validated `implements` ────────────
+    // ── Standard interfaces (Task 4 + Task 7): required + validated
+    // `implements` ────────────────────────────────────────────────────────
     //
     // `implements X` used to be pure decoration -- parsed into
     // `ProgramDecl::implements`, round-tripped through `.cubebin`, never
-    // checked against anything. This makes it real: `X` must resolve to
+    // checked against anything. Task 4 made it real: `X` must resolve to
     // either a VM-internal interface (`vm::interfaces::InterfaceRegistry`)
     // or an in-file inline `interface X { ... }` decl, and the program must
     // provide a same-name/same-arity function for every required member of
-    // whichever one it resolved to.
+    // whichever one it resolved to -- but an EMPTY (or absent) `implements`
+    // list was deliberately left untouched, so the migration to a
+    // conforming repo could land in its own task rather than needing every
+    // program fixed in the same commit that built the checker.
     //
-    // Deliberately NOT required yet: an empty (or absent) `implements` list
-    // is untouched by this check (Task 7 makes it required, once every
-    // example conforms) -- see the early return below.
+    // Task 7 is that migration: every program in this repo (examples/, the
+    // embedded `.cube` fixtures across tests/*.rs, and this file's own unit
+    // tests) was brought to a real, validated `implements` first, and ONLY
+    // THEN does this method start rejecting an empty one below -- reversing
+    // that order would have made every one of those fixtures a compile
+    // error the moment this landed, instead of a deliberate, reviewable
+    // migration.
 
     /// For every name in `prog.implements`: resolve it, then confirm every
     /// required member is satisfied. Pushes onto `self.interface_errors`
@@ -854,19 +862,36 @@ impl Compiler {
     /// and validate against that instead -- silently defeating the whole
     /// mechanism. So a name the registry knows ALWAYS means the registry's
     /// contract; an in-file decl is only ever consulted for a name the
-    /// registry does NOT recognize (e.g. `conversation_agent.cube`'s own
-    /// `IConversationAgent`), which is exactly the "existing programs that
+    /// registry does NOT recognize (e.g. `SpinningWidget`'s own `IWidget` in
+    /// tests/interfaces.rs), which is exactly the "existing programs that
     /// declare inline interfaces MUST keep working" case the brief calls
     /// out. This ordering is unobservable on every program in examples/
-    /// today -- the six inline `ISolver` decls this project's examples
-    /// carry are identical in shape to the registry's `ISolver` (Task 7
-    /// deletes them as redundant once `implements` is required) -- it only
-    /// matters once a program tries to shadow a registry name with a
+    /// today -- the six inline `ISolver` decls this project's examples used
+    /// to carry were identical in shape to the registry's `ISolver`, and
+    /// Task 7 deleted them as redundant now that `implements` is required --
+    /// it only matters once a program tries to shadow a registry name with a
     /// weaker local one; `a_local_interface_block_cannot_redefine_a_registry_interface_to_something_weaker`
     /// (tests/interfaces.rs) pins this down directly.
+    ///
+    /// Task 7: an EMPTY `implements` is now itself a member of
+    /// `interface_errors` below, not an early return -- every `program` must
+    /// declare at least one interface. This is checked before resolution
+    /// (there is nothing to resolve), but goes through the exact same
+    /// accumulator as a resolution/member failure, so it is checked
+    /// unconditionally (not just under `--strict`) and folds into the same
+    /// combined error surface as everything else in this method.
     fn check_implements(&mut self, prog: &ProgramDecl) {
         if prog.implements.is_empty() {
-            return; // Task 7 makes this required; Task 4 does not.
+            self.interface_errors.push(ParseError {
+                message: format!(
+                    "program `{}` has no `implements` clause -- every program must \
+                     declare at least one interface (e.g. `implements ISolve`); \
+                     see src/vm/interfaces.rs for the full VM interface registry",
+                    prog.name,
+                ),
+                span: prog.span,
+            });
+            return;
         }
 
         let registry = InterfaceRegistry::new();
@@ -1972,36 +1997,46 @@ pub fn compile_ast_strict(source: &SourceFile) -> Result<Vec<CompiledProgram>, S
 mod tests {
     use super::*;
 
-    // Task 4: most fixtures below dropped a decorative `implements ISolver`
-    // that predates real `implements` validation -- these tests exercise
-    // bytecode/format/strict-mode concerns unrelated to interfaces, and none
-    // of them ever defined parse/verify, so the claim was already false
-    // before this task, just never checked. `test_compile_gsm8k` (a real
-    // `include_str!` of examples/gsm8k.cube) and `test_cubebin_roundtrip`
-    // (asserts on `.implements` content directly) are the two exceptions
-    // that keep it, and `test_cubebin_roundtrip`'s fixture now provides the
-    // full parse/solve/verify triad to match.
+    // Task 4 dropped a decorative `implements ISolver` from most fixtures
+    // below (bytecode/format/strict-mode concerns unrelated to interfaces,
+    // none of them ever defined parse/verify) since `implements` was still
+    // optional. Task 7 made `implements` REQUIRED, so every fixture that
+    // expects a successful `compile`/`compile_strict` now carries a real
+    // `implements ISolve` + a same-name/arity-1 `solve` -- usually the
+    // fixture's OWN probe function renamed from `run` to `solve(input: str)`
+    // with the parameter left unused, exactly like qc_decision.cube's real
+    // `solve` ignores its declared `input` in favor of injected registers.
+    // Fixtures that already expect a compile ERROR (missing verify, an
+    // unknown statement under --strict, a sealed-capability collision, ...)
+    // are deliberately left with no `implements` at all: `check_implements`
+    // now ALSO rejects them (for that additional reason), and since
+    // `compile_strict`/`compile_ast_strict` combine every error category
+    // into one string, the substring each test actually asserts on is still
+    // present regardless. `test_compile_gsm8k` (a real `include_str!` of
+    // examples/gsm8k.cube) and `test_cubebin_roundtrip` (asserts on
+    // `.implements` content directly) predate this and already carried a
+    // real `implements ISolver` + full parse/solve/verify triad.
 
     #[test]
     fn test_compile_empty_program() {
         let programs = compile(r#"
-            program Empty {
-                public function run(): void {
+            program Empty implements ISolve {
+                public function solve(input: str): void {
                 }
             }
         "#).unwrap();
         assert_eq!(programs.len(), 1);
         assert_eq!(programs[0].name, "Empty");
         assert_eq!(programs[0].functions.len(), 1);
-        assert_eq!(programs[0].functions[0].name, "run");
+        assert_eq!(programs[0].functions[0].name, "solve");
         assert!(programs[0].functions[0].bytecode.is_empty());
     }
 
     #[test]
     fn test_compile_opcodes() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 42;
                     add x, 10;
@@ -2029,8 +2064,8 @@ mod tests {
     #[test]
     fn test_compile_bytecode_format() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 16;
                     sub x, 3;
@@ -2061,8 +2096,8 @@ mod tests {
     #[test]
     fn test_compile_with_control_flow() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     if (x > 0) {
                         add x, 1;
                     } else {
@@ -2082,8 +2117,8 @@ mod tests {
     #[test]
     fn test_compile_atomic_block() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     atomic {
                         assign x = 12;
                         sub x, 4;
@@ -2104,8 +2139,8 @@ mod tests {
     #[test]
     fn test_compile_let_stmt() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     let x: f64 = 3.14;
                 }
             }
@@ -2124,7 +2159,10 @@ mod tests {
 
         assert_eq!(programs.len(), 1);
         assert_eq!(programs[0].name, "GSM8K");
-        assert_eq!(programs[0].implements, vec!["ISolver"]);
+        // Task 7: gsm8k.cube moved from its own inline `interface ISolver`
+        // (learn merely optional) to the registry's `ISolverLearn` (learn
+        // required) -- see examples/gsm8k.cube and src/vm/interfaces.rs.
+        assert_eq!(programs[0].implements, vec!["ISolverLearn"]);
 
         // Should have constructor + parse + solve + verify + learn = 5 functions
         assert_eq!(programs[0].functions.len(), 5);
@@ -2143,8 +2181,8 @@ mod tests {
     #[test]
     fn test_compile_debug_lines() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 16;
                     add x, 3;
@@ -2223,8 +2261,8 @@ mod tests {
     #[test]
     fn test_cubebin_file_roundtrip() {
         let programs = compile(r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     create x : number;
                     assign x = 42;
                     sum x;
@@ -2263,8 +2301,8 @@ mod tests {
         // Plan-4: `for` lowers to while+index; it executes for real and is
         // no longer a strict-mode violation.
         let source = r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     let xs = [1, 2, 3];
                     create total : number;
                     assign total = 0;
@@ -2328,11 +2366,11 @@ mod tests {
         // Plan-2: CALL is real. A program whose only "stub" risk is a call
         // should now compile under --strict.
         let source = r#"
-            program Test {
+            program Test implements ISolve {
                 public function helper(): number {
                     return 1;
                 }
-                public function run(): void {
+                public function solve(input: str): void {
                     let r = helper();
                     sum r;
                 }
@@ -2458,8 +2496,8 @@ mod tests {
         // Non-strict path is untouched by the whitelist flip (regression
         // guard, mirrors non_strict_compile_still_allows_trace_only below).
         let source = r#"
-            program T {
-                public function run(): void {
+            program T implements ISolve {
+                public function solve(input: str): void {
                     create arr : array<u64>;
                     frobnicate d;
                     arr[0] = 5;
@@ -2473,8 +2511,8 @@ mod tests {
     fn non_strict_compile_still_allows_trace_only() {
         // Non-strict path must keep accepting these (regression guard).
         let source = r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
                     predict x;
                     infer y;
                 }

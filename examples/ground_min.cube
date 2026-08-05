@@ -8,7 +8,7 @@
 # Every opcode here executes. QUERY does an exact hash lookup with provenance;
 # ASK suspends and resumes. Zero embeddings, zero forward passes.
 
-program Ground {
+program Ground implements ISolve {
 
     storage {
         grounded: mutable u64 = 0;

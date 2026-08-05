@@ -5,14 +5,6 @@
 # termination) plus hippocampal memory. A genuine iterative reasoning pattern:
 # "apply a step N times, accumulating a running total."
 
-interface ISolver {
-    type Input;
-    type Output;
-    abstract public function parse(raw: str): Input;
-    abstract public function solve(input: Input): Output;
-    abstract public function verify(input: Input, output: Output): bool;
-}
-
 program LoopMin implements ISolver {
     type Input = number;
     type Output = number;
