@@ -1093,6 +1093,15 @@ impl VM {
 
     /// Resolve an operand to a Value, preserving int vs float so arithmetic
     /// can promote correctly. Named operands resolve to the register's value.
+    /// Global operands (string literals -- e.g. `return "ok";`) resolve via
+    /// `resolve_symbol_name`, the same name-table path ASK's question text
+    /// and BIND_ROLE/UNBIND's role/filler symbols already use to reverse a
+    /// 2-byte hash to its real spelling. Without this arm, RETURN fell
+    /// through to the wildcard below and silently returned `Int(0)` for any
+    /// string literal. `resolve_symbol_name` falls back to the `g_xxxx`
+    /// token only for a genuinely unrecorded literal -- not the normal case,
+    /// since `emit_global` always records the spelling before emitting the
+    /// operand.
     fn resolve_value(&self, op: Option<&Operand>) -> Value {
         match op {
             Some(Operand::Imm(n)) => Value::Int(*n),
@@ -1100,6 +1109,7 @@ impl VM {
             Some(o @ Operand::Named(_)) => {
                 self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Int(0))
             }
+            Some(o @ Operand::Global(_)) => Value::Str(self.resolve_symbol_name(Some(o))),
             _ => Value::Int(0),
         }
     }
