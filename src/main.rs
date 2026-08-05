@@ -8,12 +8,15 @@
 //!   cubelang check   <file.cube>              → parse + type check only
 //!   cubelang version
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
 use cubelang::compiler::{self, CompiledProgram, op};
 use cubelang::loader;
+use cubelang::reasoning::{RunRequest, RunResult, run_result};
 use cubelang::vm::{VM, ExecResult, Value};
+use prost::Message;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -30,6 +33,7 @@ fn main() {
         "check"    | "k" => cmd_check(&args[2..]),
         "validate" | "vd" => cmd_validate(&args[2..]),
         "run"      | "r" => cmd_run(&args[2..]),
+        "run-proto"      => cmd_run_proto(),
         "version"  | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
@@ -49,6 +53,8 @@ USAGE:
 COMMANDS:
     compile,  c    Compile .cube to .cubebin (use --strict to reject stubs)
     run,      r    Compile (or load .cubebin) and execute a program
+    run-proto      Read a length-prefixed RunRequest from stdin, run it from
+                   source, write a length-prefixed RunResult to stdout
     inspect,  i    Show .cubebin program info
     disasm,   d    Disassemble .cubebin to readable opcodes
     check,    k    Parse and check .cube without compiling
@@ -456,16 +462,12 @@ fn cmd_run(args: &[String]) {
             eprintln!("error: no programs in {}", input);
             process::exit(1);
         }
-        let name = programs[0].name.clone();
-        for p in programs { vm.load(p); }
-        name
+        load_programs(&mut vm, programs)
     };
 
-    // Run the constructor first if the program defines one (sets up storage).
-    let _ = vm.call(&prog_name, "constructor", Vec::new());
-
-    // Run the target function.
-    let result = vm.call(&prog_name, &target_fn, call_args);
+    // Run the constructor first if the program defines one (sets up
+    // storage), then the target function.
+    let result = call_with_constructor(&mut vm, &prog_name, &target_fn, call_args);
 
     if trace && !json_out {
         println!("# trace ({} ops):", vm.trace.len());
@@ -562,8 +564,126 @@ fn cmd_run(args: &[String]) {
     }
 }
 
+// ── run-proto ───────────────────────────────────────────────────────────────
+//
+// `run --json`'s wire-transport sibling for the reasoning bridge (M2): same
+// compile-from-source + call path, same value mapping, protobuf over
+// stdin/stdout instead of a JSON line on a subprocess's stdout. Framing in
+// both directions is a plain `u32` big-endian byte length followed by the
+// encoded message. Rust's stdio is binary-safe (no CRLF translation), so
+// reads/writes below move raw bytes with no text-mode handling.
+
+/// Read one length-prefixed `RunRequest` from stdin, compile+run it, write
+/// one length-prefixed `RunResult` to stdout. Never touches `cmd_run` or its
+/// `--json` output -- this is a fully separate entry point that happens to
+/// reuse the same program-loading/call helpers (`load_programs`,
+/// `call_with_constructor`) `cmd_run` itself now uses.
+fn cmd_run_proto() {
+    let mut len_buf = [0u8; 4];
+    if let Err(e) = std::io::stdin().read_exact(&mut len_buf) {
+        eprintln!("error: cannot read RunRequest length from stdin: {}", e);
+        process::exit(1);
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut req_buf = vec![0u8; len];
+    if let Err(e) = std::io::stdin().read_exact(&mut req_buf) {
+        eprintln!("error: cannot read RunRequest body from stdin: {}", e);
+        process::exit(1);
+    }
+
+    let req = match RunRequest::decode(&req_buf[..]) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: cannot decode RunRequest: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let result = run_request_result(req);
+
+    let mut out_buf = Vec::new();
+    // `Message::encode` into a `Vec<u8>` only fails on a writer error; a
+    // `Vec` never fails to grow, so this can't actually happen in practice --
+    // the `expect` documents that instead of threading a dead error path
+    // through the rest of the function.
+    result.encode(&mut out_buf).expect("encoding RunResult into a Vec cannot fail");
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = out.write_all(&(out_buf.len() as u32).to_be_bytes());
+    let _ = out.write_all(&out_buf);
+    let _ = out.flush();
+}
+
+/// Compile `req.program` FROM SOURCE (`compiler::compile`, the loader-free
+/// sibling of the `loader::load` + `compiler::compile_ast` pair `cmd_run`
+/// uses for a `.cube` file -- there is no filesystem path here to resolve
+/// `import`s against, and a `use`-ing program can't serialize to `.cubebin`
+/// anyway) and run `req.fn_name` with `req.args` bound as `Value::Str`,
+/// mapping the outcome onto `RunResult` with the SAME value shape `cmd_run`'s
+/// `--json` path uses (`value_to_json`) so the two transports agree on
+/// meaning byte-for-byte. See `value_to_run_result` for the mapping detail
+/// that matters most: `Value::Null` leaves the oneof UNSET rather than
+/// becoming `Symbol("null")`.
+fn run_request_result(req: RunRequest) -> RunResult {
+    let programs = match compiler::compile(&req.program) {
+        Ok(p) => p,
+        Err(e) => return RunResult { ok: false, result: Some(run_result::Result::Error(e.to_string())) },
+    };
+    if programs.is_empty() {
+        return RunResult {
+            ok: false,
+            result: Some(run_result::Result::Error("no programs in request".to_string())),
+        };
+    }
+
+    let mut vm = VM::new();
+    let prog_name = load_programs(&mut vm, programs);
+    let call_args: Vec<Value> = req.args.into_iter().map(Value::Str).collect();
+
+    match call_with_constructor(&mut vm, &prog_name, &req.fn_name, call_args) {
+        ExecResult::Ok(val) | ExecResult::Return(val) => {
+            RunResult { ok: true, result: value_to_run_result(&val) }
+        }
+        ExecResult::Suspend(susp) => {
+            // RunResult has no wire shape for a suspension (no question /
+            // candidates fields -- only Symbol/Error). None of the
+            // reasoning-bridge programs this transport serves today ASK, so
+            // rather than silently misrepresenting a suspend as some Symbol,
+            // report it honestly as an error.
+            RunResult {
+                ok: false,
+                result: Some(run_result::Result::Error(format!(
+                    "suspended (not representable over run-proto): {}", susp.question
+                ))),
+            }
+        }
+        ExecResult::Error(e) => RunResult { ok: false, result: Some(run_result::Result::Error(e)) },
+    }
+}
+
+/// The value mapping `run-proto` and `run --json` (`value_to_json`) must
+/// agree on: `Value::Str` passes through verbatim as `Symbol`; every other
+/// non-null variant reuses `value_to_json`'s own JSON shape, stringified, so
+/// a bool/int/array/map result stays inspectable through one formatting
+/// rule instead of two divergent ones. `Value::Null` is the load-bearing
+/// case -- it leaves the oneof UNSET (`None`), mirroring
+/// `value_to_json`'s `Value::Null -> serde_json::Value::Null` (how an
+/// unbound `recover()` already renders as JSON `null`), so the Python side
+/// decodes `None` rather than the string `"null"`.
+fn value_to_run_result(val: &Value) -> Option<run_result::Result> {
+    match val {
+        Value::Null => None,
+        Value::Str(s) => Some(run_result::Result::Symbol(s.clone())),
+        other => Some(run_result::Result::Symbol(value_to_json(other).to_string())),
+    }
+}
+
 /// Serialize a VM result Value to JSON for the `run --json` bridge output
-/// (cubbyverse parses this structured result; protobuf is a later transport swap).
+/// (cubbyverse parses this structured result). `run-proto`'s
+/// `value_to_run_result` reuses this same shape, stringified, for every
+/// non-Str/non-Null value so the JSON and protobuf transports agree.
 fn value_to_json(v: &cubelang::vm::Value) -> serde_json::Value {
     use cubelang::vm::Value;
     match v {
@@ -581,6 +701,27 @@ fn value_to_json(v: &cubelang::vm::Value) -> serde_json::Value {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Load every freshly-compiled program into `vm`, returning the first
+/// program's name -- the "the first compiled program is the default one to
+/// run" convention (see `loader` module doc) that `cmd_run`'s in-memory
+/// `.cube`-compile branch and `run-proto` both rely on identically. Callers
+/// check `programs.is_empty()` themselves first (the two call sites report
+/// that case with different, path-specific messages).
+fn load_programs(vm: &mut VM, programs: Vec<CompiledProgram>) -> String {
+    let name = programs[0].name.clone();
+    for p in programs { vm.load(p); }
+    name
+}
+
+/// Run a program's `constructor` if it has one (sets up storage; best-effort,
+/// like `cmd_run` always treated it), then call `function` -- the exact
+/// two-call sequence `cmd_run` and `run-proto` both need, factored out so it
+/// can't drift between the two transports.
+fn call_with_constructor(vm: &mut VM, program: &str, function: &str, args: Vec<Value>) -> ExecResult {
+    let _ = vm.call(program, "constructor", Vec::new());
+    vm.call(program, function, args)
+}
 
 fn load_cubebin(path: &str) -> CompiledProgram {
     match CompiledProgram::load(Path::new(path)) {
