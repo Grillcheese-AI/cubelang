@@ -68,9 +68,13 @@ contract — so `@external public` on it is redundant ceremony and may be
 omitted. A bare `function solve(input: Input): Output { ... }` parses and
 compiles to byte-identical bytecode as the fully-annotated form (see
 `tests/interfaces.rs`'s Task 8 tests). The verbose form remains fully
-supported and is still worth writing wherever the annotation carries real
-information (`private`/`@internal` helpers, `@system`-only lifecycle hooks,
-`@restricted`/`@ratelimit`, etc.).
+supported. Note that the permission/modifier annotations above
+(`private`, `@internal`, `@system`, `@restricted`, `@ratelimit`, and the
+rest of the table) are currently **parsed but not yet enforced** — only
+interface-declaration `abstract`/`optional` affects compilation today; the
+permissions and visibility modifiers reserve the syntax for a future
+access-control cycle and change nothing at compile or run time yet. Write
+them where they make intent clear, but don't rely on them for enforcement.
 
 ### Usage
 
