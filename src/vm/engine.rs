@@ -636,16 +636,31 @@ impl VM {
                 }
 
                 op::RECALL => {
-                    let key = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    // `recall "key"` (1-arg): operand0 is the key; there is
+                    // no explicit destination, so the recalled value parks
+                    // in a register addressed by that same key operand.
+                    // `recall reg, "key"` (2-arg): operand0 is the
+                    // destination register and operand1 is the key --
+                    // the SAME layout STORE uses (STORE's `reg` operand0 /
+                    // `key` operand1), so select operands by arity the same
+                    // way STORE does rather than always reading operand0.
+                    let (dest, key) = if operands.len() >= 2 {
+                        let dest = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                        let key = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                        (dest, key)
+                    } else {
+                        let key = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                        (key.clone(), key)
+                    };
                     // Associative cleanup: nearest stored key by cosine similarity.
                     match self.memory.recall(&key) {
                         Some((matched, val, sim)) => {
                             self.trace_op(pc, &format!("RECALL {} → {} (sim {:.3}) = {}", key, matched, sim, val));
-                            self.registers.insert(key, val);
+                            self.registers.insert(dest, val);
                         }
                         None => {
                             self.trace_op(pc, &format!("RECALL {} → (empty)", key));
-                            self.registers.insert(key, Value::Null);
+                            self.registers.insert(dest, Value::Null);
                         }
                     }
                 }
