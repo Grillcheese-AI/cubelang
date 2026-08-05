@@ -1114,10 +1114,24 @@ impl VM {
         }
     }
 
-    /// Resolve an ASSIGN right-hand-side. Like `resolve_value` for Named (copy
-    /// register value), but for Global we fall back to the synthesized name
-    /// token when no register is bound — preserving `assign x = "literal"`
-    /// behaviour (string literals compile to Global). Imm/FloatImm unchanged.
+    /// Resolve an ASSIGN right-hand-side -- also the resolver shared by
+    /// MAKE_ARRAY's element list and intra-program CALL's argument list (see
+    /// `op::MAKE_ARRAY` and `op::CALL`'s `arg_values`). Imm/FloatImm pass
+    /// through as literal values; Named copies the source register's value.
+    /// Global operands (string literals -- e.g. `assign x = "hello"`)
+    /// resolve via `resolve_symbol_name`, the same name-table path
+    /// `resolve_value` (RETURN/ADD/SUB/...) and BIND_ROLE/UNBIND's
+    /// role/filler symbols already use to reverse a 2-byte hash to its real
+    /// spelling. Without this arm, a Global operand fell back to the raw
+    /// `g_xxxx` token whenever nothing happened to be bound at that
+    /// register key -- the normal case for a fresh literal, since nothing
+    /// ever assigns INTO a hash-keyed register -- so ASSIGN, MAKE_ARRAY
+    /// string elements, and string-literal CALL args all silently carried
+    /// the hash token instead of the literal's real text.
+    /// `resolve_symbol_name` falls back to `g_xxxx` only for a genuinely
+    /// unrecorded literal -- not the normal case, since `emit_global`
+    /// always records the spelling via `record_symbol` before emitting the
+    /// operand.
     fn resolve_assign_rhs(&self, op: Option<&Operand>) -> Value {
         match op {
             Some(Operand::Imm(n)) => Value::Int(*n),
@@ -1125,10 +1139,7 @@ impl VM {
             Some(o @ Operand::Named(_)) => {
                 self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Null)
             }
-            Some(o @ Operand::Global(_)) => {
-                let key = o.as_name();
-                self.registers.get(&key).cloned().unwrap_or(Value::Str(key))
-            }
+            Some(o @ Operand::Global(_)) => Value::Str(self.resolve_symbol_name(Some(o))),
             Some(other) => other.to_value(),
             None => Value::Null,
         }

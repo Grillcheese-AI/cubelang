@@ -141,12 +141,16 @@ Lifting this needs the real call frames that `CUBELANG_OPCODES_PLAN.md` already
 defers to v2. `ASK` at the top level of `solve` works — which is where a
 disambiguation belongs anyway.
 
-**The question text does not survive compilation.** String literals compile to a
-2-byte hash (`Operand::Global`), and `load()` registers program/function/field/
-role names in the name table — not arbitrary literals. So `question` comes back
-as `"g_727b"` rather than the sentence. Candidates are unaffected (real values).
-Fixing this means adding string literals to `symbol_names` at compile time. A
-compiler-side gap, not a VM one.
+**The question text does survive compilation.** String literals compile to a
+2-byte hash (`Operand::Global`), but `emit_global` records the real spelling
+into `symbol_names` at compile time (`record_symbol`), and `load()` copies
+`symbol_names` into the VM's name table. `ASK`'s question operand resolves via
+`resolve_symbol_name`, which reverses the hash back to the literal's real
+text — so `question` comes back as `"which moon landing did you mean"`, the
+actual sentence, not `"g_727b"`. Candidates were always unaffected (real
+values). The `g_xxxx` token now surfaces only for a genuinely unrecorded
+literal — deterministic, just not human-readable — which is not the normal
+case.
 
 **`cubelang run` without `--json` is a debug harness**, not the interface. It
 prints numbered options and reads an index from stdin so the contract can be
@@ -155,7 +159,7 @@ host boundary:
 
 ```json
 {"suspended":true,"program":"AskMin","function":"solve",
- "question":"g_727b","candidates":[1959,1969]}
+ "question":"which moon landing did you mean","candidates":[1959,1969]}
 ```
 
 ## Where this sits
