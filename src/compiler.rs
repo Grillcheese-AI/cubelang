@@ -1953,8 +1953,14 @@ pub fn compile_ast(source: &SourceFile) -> Result<Vec<CompiledProgram>, crate::p
 
 /// Compile in strict mode (P0-1): rejects any construct that compiles but does
 /// not execute under the safe-subset VM — extended trace-only opcodes,
-/// `for`, `match`, intra-program `call`. Returns one combined error string
-/// listing every violation (named construct + source line when available).
+/// `match`, intra-program `call`. Returns one combined error string listing
+/// every violation (named construct + source line when available).
+///
+/// NOTE: `for` is NOT in this list, despite an earlier version of this
+/// comment claiming it was -- `strict_check_stmt`'s `Stmt::For(_)` arm is a
+/// deliberate no-op (Task 6: `for` always lowers to real COMPARE/COND/JMP/
+/// LABEL loop scaffolding, so there's nothing non-executing about it to
+/// reject).
 ///
 /// Task 3: `use`/`override`/registry capability errors are folded into the
 /// same combined string (before the strict-mode findings), since they are

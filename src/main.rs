@@ -86,7 +86,9 @@ fn cmd_compile(args: &[String]) {
     }
 
     // Parse flags and positional args. `--strict` (P0-1) rejects non-executing
-    // constructs (trace-only opcodes, `for`, `match`, intra-program `call`).
+    // constructs (trace-only opcodes, `match`, intra-program `call` -- NOT
+    // `for`, which always lowers to real loop scaffolding; see
+    // `compiler::compile_strict`'s doc).
     let mut strict = false;
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
@@ -328,32 +330,44 @@ fn cmd_check(args: &[String]) {
 
     // Load + merge (Task 5: `import`) instead of a bare parse -- `check`
     // should see the whole compilation unit, imports included.
-    match loader::load(Path::new(&args[0])) {
-        Ok(ast) => {
-            let n_items = ast.items.len();
-            let mut n_programs = 0;
-            let mut n_interfaces = 0;
-            let mut n_structs = 0;
-            let mut n_enums = 0;
-
-            for item in &ast.items {
-                match item {
-                    cubelang::ast::TopLevel::Interface(_) => n_interfaces += 1,
-                    cubelang::ast::TopLevel::Program(_) => n_programs += 1,
-                    cubelang::ast::TopLevel::Struct(_) => n_structs += 1,
-                    cubelang::ast::TopLevel::Enum(_) => n_enums += 1,
-                    _ => {}
-                }
-            }
-
-            println!("  {} ok ({} items: {} programs, {} interfaces, {} structs, {} enums)",
-                args[0], n_items, n_programs, n_interfaces, n_structs, n_enums);
-        }
+    let ast = match loader::load(Path::new(&args[0])) {
+        Ok(ast) => ast,
         Err(e) => {
             eprintln!("  {} error: {}", args[0], e);
             process::exit(1);
         }
+    };
+
+    // Task 8 (Feature B, verify-before-execute): `check` used to be
+    // parse-only -- a program that parses but fails real compilation (a
+    // missing `implements`, an unknown `asm` mnemonic, or a strict-mode
+    // violation like a trace-only ext op) silently reported "ok". Actually
+    // compile it, in strict mode, so `check` is an honest "will this run
+    // safely" preflight rather than just a syntax check -- the same
+    // strict verifier `compile --strict` and `run --strict` use.
+    if let Err(e) = compiler::compile_ast_strict(&ast) {
+        eprintln!("  {} error: {}", args[0], e);
+        process::exit(1);
     }
+
+    let n_items = ast.items.len();
+    let mut n_programs = 0;
+    let mut n_interfaces = 0;
+    let mut n_structs = 0;
+    let mut n_enums = 0;
+
+    for item in &ast.items {
+        match item {
+            cubelang::ast::TopLevel::Interface(_) => n_interfaces += 1,
+            cubelang::ast::TopLevel::Program(_) => n_programs += 1,
+            cubelang::ast::TopLevel::Struct(_) => n_structs += 1,
+            cubelang::ast::TopLevel::Enum(_) => n_enums += 1,
+            _ => {}
+        }
+    }
+
+    println!("  {} ok ({} items: {} programs, {} interfaces, {} structs, {} enums)",
+        args[0], n_items, n_programs, n_interfaces, n_structs, n_enums);
 }
 
 // ── validate ────────────────────────────────────────────────────────────────
@@ -392,7 +406,7 @@ fn cmd_validate(args: &[String]) {
 fn cmd_run(args: &[String]) {
     if args.is_empty() {
         eprintln!("usage: cubelang run <file.cube|file.cubebin> \
-                   [--fn name] [--trace] [--json] [--arg VALUE]... \
+                   [--strict] [--fn name] [--trace] [--json] [--arg VALUE]... \
                    [--knowledge facts.jsonl]");
         process::exit(1);
     }
@@ -401,6 +415,11 @@ fn cmd_run(args: &[String]) {
     let mut target_fn = "solve".to_string();
     let mut trace = false;
     let mut json_out = false;
+    // Task 8 (Feature B, verify-before-execute): mirrors `cmd_compile`'s
+    // `--strict` (P0-1) -- rejects non-executing constructs (trace-only
+    // opcodes, `match`, ...; see `compile_strict`'s doc for the exact list)
+    // for the `.cube`-from-source path here too, not just `compile`.
+    let mut strict = false;
     let mut knowledge_path: Option<String> = None;
     let mut call_args: Vec<Value> = Vec::new();
     let mut i = 1;
@@ -409,6 +428,7 @@ fn cmd_run(args: &[String]) {
             "--fn" | "-f" => { if i + 1 < args.len() { target_fn = args[i + 1].clone(); i += 1; } }
             "--trace" | "-t" => trace = true,
             "--json" | "-j" => json_out = true,
+            "--strict" => strict = true,
             // Facts for QUERY. Without this the VM has no knowledge and
             // abstains on every query -- which is correct, but not useful.
             "--knowledge" | "-k" => {
@@ -454,9 +474,25 @@ fn cmd_run(args: &[String]) {
             Ok(ast) => ast,
             Err(e) => { eprintln!("error: {}", e); process::exit(1); }
         };
-        let programs = match compiler::compile_ast(&merged) {
-            Ok(p) => p,
-            Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+        // Task 8: same strict/loose split as `cmd_compile` above -- `--strict`
+        // surfaces non-executing constructs as hard errors instead of
+        // silently compiling them to no-ops.
+        let programs = if strict {
+            match compiler::compile_ast_strict(&merged) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error (--strict): {}", e);
+                    process::exit(1);
+                }
+            }
+        } else {
+            match compiler::compile_ast(&merged) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            }
         };
         if programs.is_empty() {
             eprintln!("error: no programs in {}", input);
@@ -617,18 +653,25 @@ fn cmd_run_proto() {
     let _ = out.flush();
 }
 
-/// Compile `req.program` FROM SOURCE (`compiler::compile`, the loader-free
-/// sibling of the `loader::load` + `compiler::compile_ast` pair `cmd_run`
-/// uses for a `.cube` file -- there is no filesystem path here to resolve
-/// `import`s against, and a `use`-ing program can't serialize to `.cubebin`
-/// anyway) and run `req.fn_name` with `req.args` bound as `Value::Str`,
-/// mapping the outcome onto `RunResult` with the SAME value shape `cmd_run`'s
-/// `--json` path uses (`value_to_json`) so the two transports agree on
-/// meaning byte-for-byte. See `value_to_run_result` for the mapping detail
-/// that matters most: `Value::Null` leaves the oneof UNSET rather than
-/// becoming `Symbol("null")`.
+/// Compile `req.program` FROM SOURCE (`compiler::compile_strict`, the
+/// loader-free sibling of the `loader::load` + `compiler::compile_ast_strict`
+/// pair `cmd_run --strict` uses for a `.cube` file -- there is no filesystem
+/// path here to resolve `import`s against, and a `use`-ing program can't
+/// serialize to `.cubebin` anyway) and run `req.fn_name` with `req.args`
+/// bound as `Value::Str`, mapping the outcome onto `RunResult` with the SAME
+/// value shape `cmd_run`'s `--json` path uses (`value_to_json`) so the two
+/// transports agree on meaning byte-for-byte. See `value_to_run_result` for
+/// the mapping detail that matters most: `Value::Null` leaves the oneof
+/// UNSET rather than becoming `Symbol("null")`.
+///
+/// Task 8 (Feature B, verify-before-execute): this used to call the loose
+/// `compiler::compile`. A `use`-ing reasoning program can't serialize to
+/// `.cubebin`, so `run-proto` was its ONLY from-source entry point that
+/// never ran the strict verifier `compile --strict` already had for `.cube`
+/// files compiled to disk -- every protobuf request now gets the same
+/// verify-before-execute guarantee.
 fn run_request_result(req: RunRequest) -> RunResult {
-    let programs = match compiler::compile(&req.program) {
+    let programs = match compiler::compile_strict(&req.program) {
         Ok(p) => p,
         Err(e) => return RunResult { ok: false, result: Some(run_result::Result::Error(e.to_string())), similarity: None },
     };
@@ -656,6 +699,15 @@ fn run_request_result(req: RunRequest) -> RunResult {
         ExecResult::Ok(val) | ExecResult::Return(val) => {
             RunResult { ok: true, result: value_to_run_result(&val), similarity }
         }
+        // Task 8 (folded-in Minor from Task 7's review): both non-ok arms
+        // below now hardcode `similarity: None` instead of threading through
+        // `similarity`. A run that recovers cleanly and THEN suspends/errors
+        // would otherwise carry a real-looking, stale similarity next to
+        // `ok:false` -- misleading, since that number described an earlier
+        // recover(), not the outcome being reported. The compile-error early
+        // returns above already hardcode `similarity: None`; this makes
+        // every non-ok `RunResult` agree, protecting whatever future
+        // non-Python wire consumer reads this next.
         ExecResult::Suspend(susp) => {
             // RunResult has no wire shape for a suspension (no question /
             // candidates fields -- only Symbol/Error). None of the
@@ -667,10 +719,10 @@ fn run_request_result(req: RunRequest) -> RunResult {
                 result: Some(run_result::Result::Error(format!(
                     "suspended (not representable over run-proto): {}", susp.question
                 ))),
-                similarity,
+                similarity: None,
             }
         }
-        ExecResult::Error(e) => RunResult { ok: false, result: Some(run_result::Result::Error(e)), similarity },
+        ExecResult::Error(e) => RunResult { ok: false, result: Some(run_result::Result::Error(e)), similarity: None },
     }
 }
 

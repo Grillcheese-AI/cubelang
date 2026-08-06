@@ -117,6 +117,73 @@ fn proto_stdio_wrong_role_recovers_mouse_not_cat() {
         "clean bind->unbind recovery should score well above chance/noise, got {:?}", res.similarity);
 }
 
+// ── Task 8 (Feature B, verify-before-execute) ───────────────────────────────
+//
+// `run-proto` now compiles the request FROM SOURCE with `compiler::
+// compile_strict`, not the loose `compiler::compile` -- so a `use`-ing
+// reasoning program (which can't serialize to `.cubebin` and so only ever
+// runs from source) gets the SAME strict verification `compile --strict`
+// already gave `.cube` files compiled to disk. These two tests are the
+// wire-level red/green pair for that swap: a program that only a strict
+// check rejects must now fail over the wire, and the real reasoning-bridge
+// shape must keep succeeding exactly as before.
+
+#[test]
+fn proto_stdio_strict_violation_returns_ok_false_with_strict_error() {
+    // Compiles cleanly under the old loose `compiler::compile` (implements
+    // present, `solve` provided, matching ISolve) -- `infer` is a normal
+    // statement there. Only `compile_strict`'s `strict_check_stmt` rejects
+    // it, since `infer` is a trace-only ext op (`is_trace_only_ext_op`) that
+    // never executes value-level semantics under the current VM. This is
+    // the same minimal shape `src/compiler.rs`'s own
+    // `strict_rejects_trace_only_infer` unit test uses.
+    let program = r#"
+program Test implements ISolve {
+    public function solve(input: str): void {
+        infer x;
+    }
+}
+"#;
+    let res = call_proto(RunRequest {
+        program: program.into(),
+        args: vec!["_".into()],
+        fn_name: "solve".into(),
+    });
+    assert!(!res.ok, "a strict-violating program must not succeed over run-proto");
+    match res.result {
+        Some(run_result::Result::Error(ref e)) => {
+            assert!(e.to_lowercase().contains("infer"),
+                "strict error should name the offending construct (infer): got {}", e);
+        }
+        other => panic!("expected Error(..) naming the strict violation, got {:?}", other),
+    }
+    // A compile-time failure happens before the VM ever runs -- there is no
+    // recover() call to have produced a similarity, and Task 8's fold-in
+    // fix (folded-in Minor from Task 7's review) makes this explicit for
+    // every non-ok RunResult, not just this one.
+    assert!(res.similarity.is_none(), "a compile-time failure must not carry a similarity");
+}
+
+#[test]
+fn proto_stdio_reasoning_bridge_solve_still_ok_under_strict_verification() {
+    // Companion to the strict-violation test above: strict verification must
+    // not break the real path. `reasoning_bridge_program()`'s `solve`
+    // mirrors `cubbyllm/bridges/programs/reasoning_bridge.cube` exactly and
+    // was confirmed clean under `compile_strict` by investigation before
+    // this task started; this proves it end to end over the actual wire,
+    // now that `run-proto` runs `compile_strict` on every request.
+    let res = call_proto(RunRequest {
+        program: reasoning_bridge_program().into(),
+        args: vec!["_".into()],
+        fn_name: "solve".into(),
+    });
+    assert!(res.ok, "reasoning_bridge's solve must still succeed under strict verification");
+    match res.result {
+        Some(run_result::Result::Symbol(ref s)) => assert_eq!(s, "cat"),
+        other => panic!("expected Symbol(\"cat\"), got {:?}", other),
+    }
+}
+
 #[test]
 fn proto_stdio_unbound_maps_to_unset_oneof_not_symbol_null() {
     let res = call_proto(RunRequest {
