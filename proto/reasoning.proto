@@ -13,4 +13,12 @@ message RunResult {
     string symbol = 2;   // the recovered symbol (similarity deferred, spec §8.1)
     string error = 3;
   }
+  // Task 7 (Feature A, similarity-surfacing): the cosine similarity of the
+  // winning `recover()`/UNBIND match, when there is one. Deliberately
+  // OUTSIDE the `result` oneof -- it's a side-channel confidence score for
+  // `symbol`, not an alternative to it, so `recover()`'s wire shape (a bare
+  // symbol) doesn't change. Proto3 `optional` (not implicit presence) so
+  // "no winning match" (unset) is distinguishable from "matched with
+  // similarity 0.0".
+  optional double similarity = 4;
 }

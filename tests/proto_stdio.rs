@@ -40,6 +40,19 @@ program R implements ISolve {
     let res = call_proto(RunRequest { program: program.into(), args: vec!["_".into()], fn_name: "solve".into() });
     assert!(res.ok);
     assert!(matches!(res.result, Some(run_result::Result::Symbol(ref s)) if s == "cat"));
+    // Task 7 (Feature A, similarity-surfacing): a clean single-pair
+    // bind->unbind recovery must surface a high-confidence similarity
+    // alongside the symbol, not just the symbol. Empirically ~0.52 here
+    // (deterministic: fixed codebook seed + fixed symbol names) -- a
+    // 2-pair MAP-Bipolar bundle's recovered-role cosine sim centers near
+    // 0.5 by construction (half the dims recover exactly, the other half
+    // are a coin flip from cross-talk), so 0.3 is the threshold that
+    // actually separates "real recovery" from noise: it's ~3x the <0.1
+    // near-orthogonal ceiling this repo's own hypervec.rs tests use, with
+    // real headroom below the observed value on the other side.
+    assert!(res.similarity.is_some(), "solve's clean recover() must surface Some(similarity)");
+    assert!(res.similarity.unwrap() > 0.3,
+        "clean bind->unbind recovery should score well above chance/noise, got {:?}", res.similarity);
 }
 
 // ── wrong_role / unbound over the wire ──────────────────────────────────────
@@ -95,6 +108,13 @@ fn proto_stdio_wrong_role_recovers_mouse_not_cat() {
         Some(run_result::Result::Symbol(ref s)) => assert_eq!(s, "mouse", "wrong-role control must recover a different filler than SUBJECT's"),
         other => panic!("expected Symbol(\"mouse\"), got {:?}", other),
     }
+    // Task 7: same as `solve` -- a real, clean recovery (just of the other
+    // role in the same frame) must also carry a similarity well clear of
+    // noise. Empirically ~0.486 here; see `solve`'s test above for why 0.3,
+    // not 0.5, is the right cutoff for a 2-pair bundle recovery.
+    assert!(res.similarity.is_some(), "wrong_role's clean recover() must surface Some(similarity)");
+    assert!(res.similarity.unwrap() > 0.3,
+        "clean bind->unbind recovery should score well above chance/noise, got {:?}", res.similarity);
 }
 
 #[test]
@@ -118,4 +138,8 @@ fn proto_stdio_unbound_maps_to_unset_oneof_not_symbol_null() {
             "unbound recover() must map to an UNSET oneof (Python None), got {:?}", other
         ),
     }
+    // Task 7: no winning match means no similarity either -- `similarity`
+    // must be unset (None) exactly when `symbol` is, not e.g. Some(0.0).
+    assert!(res.similarity.is_none(),
+        "unbound recover() must leave similarity unset too (no winning match), got {:?}", res.similarity);
 }

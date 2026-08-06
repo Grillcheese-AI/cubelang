@@ -483,6 +483,7 @@ fn cmd_run(args: &[String]) {
                     "program": prog_name,
                     "function": target_fn,
                     "result": value_to_json(&val),
+                    "similarity": vm.last_recover_similarity,
                 }));
             } else {
                 println!("  {}.{}() -> {}", prog_name, target_fn, val);
@@ -629,12 +630,13 @@ fn cmd_run_proto() {
 fn run_request_result(req: RunRequest) -> RunResult {
     let programs = match compiler::compile(&req.program) {
         Ok(p) => p,
-        Err(e) => return RunResult { ok: false, result: Some(run_result::Result::Error(e.to_string())) },
+        Err(e) => return RunResult { ok: false, result: Some(run_result::Result::Error(e.to_string())), similarity: None },
     };
     if programs.is_empty() {
         return RunResult {
             ok: false,
             result: Some(run_result::Result::Error("no programs in request".to_string())),
+            similarity: None,
         };
     }
 
@@ -642,9 +644,17 @@ fn run_request_result(req: RunRequest) -> RunResult {
     let prog_name = load_programs(&mut vm, programs);
     let call_args: Vec<Value> = req.args.into_iter().map(Value::Str).collect();
 
-    match call_with_constructor(&mut vm, &prog_name, &req.fn_name, call_args) {
+    let exec_result = call_with_constructor(&mut vm, &prog_name, &req.fn_name, call_args);
+    // Task 7 (Feature A, similarity-surfacing): read after the call, since
+    // it's VM state the call itself populates. "The last recover in this
+    // run" is well-defined here -- this function builds a fresh `VM::new()`
+    // per request (above) and the reasoning program does exactly one
+    // `recover` per function.
+    let similarity = vm.last_recover_similarity;
+
+    match exec_result {
         ExecResult::Ok(val) | ExecResult::Return(val) => {
-            RunResult { ok: true, result: value_to_run_result(&val) }
+            RunResult { ok: true, result: value_to_run_result(&val), similarity }
         }
         ExecResult::Suspend(susp) => {
             // RunResult has no wire shape for a suspension (no question /
@@ -657,9 +667,10 @@ fn run_request_result(req: RunRequest) -> RunResult {
                 result: Some(run_result::Result::Error(format!(
                     "suspended (not representable over run-proto): {}", susp.question
                 ))),
+                similarity,
             }
         }
-        ExecResult::Error(e) => RunResult { ok: false, result: Some(run_result::Result::Error(e)) },
+        ExecResult::Error(e) => RunResult { ok: false, result: Some(run_result::Result::Error(e)), similarity },
     }
 }
 

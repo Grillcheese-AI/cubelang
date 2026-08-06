@@ -11,7 +11,7 @@ fn run_request_and_result_roundtrip_through_prost() {
     assert_eq!(back.fn_name, "solve");
     assert_eq!(back.args, vec!["x".to_string()]);
 
-    let res = RunResult { ok: true, result: Some(run_result::Result::Symbol("cat".into())) };
+    let res = RunResult { ok: true, result: Some(run_result::Result::Symbol("cat".into())), similarity: None };
     let mut b2 = Vec::new();
     res.encode(&mut b2).unwrap();
     match RunResult::decode(&b2[..]).unwrap().result {

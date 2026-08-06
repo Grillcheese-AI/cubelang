@@ -172,6 +172,15 @@ pub struct VM {
     /// override/registry-impl resolution. See `vm::registry` for the
     /// deny-by-default access model and the override precedence rule.
     registry: crate::vm::registry::ModuleRegistry,
+    /// Task 7 (Feature A, similarity-surfacing): the cosine similarity of
+    /// the last winning `vsa_unbind_cleanup` match in this run -- i.e. the
+    /// confidence behind the most recent `recover()`/`UNBIND`. `None` means
+    /// either no recover has happened yet, or the last one found no match
+    /// (the unbound/absent-role case). "The last recover in this run" is a
+    /// safe, well-defined reading here because `run_request_result` builds
+    /// a fresh `VM::new()` per request and the reasoning program does
+    /// exactly one `recover` per function.
+    pub last_recover_similarity: Option<f64>,
 }
 
 /// Conservative recursion cap. exec_function has a sizeable per-frame
@@ -199,6 +208,7 @@ impl VM {
             resume_state: None,
             knowledge: crate::vm::knowledge::KnowledgeStore::new(),
             registry: crate::vm::registry::ModuleRegistry::new(),
+            last_recover_similarity: None,
         };
         // Task 3: pre-register every registry function name into the
         // hash-reversal table, regardless of which modules any given
@@ -1285,6 +1295,12 @@ impl VM {
     /// with that similarity. `None` if `reg` holds no hypervector. A high
     /// similarity means a real binding was present; near-zero means the role
     /// was not bound (the unbind yields quasi-orthogonal noise).
+    ///
+    /// Task 7 (Feature A, similarity-surfacing): also mirrors its own
+    /// winning similarity (or `None`) into `self.last_recover_similarity`.
+    /// This is the one chokepoint both `op::UNBIND` and the `vsa` registry
+    /// module's `recover()` funnel through, so neither call site needs its
+    /// own bookkeeping to make the score observable to callers upstream.
     pub fn vsa_unbind_cleanup(
         &mut self,
         reg: &str,
@@ -1293,7 +1309,10 @@ impl VM {
     ) -> Option<(String, f64)> {
         let bound = match self.registers.get(reg) {
             Some(Value::Hvec(h)) => h.clone(),
-            _ => return None,
+            _ => {
+                self.last_recover_similarity = None;
+                return None;
+            }
         };
         let rv = self.vsa_role_vec(role);
         let recovered = bound.unbind(&rv);
@@ -1306,6 +1325,7 @@ impl VM {
                 _ => best = Some((cand.to_string(), sim)),
             }
         }
+        self.last_recover_similarity = best.as_ref().map(|(_, sim)| *sim);
         best
     }
 
