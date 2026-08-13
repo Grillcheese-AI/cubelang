@@ -1,6 +1,7 @@
 //! CubeLang lexer — tokenizes `.cube` source into a token stream.
 
 use crate::token::{Token, TokenKind, Span};
+use crate::parser::ParseError;
 
 pub struct Lexer<'a> {
     source: &'a [u8],
@@ -14,15 +15,15 @@ impl<'a> Lexer<'a> {
         Self { source: source.as_bytes(), pos: 0, line: 1, col: 1 }
     }
 
-    pub fn tokenize(&mut self) -> Vec<Token> {
+    pub fn tokenize(&mut self) -> Result<Vec<Token>, ParseError> {
         let mut tokens = Vec::new();
         loop {
-            let tok = self.next_token();
+            let tok = self.next_token()?;
             let is_eof = tok.kind == TokenKind::Eof;
             tokens.push(tok);
             if is_eof { break; }
         }
-        tokens
+        Ok(tokens)
     }
 
     fn span(&self) -> Span {
@@ -67,7 +68,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn next_token(&mut self) -> Token {
+    fn next_token(&mut self) -> Result<Token, ParseError> {
         loop {
             self.skip_whitespace();
             if self.peek() == b'#' {
@@ -80,7 +81,7 @@ impl<'a> Lexer<'a> {
         let span = self.span();
 
         if self.pos >= self.source.len() {
-            return Token { kind: TokenKind::Eof, span };
+            return Ok(Token { kind: TokenKind::Eof, span });
         }
 
         let ch = self.peek();
@@ -88,7 +89,7 @@ impl<'a> Lexer<'a> {
         // Newline
         if ch == b'\n' {
             self.advance();
-            return Token { kind: TokenKind::Newline, span };
+            return Ok(Token { kind: TokenKind::Newline, span });
         }
 
         // String literal
@@ -98,26 +99,41 @@ impl<'a> Lexer<'a> {
 
         // Number literal
         if ch.is_ascii_digit() {
-            return self.lex_number(span);
+            return Ok(self.lex_number(span));
         }
 
         // @ annotations
         if ch == b'@' {
-            return self.lex_annotation(span);
+            return Ok(self.lex_annotation(span));
         }
 
         // Identifier or keyword
         if ch.is_ascii_alphabetic() || ch == b'_' {
-            return self.lex_ident(span);
+            return Ok(self.lex_ident(span));
         }
 
         // Punctuation and operators
-        self.lex_punct(span)
+        Ok(self.lex_punct(span))
     }
 
-    fn lex_string(&mut self, span: Span) -> Token {
+    /// Lexes a `"..."` string literal.
+    ///
+    /// Walks `source` byte-by-byte (as every other lexer routine does, so
+    /// span/offset arithmetic stays exact) but accumulates the literal's
+    /// *raw bytes* into `bytes` instead of reinterpreting each byte as its
+    /// own Latin-1 codepoint — a non-ASCII source character spans multiple
+    /// UTF-8 continuation bytes, and `byte as char` on a lone continuation
+    /// byte silently produces the wrong Unicode scalar (this was the actual
+    /// corruption: "Köln" round-tripped as "KÃ¶ln"). Both escape sequences
+    /// this lexer understands (`\n`, `\t`, `\\`, `\"`, `\$`) are ASCII, so
+    /// handling them at the byte level is unchanged in behavior. The whole
+    /// byte buffer is decoded once, here, at the end — covering both the
+    /// normal closing-quote break and the pre-existing lenient
+    /// unterminated-string break (EOF reached without a closing quote,
+    /// which this lexer has never treated as an error and still doesn't).
+    fn lex_string(&mut self, span: Span) -> Result<Token, ParseError> {
         self.advance(); // skip opening "
-        let mut s = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             if self.pos >= self.source.len() { break; }
             let ch = self.advance();
@@ -125,18 +141,22 @@ impl<'a> Lexer<'a> {
             if ch == b'\\' {
                 let esc = self.advance();
                 match esc {
-                    b'n' => s.push('\n'),
-                    b't' => s.push('\t'),
-                    b'\\' => s.push('\\'),
-                    b'"' => s.push('"'),
-                    b'$' => s.push('$'),
-                    _ => { s.push('\\'); s.push(esc as char); }
+                    b'n' => bytes.push(b'\n'),
+                    b't' => bytes.push(b'\t'),
+                    b'\\' => bytes.push(b'\\'),
+                    b'"' => bytes.push(b'"'),
+                    b'$' => bytes.push(b'$'),
+                    _ => { bytes.push(b'\\'); bytes.push(esc); }
                 }
             } else {
-                s.push(ch as char);
+                bytes.push(ch);
             }
         }
-        Token { kind: TokenKind::StringLit(s), span }
+        let s = String::from_utf8(bytes).map_err(|e| ParseError {
+            message: format!("invalid UTF-8 in string literal: {}", e),
+            span,
+        })?;
+        Ok(Token { kind: TokenKind::StringLit(s), span })
     }
 
     fn lex_number(&mut self, span: Span) -> Token {
@@ -549,14 +569,14 @@ mod tests {
 
     #[test]
     fn test_lex_empty() {
-        let tokens = Lexer::new("").tokenize();
+        let tokens = Lexer::new("").tokenize().unwrap();
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Eof);
     }
 
     #[test]
     fn test_lex_keywords() {
-        let tokens = Lexer::new("interface program container function").tokenize();
+        let tokens = Lexer::new("interface program container function").tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Interface);
         assert_eq!(tokens[1].kind, TokenKind::Program);
         assert_eq!(tokens[2].kind, TokenKind::Container);
@@ -565,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_lex_modifiers() {
-        let tokens = Lexer::new("public async mutable function").tokenize();
+        let tokens = Lexer::new("public async mutable function").tokenize().unwrap();
         assert!(tokens[0].kind.is_modifier());
         assert!(tokens[1].kind.is_modifier());
         assert!(tokens[2].kind.is_modifier());
@@ -574,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_lex_permissions() {
-        let tokens = Lexer::new("@external @internal @system @once").tokenize();
+        let tokens = Lexer::new("@external @internal @system @once").tokenize().unwrap();
         assert!(tokens[0].kind.is_permission());
         assert!(tokens[1].kind.is_permission());
         assert!(tokens[2].kind.is_permission());
@@ -583,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_lex_opcodes() {
-        let tokens = Lexer::new("create assign add sub mul div sum push pop query remember").tokenize();
+        let tokens = Lexer::new("create assign add sub mul div sum push pop query remember").tokenize().unwrap();
         for tok in &tokens[..11] {
             assert!(tok.kind.is_opcode(), "expected opcode, got {:?}", tok.kind);
         }
@@ -591,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_lex_types() {
-        let tokens = Lexer::new("u8 u64 f32 str vec emb ctx rag mdx agent").tokenize();
+        let tokens = Lexer::new("u8 u64 f32 str vec emb ctx rag mdx agent").tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::TyU8);
         assert_eq!(tokens[1].kind, TokenKind::TyU64);
         assert_eq!(tokens[2].kind, TokenKind::TyF32);
@@ -606,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_lex_literals() {
-        let tokens = Lexer::new(r#"42 3.14 "hello" true false null"#).tokenize();
+        let tokens = Lexer::new(r#"42 3.14 "hello" true false null"#).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::IntLit(42));
         assert_eq!(tokens[1].kind, TokenKind::FloatLit(3.14));
         assert_eq!(tokens[2].kind, TokenKind::StringLit("hello".into()));
@@ -616,8 +636,21 @@ mod tests {
     }
 
     #[test]
+    fn test_lex_string_literal_utf8_roundtrip() {
+        // Regression test for the byte-as-char corruption bug: a string
+        // literal containing multi-byte UTF-8 characters must come back
+        // out of the lexer byte-for-byte identical to what went in, not
+        // reinterpreted one raw byte at a time as Latin-1.
+        let src = r#""Köln" "naïve" "東京""#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::StringLit("Köln".into()));
+        assert_eq!(tokens[1].kind, TokenKind::StringLit("naïve".into()));
+        assert_eq!(tokens[2].kind, TokenKind::StringLit("東京".into()));
+    }
+
+    #[test]
     fn test_lex_operators() {
-        let tokens = Lexer::new("= == != -> => <= >= += -=").tokenize();
+        let tokens = Lexer::new("= == != -> => <= >= += -=").tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Eq);
         assert_eq!(tokens[1].kind, TokenKind::EqEq);
         assert_eq!(tokens[2].kind, TokenKind::NotEq);
@@ -631,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_lex_comments_skipped() {
-        let tokens = Lexer::new("let x # this is a comment\nlet y").tokenize();
+        let tokens = Lexer::new("let x # this is a comment\nlet y").tokenize().unwrap();
         // Should get: let, x, newline, let, y, eof
         assert_eq!(tokens[0].kind, TokenKind::Let);
         assert_eq!(tokens[1].kind, TokenKind::Ident("x".into()));
@@ -640,7 +673,7 @@ mod tests {
     #[test]
     fn test_lex_program_header() {
         let src = "program GSM8K implements ISolver, IDeployable {";
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Program);
         assert_eq!(tokens[1].kind, TokenKind::Ident("GSM8K".into()));
         assert_eq!(tokens[2].kind, TokenKind::Implements);
@@ -653,7 +686,7 @@ mod tests {
     #[test]
     fn test_lex_function_decl() {
         let src = "@external public async function solve(input: Input): Output {";
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::AtExternal);
         assert_eq!(tokens[1].kind, TokenKind::Public);
         assert_eq!(tokens[2].kind, TokenKind::Async);
@@ -672,7 +705,7 @@ mod tests {
     #[test]
     fn test_lex_container_declaration() {
         let src = "container MathLab implements IOrchestrator, IDeployable {";
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Container);
         assert_eq!(tokens[1].kind, TokenKind::Ident("MathLab".into()));
         assert_eq!(tokens[2].kind, TokenKind::Implements);
@@ -681,7 +714,7 @@ mod tests {
     #[test]
     fn test_lex_world_extends() {
         let src = "world MathClassroom extends Container implements IDeployable {";
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::WorldKw);
         assert_eq!(tokens[1].kind, TokenKind::Ident("MathClassroom".into()));
         assert_eq!(tokens[2].kind, TokenKind::Extends);
@@ -692,7 +725,7 @@ mod tests {
     #[test]
     fn test_lex_opcode_statement() {
         let src = "create x : number;\nassign x = 16;\nadd x, 3;";
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::OpCreate);
         assert_eq!(tokens[1].kind, TokenKind::Ident("x".into()));
         assert_eq!(tokens[2].kind, TokenKind::Colon);
@@ -703,7 +736,7 @@ mod tests {
     #[test]
     fn test_lex_generic_type() {
         let src = "map<str, f64>";
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::TyMap);
         assert_eq!(tokens[1].kind, TokenKind::LAngle);
         assert_eq!(tokens[2].kind, TokenKind::TyStr);
@@ -714,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_lex_error_handling() {
-        let tokens = Lexer::new("try catch finally assert").tokenize();
+        let tokens = Lexer::new("try catch finally assert").tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Try);
         assert_eq!(tokens[1].kind, TokenKind::Catch);
         assert_eq!(tokens[2].kind, TokenKind::Finally);
@@ -723,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_lex_acid_keywords() {
-        let tokens = Lexer::new("atomic rollback commit").tokenize();
+        let tokens = Lexer::new("atomic rollback commit").tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Atomic);
         assert_eq!(tokens[1].kind, TokenKind::Rollback);
         assert_eq!(tokens[2].kind, TokenKind::Commit);
@@ -737,7 +770,7 @@ mod tests {
         // is lowercase), and a comma-separated operand list mixes bareword
         // idents with a quoted string literal.
         let src = r#"asm { BIND_ROLE frame, SUBJECT, "cat"; UNBIND frame, SUBJECT }"#;
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::AsmKw);
         assert_eq!(tokens[1].kind, TokenKind::LBrace);
         assert_eq!(tokens[2].kind, TokenKind::Ident("BIND_ROLE".into()));
@@ -752,7 +785,7 @@ mod tests {
     fn test_lex_use_and_override() {
         // Task 3: `use <module>;` (top-level) and a postfix `override` marker
         // on a function signature both need real tokens.
-        let tokens = Lexer::new("use demo; function greet() override {").tokenize();
+        let tokens = Lexer::new("use demo; function greet() override {").tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Use);
         assert_eq!(tokens[1].kind, TokenKind::Ident("demo".into()));
         assert_eq!(tokens[2].kind, TokenKind::Semicolon);
@@ -771,7 +804,7 @@ mod tests {
             sub x, 4;
             commit;
         }"#;
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Atomic);
         assert_eq!(tokens[1].kind, TokenKind::LBrace);
     }
@@ -779,7 +812,7 @@ mod tests {
     #[test]
     fn test_lex_try_catch() {
         let src = r#"try { solve(input); } catch (e) { rollback; }"#;
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Try);
         assert_eq!(tokens[1].kind, TokenKind::LBrace);
     }
@@ -787,7 +820,7 @@ mod tests {
     #[test]
     fn test_lex_assert() {
         let src = r#"assert output.result == 18, "wrong answer";"#;
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         assert_eq!(tokens[0].kind, TokenKind::Assert);
         assert_eq!(tokens[1].kind, TokenKind::Ident("output".into()));
         assert_eq!(tokens[2].kind, TokenKind::Dot);
@@ -820,7 +853,7 @@ mod tests {
                 }
             }
         "#;
-        let tokens = Lexer::new(src).tokenize();
+        let tokens = Lexer::new(src).tokenize().unwrap();
         // Should tokenize without errors — just check it doesn't panic
         // and has reasonable token count
         let non_newline: Vec<_> = tokens.iter()

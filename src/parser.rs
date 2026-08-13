@@ -1997,7 +1997,7 @@ fn is_role_bareword(name: &str) -> bool {
 // ── Public parse function ───────────────────────────────────────────────────
 
 pub fn parse(source: &str) -> PResult<SourceFile> {
-    let tokens = crate::lexer::Lexer::new(source).tokenize();
+    let tokens = crate::lexer::Lexer::new(source).tokenize()?;
     let mut parser = Parser::new(tokens);
     parser.parse()
 }
