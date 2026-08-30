@@ -4,7 +4,7 @@ use prost::Message;
 
 #[test]
 fn run_request_and_result_roundtrip_through_prost() {
-    let req = RunRequest { program: "program P {}".into(), args: vec!["x".into()], fn_name: "solve".into() };
+    let req = RunRequest { program: "program P {}".into(), args: vec!["x".into()], fn_name: "solve".into(), answers: vec![] };
     let mut buf = Vec::new();
     req.encode(&mut buf).unwrap();
     let back = RunRequest::decode(&buf[..]).unwrap();

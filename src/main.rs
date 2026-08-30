@@ -687,7 +687,47 @@ fn run_request_result(req: RunRequest) -> RunResult {
     let prog_name = load_programs(&mut vm, programs);
     let call_args: Vec<Value> = req.args.into_iter().map(Value::Str).collect();
 
-    let exec_result = call_with_constructor(&mut vm, &prog_name, &req.fn_name, call_args);
+    let mut exec_result = call_with_constructor(&mut vm, &prog_name, &req.fn_name, call_args);
+
+    // ASK/resume over the one-shot transport (2026-08-30): the request may
+    // carry answers to the program's ASKs, in order. Each is a JSON-encoded
+    // Value; `VM::resume` keeps its guarantee (the answer must be one of the
+    // candidates that ASK offered) -- an invented answer is an error here
+    // exactly as it is in-process. Out of answers with the program still
+    // asking => report the suspension, never a fake Symbol.
+    let mut answers = req.answers.into_iter();
+    while let ExecResult::Suspend(susp) = exec_result {
+        match answers.next() {
+            None => {
+                let suspended = cubelang::reasoning::Suspended {
+                    question: value_to_json(&susp.question).to_string(),
+                    candidates: susp.candidates.iter().map(|c| value_to_json(c).to_string()).collect(),
+                    program: susp.program.clone(),
+                    function: susp.function.clone(),
+                };
+                return RunResult { ok: true, result: Some(run_result::Result::Suspended(suspended)), similarity: None };
+            }
+            Some(raw) => {
+                let parsed = match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(j) => j,
+                    Err(e) => return RunResult {
+                        ok: false,
+                        result: Some(run_result::Result::Error(format!("resume: answer is not JSON ({}): {}", raw, e))),
+                        similarity: None,
+                    },
+                };
+                let answer = match json_to_value(&parsed) {
+                    Ok(v) => v,
+                    Err(e) => return RunResult {
+                        ok: false,
+                        result: Some(run_result::Result::Error(format!("resume: bad answer {}: {}", raw, e))),
+                        similarity: None,
+                    },
+                };
+                exec_result = vm.resume(susp, answer);
+            }
+        }
+    }
     // Task 7 (Feature A, similarity-surfacing): read after the call, since
     // it's VM state the call itself populates. "The last recover in this
     // run" is well-defined here -- this function builds a fresh `VM::new()`
@@ -708,17 +748,14 @@ fn run_request_result(req: RunRequest) -> RunResult {
         // returns above already hardcode `similarity: None`; this makes
         // every non-ok `RunResult` agree, protecting whatever future
         // non-Python wire consumer reads this next.
-        ExecResult::Suspend(susp) => {
-            // RunResult has no wire shape for a suspension (no question /
-            // candidates fields -- only Symbol/Error). None of the
-            // reasoning-bridge programs this transport serves today ASK, so
-            // rather than silently misrepresenting a suspend as some Symbol,
-            // report it honestly as an error.
+        ExecResult::Suspend(_) => {
+            // Unreachable: the answers loop above returns `Suspended` (or
+            // resumes) for every Suspend before this match runs. Kept as an
+            // honest arm rather than an `unreachable!()` so a future refactor
+            // that bypasses the loop still reports rather than panics.
             RunResult {
                 ok: false,
-                result: Some(run_result::Result::Error(format!(
-                    "suspended (not representable over run-proto): {}", susp.question
-                ))),
+                result: Some(run_result::Result::Error("suspended after the answers loop (internal)".to_string())),
                 similarity: None,
             }
         }
@@ -761,6 +798,32 @@ fn value_to_json(v: &cubelang::vm::Value) -> serde_json::Value {
         ),
         Value::Hvec(h) => serde_json::json!({ "hvec_dim": h.dim() }),
     }
+}
+
+/// The inverse of `value_to_json` for ASK answers arriving over the wire
+/// (`RunRequest.answers`). Ints stay ints (a `1969` must equal the
+/// `Value::Int(1969)` candidate under `resume`'s structural check), floats
+/// stay floats, and objects become `Value::Map` so a QUERY chunk handed back
+/// verbatim still matches. Hypervectors have no JSON form and cannot be a
+/// selection anyway.
+fn json_to_value(j: &serde_json::Value) -> Result<Value, String> {
+    Ok(match j {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { Value::Int(i) }
+            else if let Some(f) = n.as_f64() { Value::Float(f) }
+            else { return Err(format!("unrepresentable number {}", n)); }
+        }
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(a) => Value::Array(a.iter().map(json_to_value).collect::<Result<Vec<_>, _>>()?),
+        serde_json::Value::Object(m) => {
+            if m.contains_key("hvec_dim") { return Err("a hypervector is not a selection".to_string()); }
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in m { out.insert(k.clone(), json_to_value(v)?); }
+            Value::Map(out)
+        }
+    })
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

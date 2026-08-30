@@ -1860,6 +1860,12 @@ fn type_name(ty: &TypeExpr) -> String {
 /// blocklist (P0-1) uses this; it is also the authoritative list for the
 /// `validate` subcommand (P0-3). The list mirrors `trace_structural` in
 /// `src/vm/engine.rs` — keep in sync as P2 opcodes start executing.
+///
+/// `ExtOp::Ask` left this list on 2026-08-30: ASK executes — it returns
+/// `ExecResult::Suspend` and `VM::resume` continues past it (see
+/// `tests/ask_suspend.rs`, `examples/ask_min.cube`), so calling it
+/// "non-executing" was stale and made every asking program fail
+/// verify-before-execute over `run-proto` and `run --strict`.
 pub fn is_trace_only_ext_op(o: ExtOp) -> bool {
     matches!(o,
         ExtOp::Infer | ExtOp::MapRoles | ExtOp::Filter | ExtOp::Score
@@ -1868,7 +1874,7 @@ pub fn is_trace_only_ext_op(o: ExtOp) -> bool {
         | ExtOp::Diff | ExtOp::Seq | ExtOp::Specialize | ExtOp::Reward
         | ExtOp::Match | ExtOp::TemporalBind | ExtOp::Analogy | ExtOp::Gen
         | ExtOp::Inst | ExtOp::Broadcast | ExtOp::Explore | ExtOp::Forge
-        | ExtOp::Ask | ExtOp::Sync
+        | ExtOp::Sync
     )
 }
 
@@ -2360,6 +2366,32 @@ mod tests {
         "#;
         let err = compile_strict(source).expect_err("infer must be rejected in --strict");
         assert!(err.to_lowercase().contains("infer"));
+    }
+
+    #[test]
+    fn strict_accepts_ask_now_that_it_suspends_and_resumes() {
+        // 2026-08-30: `ask` is the third execution outcome (Suspend/resume),
+        // not a trace-only stub -- examples/ask_min.cube must pass
+        // verify-before-execute, or ASK can never reach the bridge.
+        let source = r#"
+            program AskMin implements ISolve {
+                public function solve(input: str): number {
+                    create luna : number;
+                    assign luna = 1959;
+                    create apollo : number;
+                    assign apollo = 1969;
+                    ask "which moon landing did you mean", luna, apollo;
+                    create chosen : number;
+                    pop chosen;
+                    sum chosen;
+                    return chosen;
+                }
+            }
+        "#;
+        let programs = compile_strict(source).expect("ask must compile under --strict");
+        assert_eq!(programs.len(), 1);
+        assert!(programs[0].functions[0].bytecode.contains(&op::ASK));
+        assert!(!is_trace_only_ext_op(ExtOp::Ask));
     }
 
     #[test]

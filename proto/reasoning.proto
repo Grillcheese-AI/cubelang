@@ -5,6 +5,27 @@ message RunRequest {
   string program = 1;   // CubeLang source (source on the wire, not bytecode)
   repeated string args = 2;
   string fn_name = 3;    // 'fn' is a Rust keyword; field is fn_name
+  // ASK/resume over a one-shot transport (2026-08-30): answers to the
+  // program's ASKs, in order, each a JSON-encoded Value (the same shape
+  // `Suspended.candidates` carries back). `run-proto` re-executes the
+  // program from scratch and, at each ASK, consumes the next answer via
+  // `VM::resume` -- which still rejects any answer that is not one of the
+  // candidates that ASK offered. Deterministic programs reach the same ASK,
+  // so no VM state ever crosses the wire. Empty => the first ASK suspends
+  // and is reported as `RunResult.suspended`.
+  repeated string answers = 4;
+}
+
+// The third outcome. Neither a result nor an error: the program grounded
+// several candidates and only the caller (the model, never a person) can
+// choose. `question` and `candidates` are JSON-encoded Values (value_to_json
+// shape); the caller re-sends the request with the chosen candidate JSON
+// appended to `RunRequest.answers`.
+message Suspended {
+  string question = 1;
+  repeated string candidates = 2;
+  string program = 3;
+  string function = 4;
 }
 
 message RunResult {
@@ -12,6 +33,7 @@ message RunResult {
   oneof result {
     string symbol = 2;   // the recovered symbol (similarity deferred, spec §8.1)
     string error = 3;
+    Suspended suspended = 5;   // ok=true: nothing failed, the program is asking
   }
   // Task 7 (Feature A, similarity-surfacing): the cosine similarity of the
   // winning `recover()`/UNBIND match, when there is one. Deliberately

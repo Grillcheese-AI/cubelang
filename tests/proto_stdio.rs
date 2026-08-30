@@ -37,7 +37,7 @@ program R implements ISolve {
     }
 }
 "#;
-    let res = call_proto(RunRequest { program: program.into(), args: vec!["_".into()], fn_name: "solve".into() });
+    let res = call_proto(RunRequest { program: program.into(), args: vec!["_".into()], fn_name: "solve".into(), answers: vec![] });
     assert!(res.ok);
     assert!(matches!(res.result, Some(run_result::Result::Symbol(ref s)) if s == "cat"));
     // Task 7 (Feature A, similarity-surfacing): a clean single-pair
@@ -102,6 +102,7 @@ fn proto_stdio_wrong_role_recovers_mouse_not_cat() {
         program: reasoning_bridge_program().into(),
         args: vec![],
         fn_name: "wrong_role".into(),
+        answers: vec![],
     });
     assert!(res.ok, "wrong_role must succeed (ok:true)");
     match res.result {
@@ -148,6 +149,7 @@ program Test implements ISolve {
         program: program.into(),
         args: vec!["_".into()],
         fn_name: "solve".into(),
+        answers: vec![],
     });
     assert!(!res.ok, "a strict-violating program must not succeed over run-proto");
     match res.result {
@@ -176,6 +178,7 @@ fn proto_stdio_reasoning_bridge_solve_still_ok_under_strict_verification() {
         program: reasoning_bridge_program().into(),
         args: vec!["_".into()],
         fn_name: "solve".into(),
+        answers: vec![],
     });
     assert!(res.ok, "reasoning_bridge's solve must still succeed under strict verification");
     match res.result {
@@ -190,6 +193,7 @@ fn proto_stdio_unbound_maps_to_unset_oneof_not_symbol_null() {
         program: reasoning_bridge_program().into(),
         args: vec![],
         fn_name: "unbound".into(),
+        answers: vec![],
     });
     // recover() legitimately finding no bound filler is a successful run,
     // not an error -- matches M1's JSON path, which reports ok:true with

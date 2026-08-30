@@ -96,6 +96,22 @@ impl InterfaceRegistry {
                 InterfaceFn { name: "learn".to_string(), arity: 3 },
             ],
         });
+        // `IAgent` (2026-08-30): the SPEC's conversational/autonomous-agent
+        // contract (docs/SPEC.md "Agent (autonomous behavior)"), seeded here so
+        // `implements IAgent` is a CHECKED contract like the three above rather
+        // than decoration. The spec's `plan` and `reflect` are `optional`, and
+        // the registry has no optional-member concept (see `InterfaceFn`), so
+        // only the three abstract members are required: `think(input, ctx)`,
+        // `act(decision, ctx)`, `observe(result, ctx)`. Chat turns are MEDIATED
+        // by such a program (state, risk, verify in the VM; the words come from
+        // the model through `think`'s ASK), never emitted as one.
+        interfaces.insert("IAgent".to_string(), Interface {
+            members: vec![
+                InterfaceFn { name: "think".to_string(), arity: 2 },
+                InterfaceFn { name: "act".to_string(), arity: 2 },
+                InterfaceFn { name: "observe".to_string(), arity: 2 },
+            ],
+        });
         Self { interfaces }
     }
 
@@ -154,5 +170,16 @@ mod tests {
         // and conversation_agent.cube used to carry, the registry has no
         // optional-member concept -- learn is REQUIRED here, arity 3.
         assert_eq!(members.iter().find(|m| m.name == "learn").unwrap().arity, 3);
+    }
+
+    #[test]
+    fn iagent_requires_think_act_observe_arity_2_and_nothing_optional() {
+        let reg = InterfaceRegistry::new();
+        let members = reg.get("IAgent").expect("IAgent must be seeded");
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["think", "act", "observe"]);
+        assert!(members.iter().all(|m| m.arity == 2), "every IAgent member takes (x, ctx)");
+        // the SPEC's `plan` / `reflect` are optional there and therefore absent here
+        assert!(members.iter().all(|m| m.name != "plan" && m.name != "reflect"));
     }
 }
