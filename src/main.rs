@@ -615,42 +615,104 @@ fn cmd_run(args: &[String]) {
 /// `--json` output -- this is a fully separate entry point that happens to
 /// reuse the same program-loading/call helpers (`load_programs`,
 /// `call_with_constructor`) `cmd_run` itself now uses.
+/// `run-proto`: length-prefixed `RunRequest`s on stdin, length-prefixed
+/// `RunResult`s on stdout, ONE PER REQUEST, UNTIL STDIN CLOSES.
+///
+/// Resident since 2026-09-11. Before, the process answered exactly one
+/// request and exited, so a client that needed N answers spawned N
+/// processes -- and on CubbyLLM's plan-disposer harvest the 181 spawns for
+/// 181 membership questions cost more wall time than the 161 walks they
+/// prevented (exp_m3 lookup_vp: 59.4 -> 65.7 ms/question). Now the client
+/// keeps the pipe open and streams requests; each still runs on a FRESH
+/// `VM::new()` (see `run_request_result`), so nothing about determinism or
+/// verify-before-execute changes -- only the process boundary is amortized.
+///
+/// The one-shot shape still works unchanged: a client that writes one
+/// request and closes stdin (`subprocess.run(input=...)`, the Rust tests'
+/// `drop(stdin)`) gets one result, then the loop reads EOF and exits 0. A
+/// TRUNCATED frame (EOF inside a length or body) is still an error: it
+/// means the client died mid-write, not that it finished.
 fn cmd_run_proto() {
-    let mut len_buf = [0u8; 4];
-    if let Err(e) = std::io::stdin().read_exact(&mut len_buf) {
-        eprintln!("error: cannot read RunRequest length from stdin: {}", e);
-        process::exit(1);
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut req_buf = vec![0u8; len];
-    if let Err(e) = std::io::stdin().read_exact(&mut req_buf) {
-        eprintln!("error: cannot read RunRequest body from stdin: {}", e);
-        process::exit(1);
-    }
-
-    let req = match RunRequest::decode(&req_buf[..]) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: cannot decode RunRequest: {}", e);
-            process::exit(1);
-        }
-    };
-
-    let result = run_request_result(req);
-
-    let mut out_buf = Vec::new();
-    // `Message::encode` into a `Vec<u8>` only fails on a writer error; a
-    // `Vec` never fails to grow, so this can't actually happen in practice --
-    // the `expect` documents that instead of threading a dead error path
-    // through the rest of the function.
-    result.encode(&mut out_buf).expect("encoding RunResult into a Vec cannot fail");
-
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let _ = out.write_all(&(out_buf.len() as u32).to_be_bytes());
-    let _ = out.write_all(&out_buf);
-    let _ = out.flush();
+    loop {
+        let mut len_buf = [0u8; 4];
+        match input.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            // clean EOF at a frame boundary: the client is done
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                eprintln!("error: cannot read RunRequest length from stdin: {}", e);
+                process::exit(1);
+            }
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut req_buf = vec![0u8; len];
+        if let Err(e) = input.read_exact(&mut req_buf) {
+            eprintln!("error: cannot read RunRequest body from stdin: {}", e);
+            process::exit(1);
+        }
+
+        let req = match RunRequest::decode(&req_buf[..]) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: cannot decode RunRequest: {}", e);
+                process::exit(1);
+            }
+        };
+
+        let result = run_request_result(req);
+
+        let mut out_buf = Vec::new();
+        // `Message::encode` into a `Vec<u8>` only fails on a writer error; a
+        // `Vec` never fails to grow, so this can't actually happen in practice --
+        // the `expect` documents that instead of threading a dead error path
+        // through the rest of the function.
+        result.encode(&mut out_buf).expect("encoding RunResult into a Vec cannot fail");
+
+        let _ = out.write_all(&(out_buf.len() as u32).to_be_bytes());
+        let _ = out.write_all(&out_buf);
+        let _ = out.flush();
+    }
+}
+
+/// The resident process's knowledge cache: path -> (mtime, parsed store).
+/// A request naming a `knowledge_path` gets a CLONE of the parsed store on
+/// its fresh VM; the file is re-read only when its mtime moves. Keyed by
+/// the path string as sent, so two spellings of one file parse twice --
+/// harmless, and simpler than canonicalizing on a platform where that can
+/// fail.
+thread_local! {
+    static KNOWLEDGE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, (Option<std::time::SystemTime>, cubelang::vm::knowledge::KnowledgeStore)>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Load `path` into `vm.knowledge` (through the cache). A missing or
+/// malformed file is an ERROR, never an empty store: silently grounding
+/// against nothing is the confabulation-shaped failure `knowledge.rs` exists
+/// to prevent, and the client asked for this file by name.
+fn load_knowledge_cached(vm: &mut VM, path: &str) -> Result<(), String> {
+    let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    let hit = KNOWLEDGE_CACHE.with(|c| {
+        c.borrow().get(path).and_then(|(m, store)| if *m == mtime { Some(store.clone()) } else { None })
+    });
+    let store = match hit {
+        Some(s) => s,
+        None => {
+            let data = std::fs::read_to_string(path)
+                .map_err(|e| format!("knowledge_path {}: cannot read: {}", path, e))?;
+            let mut fresh = cubelang::vm::knowledge::KnowledgeStore::new();
+            fresh.load_jsonl(&data).map_err(|e| format!("knowledge_path {}: {}", path, e))?;
+            KNOWLEDGE_CACHE.with(|c| { c.borrow_mut().insert(path.to_string(), (mtime, fresh.clone())); });
+            fresh
+        }
+    };
+    vm.knowledge = store;
+    Ok(())
 }
 
 /// Compile `req.program` FROM SOURCE (`compiler::compile_strict`, the
@@ -684,6 +746,11 @@ fn run_request_result(req: RunRequest) -> RunResult {
     }
 
     let mut vm = VM::new();
+    if !req.knowledge_path.is_empty() {
+        if let Err(e) = load_knowledge_cached(&mut vm, &req.knowledge_path) {
+            return RunResult { ok: false, result: Some(run_result::Result::Error(e)), similarity: None };
+        }
+    }
     let prog_name = load_programs(&mut vm, programs);
     let call_args: Vec<Value> = req.args.into_iter().map(Value::Str).collect();
 

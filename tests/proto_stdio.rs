@@ -37,7 +37,7 @@ program R implements ISolve {
     }
 }
 "#;
-    let res = call_proto(RunRequest { program: program.into(), args: vec!["_".into()], fn_name: "solve".into(), answers: vec![] });
+    let res = call_proto(RunRequest { program: program.into(), args: vec!["_".into()], fn_name: "solve".into(), answers: vec![], ..Default::default() });
     assert!(res.ok);
     assert!(matches!(res.result, Some(run_result::Result::Symbol(ref s)) if s == "cat"));
     // Task 7 (Feature A, similarity-surfacing): a clean single-pair
@@ -102,8 +102,7 @@ fn proto_stdio_wrong_role_recovers_mouse_not_cat() {
         program: reasoning_bridge_program().into(),
         args: vec![],
         fn_name: "wrong_role".into(),
-        answers: vec![],
-    });
+        answers: vec![], ..Default::default() });
     assert!(res.ok, "wrong_role must succeed (ok:true)");
     match res.result {
         Some(run_result::Result::Symbol(ref s)) => assert_eq!(s, "mouse", "wrong-role control must recover a different filler than SUBJECT's"),
@@ -149,8 +148,7 @@ program Test implements ISolve {
         program: program.into(),
         args: vec!["_".into()],
         fn_name: "solve".into(),
-        answers: vec![],
-    });
+        answers: vec![], ..Default::default() });
     assert!(!res.ok, "a strict-violating program must not succeed over run-proto");
     match res.result {
         Some(run_result::Result::Error(ref e)) => {
@@ -178,8 +176,7 @@ fn proto_stdio_reasoning_bridge_solve_still_ok_under_strict_verification() {
         program: reasoning_bridge_program().into(),
         args: vec!["_".into()],
         fn_name: "solve".into(),
-        answers: vec![],
-    });
+        answers: vec![], ..Default::default() });
     assert!(res.ok, "reasoning_bridge's solve must still succeed under strict verification");
     match res.result {
         Some(run_result::Result::Symbol(ref s)) => assert_eq!(s, "cat"),
@@ -193,8 +190,7 @@ fn proto_stdio_unbound_maps_to_unset_oneof_not_symbol_null() {
         program: reasoning_bridge_program().into(),
         args: vec![],
         fn_name: "unbound".into(),
-        answers: vec![],
-    });
+        answers: vec![], ..Default::default() });
     // recover() legitimately finding no bound filler is a successful run,
     // not an error -- matches M1's JSON path, which reports ok:true with
     // result:null for this same program/fn.
@@ -213,4 +209,127 @@ fn proto_stdio_unbound_maps_to_unset_oneof_not_symbol_null() {
     // must be unset (None) exactly when `symbol` is, not e.g. Some(0.0).
     assert!(res.similarity.is_none(),
         "unbound recover() must leave similarity unset too (no winning match), got {:?}", res.similarity);
+}
+
+
+// ── resident process + knowledge_path (2026-09-11) ─────────────────────────
+//
+// `run-proto` now serves until stdin closes. One spawn, N requests, N
+// results, in order -- the shape CubbyLLM's `CubelangSession` relies on.
+// Each request still runs on a fresh VM, so results must be independent of
+// order: the same program asked three times must answer the same three
+// times, and a request carrying `knowledge_path` must ground QUERY against
+// that file while a request without it must abstain.
+
+fn call_proto_many(reqs: Vec<RunRequest>) -> Vec<RunResult> {
+    let exe = env!("CARGO_BIN_EXE_cubelang");
+    let mut child = Command::new(exe).arg("run-proto")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let n = reqs.len();
+    let mut stdin = child.stdin.take().unwrap();
+    for req in reqs {
+        let mut buf = Vec::new(); req.encode(&mut buf).unwrap();
+        stdin.write_all(&(buf.len() as u32).to_be_bytes()).unwrap();
+        stdin.write_all(&buf).unwrap();
+        stdin.flush().unwrap();
+    }
+    drop(stdin);
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "run-proto must exit 0 after a clean EOF, got {:?}", status);
+    let mut results = Vec::new();
+    let mut at = 0usize;
+    while at < out.len() {
+        let len = u32::from_be_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+        results.push(RunResult::decode(&out[at + 4..at + 4 + len]).unwrap());
+        at += 4 + len;
+    }
+    assert_eq!(results.len(), n, "one RunResult per RunRequest, in order");
+    results
+}
+
+const GROUND_PROGRAM: &str = r#"
+program Ground implements ISolve {
+    @external
+    public function solve(mention: str): number {
+        query mention;
+        create ctx : number;
+        pop ctx;
+        let n = ctx.len();
+        create outcome : number;
+        assign outcome = 0;
+        if (n == 0) { assign outcome = 0; } else { assign outcome = 1; }
+        return outcome;
+    }
+}
+"#;
+
+fn symbol_of(r: &RunResult) -> String {
+    match &r.result {
+        Some(run_result::Result::Symbol(s)) => s.clone(),
+        other => panic!("expected Symbol, got {:?}", other),
+    }
+}
+
+#[test]
+fn proto_stdio_serves_many_requests_on_one_process() {
+    let program = r#"
+use vsa;
+program R implements ISolve {
+    public function solve(input: str): str {
+        create frame: number;
+        bind frame, SUBJECT, "cat";
+        bind frame, OBJECT, "mouse";
+        return recover(frame, SUBJECT);
+    }
+    public function other(): str {
+        create frame: number;
+        bind frame, SUBJECT, "cat";
+        bind frame, OBJECT, "mouse";
+        return recover(frame, OBJECT);
+    }
+}
+"#;
+    let mk = |f: &str| RunRequest { program: program.into(), args: vec!["_".into()], fn_name: f.into(), ..Default::default() };
+    let res = call_proto_many(vec![mk("solve"), mk("other"), mk("solve")]);
+    assert!(res.iter().all(|r| r.ok));
+    assert_eq!(symbol_of(&res[0]), "cat");
+    assert_eq!(symbol_of(&res[1]), "mouse");
+    assert_eq!(symbol_of(&res[2]), "cat");
+}
+
+#[test]
+fn proto_stdio_knowledge_path_grounds_query_per_request() {
+    let dir = std::env::temp_dir().join(format!("cubelang_kp_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("vocab.jsonl");
+    std::fs::write(&path, concat!(
+        r#"{"key":"capital","text":"capital","source":"store"}"#, "\n",
+        r#"{"key":"country of citizenship","text":"country of citizenship","source":"store"}"#, "\n",
+    )).unwrap();
+    let kp = path.to_string_lossy().to_string();
+    let with = |arg: &str| RunRequest { program: GROUND_PROGRAM.into(), args: vec![arg.into()], fn_name: "solve".into(),
+                                         knowledge_path: kp.clone(), ..Default::default() };
+    let without = |arg: &str| RunRequest { program: GROUND_PROGRAM.into(), args: vec![arg.into()], fn_name: "solve".into(),
+                                            ..Default::default() };
+    let res = call_proto_many(vec![
+        with("capital"),                                      // known         -> 1
+        with("award received by the director of photography"),// unknown      -> 0
+        without("capital"),                                   // no knowledge  -> 0 (abstains)
+        with("Country Of Citizenship"),                       // normalized    -> 1
+        with("capital"),                                      // cache hit     -> 1
+    ]);
+    assert!(res.iter().all(|r| r.ok), "{:?}", res);
+    let got: Vec<String> = res.iter().map(symbol_of).collect();
+    assert_eq!(got, vec!["1", "0", "0", "1", "1"]);
+
+    // a missing file is an error on THAT request, and the process keeps serving
+    let bad = RunRequest { program: GROUND_PROGRAM.into(), args: vec!["capital".into()], fn_name: "solve".into(),
+                           knowledge_path: dir.join("nope.jsonl").to_string_lossy().to_string(), ..Default::default() };
+    let res = call_proto_many(vec![bad, with("capital")]);
+    assert!(!res[0].ok);
+    assert!(matches!(res[0].result, Some(run_result::Result::Error(ref e)) if e.contains("knowledge_path")));
+    assert!(res[1].ok && symbol_of(&res[1]) == "1");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -58,6 +58,7 @@ fn req(answers: Vec<&str>) -> RunRequest {
         args: vec!["_".into()],
         fn_name: "solve".into(),
         answers: answers.into_iter().map(String::from).collect(),
+        ..Default::default()
     }
 }
 
@@ -123,7 +124,7 @@ program R implements ISolve {
 }
 "#;
     let res = call_proto(RunRequest { program: program.into(), args: vec!["_".into()], fn_name: "solve".into(),
-                                      answers: vec!["\"ignored\"".into()] });
+                                      answers: vec!["\"ignored\"".into()], ..Default::default() });
     assert!(res.ok);
     assert!(matches!(res.result, Some(run_result::Result::Symbol(ref s)) if s == "cat"));
 }

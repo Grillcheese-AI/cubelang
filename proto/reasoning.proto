@@ -14,6 +14,14 @@ message RunRequest {
   // so no VM state ever crosses the wire. Empty => the first ASK suspends
   // and is reported as `RunResult.suspended`.
   repeated string answers = 4;
+  // Knowledge for QUERY (2026-09-11, plan_verify): a path to a facts .jsonl
+  // (the same file `cubelang run --knowledge` takes) loaded into the fresh
+  // per-request VM before the call. A path, not the facts themselves: the
+  // resident `run-proto` process caches the parsed store by (path, mtime),
+  // so a client asking 500 membership questions against one vocabulary
+  // pays for one parse, and the wire stays small. Empty => no knowledge,
+  // every QUERY abstains (an empty chunk array) -- correct, not useful.
+  string knowledge_path = 5;
 }
 
 // The third outcome. Neither a result nor an error: the program grounded

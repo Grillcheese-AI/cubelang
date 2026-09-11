@@ -59,7 +59,7 @@ pub fn normalize(s: &str) -> String {
     out
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct KnowledgeStore {
     /// normalized key -> the facts carrying that name.
     ///
