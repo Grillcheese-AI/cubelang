@@ -1,7 +1,7 @@
 # CubeLang v0.1.0 — Specification
 
 **Unified AI Instruction Language**
-**License:** MIT
+**License:** Business Source License 1.1 (non-commercial use granted; Change Date 2030-09-11 → Apache-2.0; commercial licensing: licensing@grillcheese.ai). See `LICENSE`.
 **Author:** Grillcheese Research Laboratory
 **Contact:** info@grillcheeseai.com
 **Extension:** `.cube`
@@ -2177,7 +2177,7 @@ Programs implement interfaces. Every function has explicit execution modifiers.
 ```cubelang
 # gsm8k.cube
 # cubelang v0.1.0
-# license: mit
+# license: bsl-1.1
 # author: grillcheese research laboratory
 
 program GSM8K implements IMathSolver, IDeployable {
