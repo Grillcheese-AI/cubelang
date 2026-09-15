@@ -1,5 +1,18 @@
 # examples/conversation_min.cube
 # cubelang v0.1.0
+#
+# The working, executable sibling of conversation_agent.cube in this same
+# directory. conversation_agent.cube demonstrates the intended shape of a
+# full conversational ISolverLearn program (structs, maps, match-dispatch,
+# retrieval); it does not currently compile+run cleanly under this VM (see
+# docs/DRIFT.md, "Bugs found" #2 and #3) and this file is the only one
+# actually exercised by the repo's own harness
+# (examples/run_conversation_min.rs, `cargo run --example run_conversation_min`).
+#
+# Demonstrates: ISolver, storage+constructor, the minimal safe-subset shape
+# a conversational program can take today.
+# Run:    $CUBELANG_EXE run examples/conversation_agent/conversation_min.cube --json
+# Expect: {"result":10,...}
 
 program ConversationMin implements ISolver {
     type Input = str;

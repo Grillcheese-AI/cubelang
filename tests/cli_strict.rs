@@ -96,21 +96,60 @@ fn run_strict_still_allows_the_reasoning_bridge_program() {
     assert_eq!(json["result"], "cat");
 }
 
-/// Regression guard: plain `run` (no `--strict`) must still accept a
-/// strict-only violation exactly as before -- the new flag is opt-in, not a
-/// silent behavior change for existing callers.
+/// FIXED 2026-09-14 (strict-by-default): `run`/`compile`/`check` now default
+/// to strict verification -- "the language's accepted surface should equal
+/// its executing surface" (Nick, docs/DRIFT.md) -- so plain `run` (no flags
+/// at all) now REJECTS a strict-only violation exactly like `run --strict`
+/// always did. This replaces the old regression guard that pinned the
+/// opposite behavior (a plain `run` silently accepting the violation); see
+/// `run_with_loose_still_allows_the_violation` below for the new opt-out.
 #[test]
-fn run_without_strict_still_allows_the_violation() {
-    let path = write_cube_file("run_loose_violation", STRICT_VIOLATION);
+fn run_without_any_flag_now_rejects_the_violation_by_default() {
+    let path = write_cube_file("run_default_violation", STRICT_VIOLATION);
     let out = cubelang()
         .args(["run", path.to_str().unwrap(), "--json"])
         .output()
         .expect("spawn cubelang run");
     let _ = std::fs::remove_file(&path);
 
+    assert!(!out.status.success(),
+        "plain run (strict by default now) must reject a strict-only violation");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.to_lowercase().contains("infer"),
+        "stderr should name the offending construct (infer): {}", stderr);
+}
+
+/// The new opt-out: `--loose` gets back the old permissive behavior for a
+/// strict-only violation (trace-only opcodes, `match`, ...) -- but NOT for a
+/// non-encodable expression operand (docs/DRIFT.md §C11), which is always a
+/// hard error; that distinction is covered separately in
+/// `tests/operand_errors.rs`.
+#[test]
+fn run_with_loose_still_allows_the_violation() {
+    let path = write_cube_file("run_loose_violation", STRICT_VIOLATION);
+    let out = cubelang()
+        .args(["run", path.to_str().unwrap(), "--loose", "--json"])
+        .output()
+        .expect("spawn cubelang run");
+    let _ = std::fs::remove_file(&path);
+
     assert!(out.status.success(),
-        "plain run (no --strict) must still compile a strict-only violation: stderr={}",
+        "run --loose must still compile a strict-only violation: stderr={}",
         String::from_utf8_lossy(&out.stderr));
+}
+
+/// `--strict` must still work as an explicit (now redundant) flag, since
+/// existing scripts/docs pass it.
+#[test]
+fn run_with_explicit_strict_still_rejects_the_violation() {
+    let path = write_cube_file("run_explicit_strict_violation", STRICT_VIOLATION);
+    let out = cubelang()
+        .args(["run", path.to_str().unwrap(), "--strict", "--json"])
+        .output()
+        .expect("spawn cubelang run --strict");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!out.status.success(), "run --strict must still exit non-zero on a strict violation");
 }
 
 // ── `check` ─────────────────────────────────────────────────────────────────
@@ -144,4 +183,21 @@ fn check_reports_ok_for_a_clean_program() {
         String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ok"), "expected the existing 'ok' output shape: {}", stdout);
+}
+
+/// `check --loose` (new, strict-by-default fix): opts `check` out of strict
+/// verification the same way `run --loose`/`compile --loose` do, so a
+/// strict-only violation no longer fails it.
+#[test]
+fn check_with_loose_reports_ok_for_a_strict_violating_program() {
+    let path = write_cube_file("check_loose_violation", STRICT_VIOLATION);
+    let out = cubelang()
+        .args(["check", "--loose", path.to_str().unwrap()])
+        .output()
+        .expect("spawn cubelang check --loose");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(out.status.success(),
+        "check --loose must accept a strict-only violation: stderr={}",
+        String::from_utf8_lossy(&out.stderr));
 }

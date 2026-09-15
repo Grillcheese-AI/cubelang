@@ -13,6 +13,11 @@
 # exactly ISolve's one required member (name `solve`, arity 1) -- this was
 # never a phantom-ISolver problem needing new methods, just the WRONG
 # registry interface name. `implements ISolve` below is the real, honest fit.
+#
+# Demonstrates: ISolve, `while` (real COMPARE/COND/JMP), Turing-complete
+# iteration with no upper bound on `n` other than the VM's jump budget.
+# Run:    $CUBELANG_EXE run examples/fibonacci.cube --json
+# Expect: {"result":55,...}
 
 program Fibonacci implements ISolve {
     type Input = number;

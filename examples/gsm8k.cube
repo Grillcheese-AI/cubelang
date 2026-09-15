@@ -2,6 +2,38 @@
 # cubelang v0.1.0
 # license: bsl-1.1
 # author: grillcheese research laboratory
+#
+# STATUS (see docs/DRIFT.md "Bugs found" #1 and #3): this file demonstrates
+# the INTENDED shape of an ISolverLearn arithmetic-reasoning program (structs,
+# typed maps, array<tuple<...>>, per-step register replay) but does NOT
+# compile under the current VM, in ANY mode, as of the 2026-09-14 fixes:
+#   - It never used real arithmetic/structs/maps as call arguments or
+#     `let`/`assign` RHS values safely -- `compile_expr_operand` cannot
+#     encode a `BinOp`/`StructLit`/`MapLit`/`MethodCall`/`Index` expression
+#     used that way (docs/DRIFT.md §C11), and that is now a HARD COMPILE
+#     ERROR IN EVERY MODE (previously a silent OP_NONE placeholder, which is
+#     how this file used to "compile clean" and silently return
+#     {"result":0} instead of a real GSM8K answer -- see "Bugs found" #1
+#     below, now fixed). `--loose` does not help: the C11 check runs
+#     unconditionally, not just under `--strict`.
+#   - On top of that, `cubelang run`/`compile`/`check` are now STRICT BY
+#     DEFAULT (no flag needed), so this file's `match` statement and its two
+#     map-index `assign`s (docs/DRIFT.md §C3/§C4) are ALSO reported.
+#   - the only harness that ever touches this file, examples/parse_gsm8k.rs
+#     (`cargo run --example parse_gsm8k`), only PARSES it -- it has never
+#     been compiled or run end-to-end by anything in this repo's own build.
+# Kept (not deleted, and NOT rewritten to "fix" its logic -- per the task
+# brief, it fails honestly now instead of running dishonestly) as a
+# forward-looking fixture for the struct/map/typed surface the parser
+# already accepts; treat its solve()/learn() bodies as aspirational, not as
+# a working reference for what compiles to real bytecode today.
+#
+# Run (parse only):     cargo run --example parse_gsm8k
+# Run (fails to build): $CUBELANG_EXE run examples/gsm8k.cube --json
+# Expect:               a compile error naming "BinOp"/"MapLit"/"StructLit"/
+#                        "MethodCall"/"Index" (C11) plus, under the default
+#                        strict compile, "match" and "assign" violations too
+#                        -- see tests/examples_pinned.rs for the exact pin.
 
 struct ArithStep {
     label: str;

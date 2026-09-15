@@ -187,9 +187,20 @@ fn vsa_module() -> Module {
     Module { functions }
 }
 
-/// `recover(reg, role)` — UNBIND + cosine cleanup against every symbol the
-/// VM currently knows (`VM::vsa_unbind_cleanup_known`), returned as
-/// `Value::Str`. Both arguments arrive by their NAME identity (a register
+/// `recover(reg, role)` — UNBIND + cosine cleanup against **the frame's own
+/// bound fillers** (`VM::vsa_unbind_cleanup_known`), returned as
+/// `Value::Str`.
+///
+/// WO-1.2 / DRIFT.md §B11a, 2026-09-14: this used to clean up against every
+/// symbol the VM had ever seen as a name, so a role that was never bound in
+/// this frame came back as whatever unrelated string sat nearest to
+/// quasi-orthogonal noise — measured, a filler belonging to a *different*
+/// frame. Scoping did not move a genuine recovery at all (0.27002 before and
+/// after) and halved the noise floor. It does NOT make an absent role return
+/// Null; callers still have to read the `similarity` side-channel to tell a
+/// real recovery from noise.
+///
+/// Both arguments arrive by their NAME identity (a register
 /// key / a role symbol string) via `VM::resolve_registry_arg`, not by
 /// resolving to a register's current value — see that method's doc for why.
 /// `Value::Null` when `reg` never held a bound hypervector (nothing was

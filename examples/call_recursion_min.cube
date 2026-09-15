@@ -1,0 +1,64 @@
+# call_recursion_min.cube - intra-program CALL, and recursion.
+#
+# CALL (0x13) is a genuinely executing opcode (v1: recursive exec with
+# register snapshot/restore -- see docs/REFERENCE.md §3.3 and
+# CUBELANG_OPCODES_PLAN.md, whose own acceptance test for CALL was exactly
+# "recursion: factorial(5) -> 120"). No shipped example demonstrated it
+# before this one, despite CALL/RETURN being some of the most load-bearing
+# real opcodes in the VM.
+#
+# TWO THINGS THAT WILL BITE YOU (see docs/REFERENCE.md §3.3, §11 and
+# docs/DRIFT.md §B4/§C11), both verified by running the broken version first:
+#
+#   1. Inside a function reached via an INTRA-PROGRAM CALL (like `factorial`
+#      below, called from `solve`), the declared parameter name (`n`) is
+#      NEVER bound -- only positional `arg0`, `arg1`, ... registers are.
+#      (A HOST-invoked function -- `solve` itself, called by `cubelang run`
+#      -- is different: the VM binds BOTH the declared name AND the argN
+#      alias for a host call. The two calling conventions genuinely differ.)
+#   2. A call argument must be a LITERAL or a BARE REGISTER NAME --
+#      `factorial(n - 1)` would silently compile to `factorial(<garbage>)`
+#      (compile_expr_operand has no encoding for a BinOp used as an
+#      operand). Compute the decremented value into its own register first.
+#
+# Demonstrates: ISolve, real CALL + RETURN, recursion (Turing-complete-ish:
+# the only bound on recursion depth is CALL's own `call_depth` guard, not
+# anything the language enforces).
+# Run:    $CUBELANG_EXE run examples/call_recursion_min.cube --json
+# Expect: {"result":120,...}   (5! = 120)
+
+program CallRecursionMin implements ISolve {
+
+    function factorial(n: number): number {
+        # `n` is NOT bound here -- this function is reached via intra-program
+        # CALL, so only `arg0` carries the caller's value. See header note 1.
+        if (arg0 <= 1) {
+            return 1;
+        }
+
+        # Compute arg0-1 into its OWN register before the recursive call --
+        # `factorial(arg0 - 1)` directly would silently pass garbage
+        # (header note 2).
+        create m : number;
+        assign m = arg0;
+        sub m, 1;
+
+        let prev = factorial(m);
+
+        create result : number;
+        assign result = arg0;
+        mul result, prev;
+        return result;
+    }
+
+    public function solve(input: number): number {
+        # `solve` IS host-invoked (by `cubelang run`), so its declared
+        # parameter would be bound by name too -- but this program is run
+        # with no `--arg`, so `input` stays unset; the value actually
+        # factorialized is hardcoded via n0 instead.
+        create n0 : number;
+        assign n0 = 5;
+        let r = factorial(n0);
+        return r;
+    }
+}

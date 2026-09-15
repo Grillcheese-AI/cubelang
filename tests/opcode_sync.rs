@@ -83,6 +83,11 @@ fn cubelang_table() -> Vec<(&'static str, &'static str, u8)> {
         ("MAKE_ARRAY",     "MAKE_ARRAY",     op::MAKE_ARRAY),
         ("LEN",            "LEN",            op::LEN),
         ("INDEX",          "INDEX",          op::INDEX),
+        // Added 2026-09-14 with the DRIFT.md C4 fix. Not yet present in
+        // opcode-vsa-rs or the Python VM table -- this test only enforces
+        // bytes for names present in BOTH, so listing it here is harmless
+        // today and starts enforcing 0x3D the moment it is ported.
+        ("SET_INDEX",      "SET_INDEX",      op::SET_INDEX),
         ("SKIP",           "SKIP",           op::SKIP),
     ]
 }

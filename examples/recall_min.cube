@@ -3,6 +3,15 @@
 # key) -> RECALL -> the corrected value is what is retrieved. Exercises the
 # hippocampal memory overwrite semantics (store under an existing key replaces
 # the payload). A genuine belief-revision / error-correction reasoning primitive.
+#
+# NOTE: RECALL (cosine-nearest cleanup over `src/vm/memory.rs`) is a
+# different mechanism from QUERY (exact-key lookup over
+# `src/vm/knowledge.rs`, see examples/ground_min.cube) -- both "look
+# something up" but neither is the other.
+#
+# Demonstrates: ISolver, STORE overwrite semantics, RECALL.
+# Run:    $CUBELANG_EXE run examples/recall_min.cube --json
+# Expect: {"result":65,...}  (the corrected value, not the original 40)
 
 program RecallMin implements ISolver {
     type Input = number;

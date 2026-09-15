@@ -1,0 +1,82 @@
+# vsa_bind_recover.cube - the bind/recover/frame surface.
+#
+# This is the ACTUAL mechanism the CubbyLLM reasoning bridge emits today
+# (cubbyllm/reasoning/programs.py: build_chain_program) -- yet neither
+# README.md nor docs/SPEC.md mentions `use vsa;` or `recover(...)` at all
+# (see docs/DRIFT.md §A8/§B2). This example exists to close that gap.
+#
+# A `frame` register holds MULTIPLE role-filler bindings in superposition
+# (VSA bundling): `bind frame, ROLE, "value";` plants one binding without
+# disturbing the others already in `frame`. `recover(frame, ROLE)` (a plain
+# call into the `vsa` registry module, NOT a keyword or opcode statement --
+# see docs/REFERENCE.md §5/§11) performs real UNBIND + cosine cleanup
+# AGAINST EVERY SYMBOL THE VM CURRENTLY KNOWS (not just symbols used in
+# `frame`) and returns the nearest match as a string, plus a similarity
+# score (surfaced as `run --json`'s top-level "similarity" field, separate
+# from "result" -- see docs/REFERENCE.md §9 / proto/reasoning.proto).
+#
+# IMPORTANT, and undocumented anywhere else (docs/DRIFT.md §B12): recovering
+# a role that was never bound in a given (already-bound) frame does NOT
+# reliably return Null -- it returns whatever symbol happens to be nearest
+# in the whole codebook, at a LOW similarity (see `recover_unbound` below,
+# ~0.03). Only a frame that was never bound AT ALL reliably recovers Null
+# (`tests/asm_vsa.rs`'s `b3_an_unbound_frame_is_the_control...`). A caller
+# MUST check `similarity`, not just whether `result` is present, to tell a
+# real recovery from noise.
+#
+# Role names are ALWAYS ALL-CAPS barewords by convention (SUBJECT, OBJECT,
+# ...) -- see ast.rs's AsmOperand doc for the same convention applied to the
+# lower-level `asm` escape hatch.
+#
+# Demonstrates: ISolve, `use <module>`, real BIND_ROLE (via `bind`), the
+# `vsa` registry module's `recover(reg, role)`. Compare with
+# examples/recall_min.cube's STORE/RECALL (hippocampal key-value memory --
+# a completely different mechanism from VSA role-filler binding, even
+# though both involve a hypervector cleanup step under the hood).
+#
+# Run:    $CUBELANG_EXE run examples/vsa_bind_recover.cube --json
+# Expect: {"result":"cat","similarity":~0.52,...}   (--fn solve, the default)
+# Also:   $CUBELANG_EXE run examples/vsa_bind_recover.cube --json --fn recover_object
+# Expect: {"result":"mouse","similarity":~0.49,...} (a different role, same frame)
+# Also:   $CUBELANG_EXE run examples/vsa_bind_recover.cube --json --fn recover_unbound
+# Expect: {"result":<some symbol>,"similarity":~0.03,...} -- NOT null, and NOT
+#          a real recovery; a low similarity like this is the caller's only
+#          signal that nothing was actually bound to that role.
+
+use vsa;
+
+program VsaBindRecover implements ISolve {
+
+    storage {
+        binds_made: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign binds_made = 0;
+    }
+
+    @external
+    public function solve(mention: str): str {
+        create frame : number;
+        bind frame, SUBJECT, "cat";
+        bind frame, OBJECT, "mouse";
+        add binds_made, 1;
+        return recover(frame, SUBJECT);
+    }
+
+    public function recover_object(): str {
+        create frame : number;
+        bind frame, SUBJECT, "cat";
+        bind frame, OBJECT, "mouse";
+        return recover(frame, OBJECT);
+    }
+
+    public function recover_unbound(): str {
+        create frame : number;
+        bind frame, SUBJECT, "cat";
+        # OBJECT was never bound in THIS frame. This does NOT return Null --
+        # see the header note above.
+        return recover(frame, OBJECT);
+    }
+}

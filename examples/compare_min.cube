@@ -2,6 +2,10 @@
 # Pattern: parse -> store two candidates -> COMPARE -> branch to select max ->
 # remember winner -> verify. Exercises memory + branching, returning the SELECTED
 # value (not a fixed score). A genuine comparison/selection reasoning primitive.
+#
+# Demonstrates: ISolver, if/else on a real COMPARE, store/query/remember.
+# Run:    $CUBELANG_EXE run examples/compare_min.cube --json
+# Expect: {"result":58,...}  (58 > 34, so the right branch wins)
 
 program CompareMin implements ISolver {
     type Input = number;

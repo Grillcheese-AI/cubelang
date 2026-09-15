@@ -1,0 +1,57 @@
+# match_router.cube -- real `match` arm selection over a string subject.
+#
+# This is the smallest end-to-end demonstration of the DRIFT.md C3/A7 fix.
+# Before 2026-09-14 this file would have been doubly wrong, silently:
+#   1. every arm's body ran, in source order, with no comparison at all; and
+#   2. even with comparisons, `op::COMPARE` pushed both sides through
+#      `Value::as_i64`, which is 0 for every string -- so every string arm
+#      matched and the first one would always have won.
+#
+# Run it:
+#   cubelang run examples/match_router.cube --json
+#     -> {"ok":true,"result":"compare"}
+#   cubelang check examples/match_router.cube
+#     -> all executing, no stubs   (`match` is no longer flagged)
+#
+# Note the three-address style. CubeLang's real surface is a register
+# machine: `match (parts[0])` would be a compile error (C11 -- an Index
+# expression cannot be encoded as an operand). Compute into a register
+# first, then match on the register.
+
+program MatchRouter implements ISolve {
+
+    public function solve(input: str): str {
+        create intent : str;
+        assign intent = "comparison";
+        create act : str;
+        assign act = "respond";
+
+        match (intent) {
+            "implementation" => assign act = "show_program";
+            "comparison"     => assign act = "compare";
+            "explanation"    => assign act = "explain";
+            _                => assign act = "respond";
+        }
+
+        return act;
+    }
+
+    # Same router, numeric subject, showing that a non-matching subject with
+    # no wildcard leaves the accumulator untouched rather than running
+    # every arm.
+    public function score_band(): number {
+        create band : number;
+        assign band = 0;
+        create score : number;
+        assign score = 2;
+
+        match (score) {
+            1 => assign band = 10;
+            2 => assign band = 20;
+            3 => assign band = 30;
+        }
+
+        sum band;
+        return band;
+    }
+}

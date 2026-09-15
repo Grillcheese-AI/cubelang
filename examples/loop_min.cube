@@ -4,6 +4,13 @@
 # Exercises the while-loop control flow (COMPARE + COND exit + JMP back-edge +
 # termination) plus hippocampal memory. A genuine iterative reasoning pattern:
 # "apply a step N times, accumulating a running total."
+#
+# NOTE: this uses `while`, not `for (let x of arr)` -- see
+# examples/for_loop_min.cube for the array-based `for` form (LEN/INDEX).
+#
+# Demonstrates: ISolver, `while`, storage+constructor.
+# Run:    $CUBELANG_EXE run examples/loop_min.cube --json
+# Expect: {"result":42,...}  (7 added 6 times)
 
 program LoopMin implements ISolver {
     type Input = number;

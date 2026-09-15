@@ -1,0 +1,61 @@
+# agent_min.cube - IAgent, the fourth (and least-documented) engine interface.
+#
+# IAgent (src/vm/interfaces.rs) requires exactly `think(x, ctx)`,
+# `act(decision, ctx)`, `observe(result, ctx)`, all arity 2 -- the SPEC's own
+# `plan`/`reflect` are optional there and so are absent from the registry
+# entirely (see docs/REFERENCE.md §2). No shipped example implemented IAgent
+# before this one, even though README.md/SPEC.md both describe it at length
+# via containers -- and per docs/DRIFT.md §C10, none of that container-based
+# material actually compiles (only `program { }` blocks do). This is the
+# minimal PROGRAM-level (not container-level) shape that actually runs.
+#
+# `think`/`act`/`observe` are called here via intra-program CALL from
+# `solve`, so -- same caveat as examples/call_recursion_min.cube -- their
+# declared parameter names (`x`, `ctx`, `decision`, `result`) are never
+# bound inside their own bodies; only `arg0`/`arg1` are. This example keeps
+# each body trivial specifically to sidestep that gotcha; see
+# call_recursion_min.cube for the fully-worked-through version.
+#
+# Demonstrates: IAgent, storage+constructor, intra-program CALL chaining
+# three functions together (a minimal think -> act -> observe loop).
+# Run:    $CUBELANG_EXE run examples/agent_min.cube --json
+# Expect: {"result":1,...}
+
+program AgentMin implements IAgent {
+
+    storage {
+        actions_taken: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign actions_taken = 0;
+    }
+
+    function think(x: str, ctx: number): str {
+        return "act_now";
+    }
+
+    function act(decision: str, ctx: number): number {
+        add actions_taken, 1;
+        create outcome : number;
+        assign outcome = 1;
+        return outcome;
+    }
+
+    function observe(result: number, ctx: number): void {
+        store result, "last_observed_result";
+    }
+
+    @external
+    public function solve(input: str): number {
+        create zero : number;
+        assign zero = 0;
+
+        let decision = think(input, zero);
+        let outcome = act(decision, zero);
+        observe(outcome, zero);
+
+        return outcome;
+    }
+}

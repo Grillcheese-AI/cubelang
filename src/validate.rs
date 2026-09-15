@@ -8,8 +8,11 @@
 //!   * Trace-only extended opcodes (predict / score / infer / ...)        — see
 //!     [`compiler::is_trace_only_ext_op`] for the authoritative list.
 //!   * `unify` (trace-only in the VM).
-//!   * `match` — every arm body compiles unconditionally (P2-2).
 //!
+//! NOTE: `match` no longer appears here — `compile_match` now emits a real
+//! COMPARE/COND arm-selection chain and exactly one arm runs (DRIFT.md
+//! C3/A7, 2026-09-14). Arm bodies are still walked, so a trace-only
+//! construct nested inside an arm is still reported.
 //! NOTE: `return` no longer appears here — it now executes as a real
 //! early-exit opcode (Plan-1 / op::RETURN, byte 0x39).
 //! NOTE: `call` no longer appears here — intra-program CALL now executes
@@ -25,8 +28,6 @@ use crate::compiler::{ext_name, is_trace_only_ext_op};
 /// One specific stub or trace-only construct detected in a function body.
 #[derive(Debug, Clone)]
 pub enum Finding {
-    /// `match (expr) { arms }` — every arm body executes unconditionally.
-    Match { line: u32 },
     /// Trace-only extended opcode (`predict`, `infer`, `score`, ...).
     TraceOnlyOpcode { name: &'static str },
     /// `unify a, b` — trace-only in the current VM.
@@ -36,8 +37,6 @@ pub enum Finding {
 impl std::fmt::Display for Finding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Finding::Match { line } =>
-                write!(f, "match at line {} (arms execute unconditionally — P2-2)", line),
             Finding::TraceOnlyOpcode { name } =>
                 write!(f, "opcode `{}` (trace-only)", name),
             Finding::UnifyOpcode =>
@@ -148,8 +147,10 @@ fn walk_stmt(stmt: &Stmt, findings: &mut Vec<Finding>) {
         Stmt::For(f) => {
             for s in &f.body { walk_stmt(s, findings); }
         }
+        // `match` itself is no longer a finding (DRIFT.md C3/A7, 2026-09-14:
+        // real arm selection), but arm bodies are still walked so a
+        // trace-only construct nested inside one is still reported.
         Stmt::Match(m) => {
-            findings.push(Finding::Match { line: m.span.line });
             for arm in &m.arms {
                 for s in &arm.body { walk_stmt(s, findings); }
             }
@@ -236,10 +237,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_flags_match_with_line() {
-        let source = "
+    fn validate_does_not_flag_match_but_still_walks_its_arms() {
+        // FLIPPED 2026-09-14 (DRIFT.md C3/A7). This was
+        // `validate_flags_match_with_line`, and it was right to: every arm
+        // body used to run unconditionally. `compile_match` now emits a real
+        // COMPARE/COND chain, so flagging `match` here would be a false
+        // positive on `cubelang check` -- and a false positive steers an
+        // emitter away from a construct that works, which is the opposite of
+        // what this subcommand is for.
+        let clean = "
             program Test implements ISolver {
                 public function run(): void {
+                    create x : number;
+                    assign x = 1;
                     match (x) {
                         1 => { sum x; }
                         _ => { query x; }
@@ -247,11 +257,31 @@ mod tests {
                 }
             }
         ";
-        let report = validate(source).unwrap();
-        assert!(!report.is_clean());
+        let report = validate(clean).unwrap();
+        assert!(report.is_clean(),
+            "real arm selection should not be flagged; got: {}", report);
+
+        // The other half, which matters more: dropping the `match` finding
+        // must not stop the walk from descending INTO arm bodies. `predict`
+        // is trace-only and must still be reported from inside an arm.
+        let nested = "
+            program Test implements ISolver {
+                public function run(): void {
+                    create x : number;
+                    assign x = 1;
+                    match (x) {
+                        1 => { predict x; }
+                        _ => { sum x; }
+                    }
+                }
+            }
+        ";
+        let report = validate(nested).unwrap();
+        assert!(!report.is_clean(),
+            "a trace-only opcode inside a match arm must still be reported");
         let printed = format!("{}", report);
-        assert!(printed.contains("match"));
-        assert!(printed.contains("line"));
+        assert!(printed.contains("predict"),
+            "report should name the nested 'predict': {}", printed);
     }
 
     #[test]

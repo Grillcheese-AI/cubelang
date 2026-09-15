@@ -4,6 +4,10 @@
 # Exercises BOTH halves of the VM: hippocampal memory (store/recall/remember)
 # AND control flow (if/else on a comparison). This is genuine stateful
 # reasoning, not a flat snippet.
+#
+# Demonstrates: ISolver, storage+constructor, if/else, store/remember.
+# Run:    $CUBELANG_EXE run examples/decision_min.cube --json
+# Expect: {"result":80,...}  (observation 72 > gate 50 -> approve, +80)
 
 program DecisionMin implements ISolver {
     type Input = number;

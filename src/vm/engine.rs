@@ -149,6 +149,29 @@ pub struct VM {
     /// Deterministic symbol -> hypervector at MEM_DIM/MEM_SEED, so bound
     /// structures are reproducible across runs and share the memory's space.
     vsa: Codebook,
+    /// WO-1.2: register name -> the fillers bound INTO that register, in bind
+    /// order, deduplicated.
+    ///
+    /// `recover`/UNBIND is a cosine cleanup, and a cleanup always returns its
+    /// nearest candidate -- it never returns "nothing". So the candidate pool
+    /// IS the semantics. It used to be every symbol the VM had ever seen as a
+    /// name, which means a role that was never bound in a frame came back as
+    /// whatever unrelated string happened to sit closest to quasi-orthogonal
+    /// noise: measured before this change, `recover(frame, LOCATION)` on a
+    /// frame holding SUBJECT/OBJECT/VERB returned **"umbrella" at 0.0215** --
+    /// a filler belonging to a completely different frame.
+    ///
+    /// Scoping the pool to the frame's own bindings does not make the absent
+    /// role return Null (that is a separate question -- DRIFT.md B11a), but it
+    /// does confine the wrong answer to symbols that are actually part of this
+    /// structure, and it makes the similarity mean what the tau thresholds
+    /// assume it means: "how well does this frame's own content explain the
+    /// unbound result", not "what is the nearest thing in the universe".
+    ///
+    /// Kept beside `registers` and given the same lifetime: `exec_intra_call`
+    /// takes and restores both together, so a callee's bindings cannot leak
+    /// into the caller's frames.
+    vsa_frames: HashMap<String, Vec<String>>,
     /// Accumulator (SUM results).
     pub accumulator: Value,
     /// Event log.
@@ -197,6 +220,7 @@ impl VM {
             storage: HashMap::new(),
             memory: HippocampalMemory::new(MEM_DIM, MEM_SEED),
             vsa: Codebook::with_dim(MEM_SEED, MEM_DIM),
+            vsa_frames: HashMap::new(),
             accumulator: Value::Null,
             events: Vec::new(),
             programs: HashMap::new(),
@@ -440,7 +464,23 @@ impl VM {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     let ty = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
                     self.trace_op(pc, &format!("CREATE {} : {}", name, ty));
-                    self.registers.insert(name, Value::Null);
+                    // DRIFT.md §C4 (2026-09-14): a declared container type now
+                    // creates an EMPTY CONTAINER rather than Null, so
+                    // `create m : map; m["k"] = v;` works without a separate
+                    // initialisation step. `Value::Null` is kept for every
+                    // other declared type -- `create x : number;` behaves
+                    // exactly as before (and `as_i64(Null)` is already 0, so
+                    // nothing numeric changes).
+                    //
+                    // `type_name` (src/compiler.rs) collapses `map<K,V>` to
+                    // "map" and `array<T>` to "array", so the two spellings
+                    // below are the only ones that ever reach here.
+                    let init = match ty.as_str() {
+                        "map" => Value::Map(HashMap::new()),
+                        "array" => Value::Array(Vec::new()),
+                        _ => Value::Null,
+                    };
+                    self.registers.insert(name, init);
                 }
 
                 op::MAKE_ARRAY => {
@@ -479,13 +519,95 @@ impl VM {
                     // bad indices surface as untrusted data rather than crash.
                     let dst = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     let arr = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
-                    let i = self.resolve_i64(operands.get(2));
+                    // DRIFT.md §C4 (2026-09-14): resolve the key as a VALUE so
+                    // maps can be read too. `.as_i64()` here is identical to
+                    // the previous `resolve_i64` for every operand kind, so
+                    // array indexing is unchanged.
+                    let key = self.resolve_value(operands.get(2));
+                    let i = key.as_i64();
                     let val = match self.registers.get(&arr) {
                         Some(Value::Array(v)) if i >= 0 && (i as usize) < v.len() => v[i as usize].clone(),
+                        // A map read was previously impossible: this arm did
+                        // not exist, so `m["k"]` fell through to Null even
+                        // when the key was present. Writing to a map was
+                        // impossible too (no SET_INDEX), so the two gaps hid
+                        // each other.
+                        Some(Value::Map(m)) => m.get(&key.as_str()).cloned().unwrap_or(Value::Null),
                         _ => Value::Null,
                     };
-                    self.trace_op(pc, &format!("INDEX {} = {}[{}] → {}", dst, arr, i, val));
+                    self.trace_op(pc, &format!("INDEX {} = {}[{}] → {}", dst, arr, key, val));
                     self.registers.insert(dst, val);
+                }
+
+                op::SET_INDEX => {
+                    // DRIFT.md §C4 fix. operands: [container, key, value].
+                    //
+                    // `arr[0] = x`, `regs[reg] = v`, `self.patterns[k] = h`
+                    // used to compile to ZERO bytecode -- `compile_stmt`'s
+                    // Assign arm only handled `self.field` and a bare
+                    // identifier, and anything else fell off the end of the
+                    // if/else chain emitting nothing at all. It is the
+                    // mechanism behind `examples/gsm8k.cube` returning 0.
+                    //
+                    // Out-of-range and wrong-container-type are ERRORS, not
+                    // silent no-ops: replacing a silent drop with a silent
+                    // clamp would keep the same class of bug.
+                    let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let key = self.resolve_value(operands.get(1));
+                    let val = self.resolve_assign_rhs(operands.get(2));
+                    self.trace_op(pc, &format!("SET_INDEX {}[{}] = {}", name, key, val));
+
+                    let current = self.registers.get(&name).cloned().unwrap_or(Value::Null);
+                    let updated = match current {
+                        Value::Map(mut m) => {
+                            m.insert(key.as_str(), val);
+                            Value::Map(m)
+                        }
+                        Value::Array(mut v) => {
+                            let i = key.as_i64();
+                            if i < 0 {
+                                return ExecResult::Error(format!(
+                                    "SET_INDEX: negative index {} into array `{}`", i, name));
+                            }
+                            let i = i as usize;
+                            if i < v.len() {
+                                v[i] = val;
+                            } else if i == v.len() {
+                                v.push(val); // append is the common idiom
+                            } else {
+                                return ExecResult::Error(format!(
+                                    "SET_INDEX: index {} is past the end of array `{}` (len {}); \
+                                     assign at index {} to append", i, name, v.len(), v.len()));
+                            }
+                            Value::Array(v)
+                        }
+                        // An untyped `let`/`create` leaves Null; pick the
+                        // container from the key's type so a caller does not
+                        // have to declare one. A string key means a map, an
+                        // integer key means an array.
+                        Value::Null => match &key {
+                            Value::Str(k) => {
+                                let mut m = HashMap::new();
+                                m.insert(k.clone(), val);
+                                Value::Map(m)
+                            }
+                            _ => {
+                                let i = key.as_i64();
+                                if i != 0 {
+                                    return ExecResult::Error(format!(
+                                        "SET_INDEX: cannot create array `{}` at index {} -- the \
+                                         first integer-keyed assignment must be index 0", name, i));
+                                }
+                                Value::Array(vec![val])
+                            }
+                        },
+                        other => {
+                            return ExecResult::Error(format!(
+                                "SET_INDEX: `{}` is {:?}, not an array or map -- cannot index-assign \
+                                 into it", name, other));
+                        }
+                    };
+                    self.registers.insert(name, updated);
                 }
 
                 op::RETURN => {
@@ -699,30 +821,100 @@ impl VM {
                 op::COMPARE => {
                     // Operands: [a, b, kind_imm] (3-arg from a condition) or
                     // [a, b] (2-arg statement-level compare, defaults to eq).
-                    let a = self.resolve_i64(operands.get(0));
                     let kind = match operands.get(2) {
                         Some(Operand::Imm(k)) => *k,
                         _ => 0, // statement-level `compare a, b` → equality test
                     };
-                    let b = if kind == 6 { 0 } else { self.resolve_i64(operands.get(1)) };
-                    flag = match kind {
-                        0 => a == b,
-                        1 => a != b,
-                        2 => a < b,
-                        3 => a <= b,
-                        4 => a > b,
-                        5 => a >= b,
-                        6 => a != 0, // truthiness
-                        _ => false,
+
+                    // FIXED 2026-09-14 -- string comparison was silently
+                    // always TRUE.
+                    //
+                    // Both sides used to be forced through `resolve_i64`, and
+                    // `Value::as_i64` returns 0 for EVERY `Value::Str` (see
+                    // its `_ => 0` arm). So any comparison between two strings
+                    // compared 0 to 0: `if (intent == "question")` took the
+                    // then-branch for EVERY value of `intent`, with no error
+                    // and no trace signal. That is precisely the silent
+                    // wrong-answer class this VM exists to prevent, and it is
+                    // why `tests/str_semantics.rs`'s
+                    // `string_equality_against_a_parameter_discriminates` was
+                    // pinned `#[ignore]`. It also made real `match` arm
+                    // selection impossible to build: every string arm would
+                    // have matched, so the first arm would always win.
+                    //
+                    // `resolve_value` already preserves strings correctly
+                    // (Named -> the register's current value; Global -> the
+                    // literal's recorded spelling via the name table), so when
+                    // BOTH sides resolve to strings, compare them AS strings.
+                    //
+                    // Deliberately scoped to the both-strings case. A mixed
+                    // Str/Int comparison keeps the numeric path, and
+                    // `va.as_i64()` is value-identical to the old
+                    // `resolve_i64(op)` for every operand kind (Imm/FloatImm
+                    // pass through; a Named register resolves to the same
+                    // value; anything unresolved is 0 either way) -- so no
+                    // existing numeric comparison changes behaviour.
+                    //
+                    // KNOWN REMAINING GAP: kind 6 (truthiness) still tests
+                    // `as_i64() != 0`, so a non-empty string is still falsy.
+                    // Left alone on purpose -- it is a separate change with a
+                    // different blast radius, and the test that would cover it
+                    // (`str_contains_evaluates_on_a_register_string`) is
+                    // blocked on `str.contains` being a stub, not on this.
+                    let va = self.resolve_value(operands.get(0));
+                    let vb = if kind == 6 {
+                        Value::Int(0)
+                    } else {
+                        self.resolve_value(operands.get(1))
                     };
+
+                    let cmp_word;
+                    match (&va, &vb) {
+                        (Value::Str(x), Value::Str(y)) => {
+                            flag = match kind {
+                                0 => x == y,
+                                1 => x != y,
+                                2 => x < y,
+                                3 => x <= y,
+                                4 => x > y,
+                                5 => x >= y,
+                                _ => false,
+                            };
+                            cmp_word = match kind {
+                                0 | 1 => if x == y { "equal" }
+                                         else if x < y { "less" }
+                                         else { "greater" },
+                                _ => if flag { "true" } else { "false" },
+                            };
+                            self.trace_op(pc, &format!(
+                                "COMPARE {:?} ? {:?} (kind {}, str) → {}", x, y, kind, flag));
+                        }
+                        _ => {
+                            let a = va.as_i64();
+                            let b = vb.as_i64();
+                            flag = match kind {
+                                0 => a == b,
+                                1 => a != b,
+                                2 => a < b,
+                                3 => a <= b,
+                                4 => a > b,
+                                5 => a >= b,
+                                6 => a != 0, // truthiness
+                                _ => false,
+                            };
+                            cmp_word = match kind {
+                                0 | 1 => if a == b { "equal" }
+                                         else if a < b { "less" }
+                                         else { "greater" },
+                                _ => if flag { "true" } else { "false" },
+                            };
+                            self.trace_op(pc, &format!(
+                                "COMPARE {} ? {} (kind {}) → {}", a, b, kind, flag));
+                        }
+                    }
                     // Expose the comparison result in a conventional register too.
-                    let cmp_word = match kind {
-                        0 | 1 => if a == b { "equal" } else if a < b { "less" } else { "greater" },
-                        _ => if flag { "true" } else { "false" },
-                    };
                     self.registers.insert("__cmp".into(), Value::Str(cmp_word.into()));
                     self.accumulator = Value::Bool(flag);
-                    self.trace_op(pc, &format!("COMPARE {} ? {} (kind {}) → {}", a, b, kind, flag));
                 }
 
                 op::LABEL => {
@@ -916,15 +1108,19 @@ impl VM {
                     // Genuine VSA unbind + cleanup. Recover the filler bound to
                     // `role` in the register's bundled hypervector and leave the
                     // recovered symbol (as a Str) in the register. Candidates are
-                    // the known symbol names (name table); the cosine-nearest
-                    // wins. A register that never held an Hvec is left untouched.
+                    // the frame's OWN bound fillers (WO-1.2; the global name
+                    // table only as a fallback for a frame with no recorded
+                    // bindings); the cosine-nearest wins. A register that never
+                    // held an Hvec is left untouched.
                     let reg = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     let role = self.resolve_symbol_name(operands.get(1));
-                    // Snapshot candidate symbol strings up front to avoid holding
-                    // an immutable borrow of name_table across the &mut self call.
-                    let candidates: Vec<String> = self.name_table.values().cloned().collect();
-                    let cand_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-                    match self.vsa_unbind_cleanup(&reg, &role, &cand_refs) {
+                    // WO-1.2: go through `vsa_unbind_cleanup_known` rather than
+                    // building the candidate pool inline. This arm used to
+                    // assemble `name_table.values()` itself, which meant the
+                    // "what do we clean up against" policy lived in two places
+                    // and the registry module's `recover` and the raw UNBIND
+                    // opcode could drift apart. One definition now.
+                    match self.vsa_unbind_cleanup_known(&reg, &role) {
                         Some((sym, sim)) => {
                             self.trace_op(pc, &format!("UNBIND {} {} → {} (sim {:.3})", reg, role, sym, sim));
                             self.registers.insert(reg, Value::Str(sym));
@@ -1054,6 +1250,12 @@ impl VM {
     /// unwound, so resuming would re-enter the callee with the wrong frame.
     fn exec_intra_call(&mut self, callee: &CompiledFunction, arg_values: Vec<Value>) -> Option<ExecResult> {
         let caller_regs = std::mem::take(&mut self.registers);
+        // WO-1.2: the frame map is register-keyed, so it has to follow the
+        // registers exactly. Without this a callee's `bind frame, ...` would
+        // leave its fillers in the caller's pool for a register of the same
+        // name -- reintroducing cross-frame contamination through the back
+        // door, which is the very thing the scoping exists to remove.
+        let caller_frames = std::mem::take(&mut self.vsa_frames);
         for (i, v) in arg_values.into_iter().enumerate() {
             let arg_name = format!("arg{}", i);
             self.register_name(&arg_name);
@@ -1066,8 +1268,9 @@ impl VM {
         let r = self.exec_function(callee);
         self.call_depth -= 1;
 
-        // Restore caller-visible registers.
+        // Restore caller-visible registers, and the frame map with them.
         self.registers = caller_regs;
+        self.vsa_frames = caller_frames;
 
         match r {
             ExecResult::Ok(v) | ExecResult::Return(v) => {
@@ -1286,6 +1489,14 @@ impl VM {
             _ => pair,
         };
         self.registers.insert(reg.to_string(), Value::Hvec(combined));
+        // WO-1.2: remember WHAT went into this frame, so the cleanup can be
+        // scoped to it. Deduplicated and order-preserving -- the order is the
+        // tie-break when two candidates score identically, and bind order is
+        // the least surprising one.
+        let seen = self.vsa_frames.entry(reg.to_string()).or_default();
+        if !seen.iter().any(|f| f == filler) {
+            seen.push(filler.to_string());
+        }
     }
 
     /// UNBIND + cleanup: recover the filler bound to `role` in register `reg`.
@@ -1329,17 +1540,44 @@ impl VM {
         best
     }
 
-    /// Task 6: `vsa_unbind_cleanup` against every symbol the VM currently
-    /// knows -- the same candidate pool `op::UNBIND`'s own bytecode arm
-    /// builds inline (`self.name_table.values()`). For callers, like the
-    /// `vsa` registry module's `recover`, that have no curated candidate
-    /// list of their own and just want "the real answer, if the VM has
-    /// ever seen it as a name" -- exposed as its own method (rather than
-    /// making `registry.rs` reach into the private `name_table` field
-    /// directly) so the "candidates = every known symbol" policy stays
-    /// defined in one place.
+    /// `vsa_unbind_cleanup` against the frame's OWN bound fillers.
+    ///
+    /// WO-1.2 (2026-09-14). This used to clean up against every symbol the VM
+    /// had ever seen as a name. The pool is the semantics here, because the
+    /// cleanup always returns its nearest candidate and never returns
+    /// "nothing": with a global pool, a role that was never bound in this
+    /// frame comes back as whatever unrelated string sits closest to
+    /// quasi-orthogonal noise.
+    ///
+    /// Measured on a frame holding SUBJECT/OBJECT/VERB, with a second frame's
+    /// fillers also in the VM's name table:
+    ///
+    /// | | winner | similarity |
+    /// |---|---|---|
+    /// | genuine `SUBJECT`, global pool | `"cat"` | 0.2700 |
+    /// | genuine `SUBJECT`, frame pool  | `"cat"` | 0.2700 |
+    /// | absent `LOCATION`, global pool | `"umbrella"` (another frame's) | 0.0215 |
+    /// | absent `LOCATION`, frame pool  | one of this frame's own | see `tests/recover_scope.rs` |
+    ///
+    /// A genuine recovery is unchanged -- same unbind, same true filler, and
+    /// the true filler is always in its own frame's pool -- so the tau_vm
+    /// values CubbyLLM calibrates against (1.0 / 0.4736328125 / 0.22021484375)
+    /// do not move for any answer that was going to be spoken. What changes is
+    /// only which wrong symbol wins when the role is absent.
+    ///
+    /// **Fallback, deliberate:** a register holding a hypervector with no
+    /// recorded bindings falls back to the global pool. That happens for
+    /// hand-assembled bytecode and for a frame restored from outside
+    /// `vsa_bind_into`, where scoping to an empty pool would silently turn a
+    /// working recovery into `None`. Narrowing behaviour is worth having; a
+    /// silent regression to Null is not.
     pub fn vsa_unbind_cleanup_known(&mut self, reg: &str, role: &str) -> Option<(String, f64)> {
-        let candidates: Vec<String> = self.name_table.values().cloned().collect();
+        let scoped = self.vsa_frames.get(reg).cloned().unwrap_or_default();
+        let candidates: Vec<String> = if scoped.is_empty() {
+            self.name_table.values().cloned().collect()
+        } else {
+            scoped
+        };
         let cand_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
         self.vsa_unbind_cleanup(reg, role, &cand_refs)
     }
@@ -2268,33 +2506,65 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_gsm8k_cubebin() {
-        // Compile gsm8k.cube, save to cubebin, load, and run solve()
-        let source = include_str!("../../examples/gsm8k.cube");
+    fn test_vm_cubebin_save_load_run() {
+        // Save to cubebin, load, and run -- the roundtrip this test has always been
+        // about. It used `examples/gsm8k.cube` as its fixture until 2026-09-14, when
+        // the C11 operand fix made that file correctly refuse to compile (its
+        // constructor binds a MapLit, its solve returns a StructLit). gsm8k was never
+        // computing anything here anyway -- this test's own comment said it "won't
+        // compute correctly without real input parsing" -- so the fixture is now a
+        // self-contained program that does compile, exercising the same VM paths:
+        // storage, a constructor, and a solve that returns a real register.
+        let source = r#"
+            program Bin implements ISolver {
+                storage {
+                    count: mutable u64 = 0;
+                }
+                public function constructor() {
+                    self.count = 0;
+                }
+                @external
+                public function solve(input: Input): Output {
+                    create x : number;
+                    assign x = 16;
+                    sub x, 3;
+                    sub x, 4;
+                    sum x;
+                    query x;
+                    remember x;
+                    return x;
+                }
+                @external
+                public function parse(raw: str): Input { return raw; }
+                @external
+                public pure function verify(input: Input, output: Output): bool { return true; }
+            }
+        "#;
         let programs = crate::compiler::compile(source).unwrap();
 
-        let path = std::env::temp_dir().join("gsm8k_vm_test.cubebin");
+        let path = std::env::temp_dir().join("bin_vm_test.cubebin");
         programs[0].save(&path).unwrap();
 
         let mut vm = VM::new();
         vm.load_file(&path).unwrap();
 
         // Run constructor
-        vm.call("GSM8K", "constructor", Vec::new());
+        vm.call("Bin", "constructor", Vec::new());
 
-        // Run solve (it won't compute correctly without real input parsing,
-        // but it should execute without errors)
+        // Run solve -- unlike the old gsm8k fixture, this one computes a real value
         vm.trace_enabled = true;
-        let result = vm.call("GSM8K", "solve", Vec::new());
+        let result = vm.call("Bin", "solve", Vec::new());
 
-        println!("GSM8K.solve() trace ({} ops):", vm.trace.len());
+        println!("Bin.solve() trace ({} ops):", vm.trace.len());
         for line in &vm.trace {
             println!("  {}", line);
         }
 
         match result {
-            ExecResult::Ok(_) => println!("GSM8K.solve() completed successfully"),
-            ExecResult::Error(e) => println!("GSM8K.solve() error (expected): {}", e),
+            // 16 - 3 - 4 = 9: the fixture computes, so assert it rather than
+            // accepting any outcome the way the gsm8k fixture had to.
+            ExecResult::Ok(v) => assert_eq!(v.as_i64(), 9, "Bin.solve() should compute 16-3-4"),
+            ExecResult::Error(e) => panic!("Bin.solve() error: {}", e),
             _ => {}
         }
 

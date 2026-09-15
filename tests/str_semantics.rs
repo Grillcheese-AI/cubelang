@@ -66,8 +66,12 @@ fn str_contains_evaluates_on_a_register_string() {
     assert_eq!(question_of(run(CONTAINS, "solve", vec![Value::Str("_".into())])), "contains_true");
 }
 
+// FIXED 2026-09-14 -- un-ignored. The gap was not specific to parameters:
+// `op::COMPARE` pushed both operands through `resolve_i64`, and
+// `Value::as_i64` returns 0 for every `Value::Str`, so EVERY string
+// comparison compared 0 to 0 and was unconditionally true. COMPARE now
+// compares two strings as strings (see `src/vm/engine.rs`).
 #[test]
-#[ignore = "VM gap 2026-08-30: comparing a function parameter to a literal is true for any input"]
 fn string_equality_against_a_parameter_discriminates() {
     assert_eq!(question_of(run(PARAM_EQ, "solve", vec![Value::Str("abc".into())])), "eq_true");
     assert_eq!(question_of(run(PARAM_EQ, "solve", vec![Value::Str("zzz".into())])), "eq_false");
@@ -75,7 +79,13 @@ fn string_equality_against_a_parameter_discriminates() {
 
 #[test]
 fn string_equality_against_a_register_literal_is_correct() {
-    // the control: this one DOES work today, so the gap above is specific
+    // Written as "the control: this one DOES work today, so the gap above is
+    // specific". It did pass -- but for the WRONG reason: with the old
+    // integer-only COMPARE, `b == "abc"` was true because both sides
+    // resolved to 0, not because the strings matched. It would have passed
+    // just as happily with `b = "zzz"`. The negative case below is what
+    // makes this an actual control; it would have failed before the
+    // 2026-09-14 COMPARE fix.
     let src = r#"
 program P implements ISolve {
     public function solve(input: str): str {
@@ -91,4 +101,16 @@ program P implements ISolve {
 }
 "#;
     assert_eq!(question_of(run(src, "solve", vec![Value::Str("_".into())])), "eq_true");
+
+    // The negative case the original control was missing.
+    let src_mismatch = src.replace(r#"assign b = "abc";"#, r#"assign b = "zzz";"#);
+    assert_ne!(
+        src_mismatch, src,
+        "the replace above must actually have changed the fixture"
+    );
+    assert_eq!(
+        question_of(run(&src_mismatch, "solve", vec![Value::Str("_".into())])),
+        "eq_false",
+        "two different strings must NOT compare equal"
+    );
 }

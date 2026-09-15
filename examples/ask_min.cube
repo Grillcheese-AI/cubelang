@@ -14,6 +14,14 @@
 # to satisfy the interface and otherwise unused -- the same shape
 # qc_decision.cube's `solve` already uses (its real inputs arrive via
 # injected registers, not the declared parameter either).
+#
+# Demonstrates: ISolve, ASK/Suspend (the third ExecResult), storage+constructor.
+# Run:     $CUBELANG_EXE run examples/ask_min.cube --json
+# Expect:  {"suspended":true,"question":"which moon landing did you mean",
+#           "candidates":[1959,1969],...} -- the run stops HERE; a real
+#          caller answers with one of the two candidates and resumes (see
+#          `cubelang run` without --json for the interactive debug harness,
+#          or tests/ask_suspend.rs for a programmatic resume).
 
 program AskMin implements ISolve {
 

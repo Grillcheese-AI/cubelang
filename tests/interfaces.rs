@@ -267,26 +267,78 @@ fn fibonacci_cube_example_still_compiles() {
 }
 
 #[test]
-fn gsm8k_cube_example_still_compiles() {
+fn gsm8k_cube_example_fails_on_the_c11_operand_bug() {
     // Task 7: gsm8k.cube dropped its own inline `interface ISolver { ...
     // optional ... learn(...) }` in favor of the registry's `ISolverLearn`
     // (parse/solve/verify/learn, all four required -- the registry has no
     // optional-member concept). gsm8k.cube already provides a real `learn`,
     // so this is a real-file regression guard for that registry interface,
     // not just the synthetic fixtures above.
+    //
+    // UPDATED 2026-09-14 (DRIFT.md C11): this test used to assert the file
+    // "must still compile". It no longer does, and that is the CORRECT
+    // outcome, not a regression to paper over. `compile_expr_operand` can
+    // only encode ATOMS; every compound expression form (MapLit, BinOp,
+    // StructLit, UnaryOp, Lambda) used in operand position previously
+    // emitted a silent OP_NONE placeholder. gsm8k.cube is full of them --
+    // the constructor's `self.patterns = {};` is simply the first one
+    // traversal reaches -- which is exactly why DRIFT.md "Bugs found" #1
+    // records it running to `{"ok":true,"result":0}` with no error. A
+    // program that can only ever return a meaningless answer must not
+    // compile. Assert the diagnostic's SHAPE, not which violation happens
+    // to be hit first: that is traversal order, not a contract.
     let source = include_str!("../examples/gsm8k.cube");
-    compiler::compile(source).expect("gsm8k.cube must still compile");
+    let err = compiler::compile(source)
+        .expect_err("gsm8k.cube uses un-encodable expression operands -- must fail to compile");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be encoded as an operand"),
+        "error should be the C11 operand diagnostic: {}",
+        msg
+    );
+    assert!(
+        ["BinOp", "MapLit", "StructLit", "UnaryOp", "Lambda"]
+            .iter()
+            .any(|f| msg.contains(f)),
+        "error should name the offending expression form: {}",
+        msg
+    );
 }
 
 #[test]
-fn conversation_agent_cube_example_still_compiles() {
+fn conversation_agent_cube_example_fails_on_the_c11_operand_bug() {
     // Task 7: dropped its own inline `IConversationAgent` (identical shape to
     // gsm8k.cube's old inline ISolver) in favor of the same registry
     // `ISolverLearn` gsm8k.cube now implements -- both real 4-method
     // implementers share one registry contract instead of two near-identical
     // in-file ones.
+    //
+    // UPDATED 2026-09-14 (DRIFT.md C11): same flip, same reason as
+    // `gsm8k_cube_example_fails_on_the_c11_operand_bug` above -- the
+    // constructor opens with a `MapLit` in operand position. DRIFT.md
+    // "Bugs found" already records this file failing at RUNTIME with
+    // "CALL: unresolved function name"; C11 moves that failure forward to
+    // compile time, where it belongs. The `implements ISolverLearn`
+    // conformance this test was written to guard is checked by the
+    // synthetic registry fixtures above; what is pinned here is that the
+    // file does not silently produce a meaningless answer.
     let source = include_str!("../examples/conversation_agent/conversation_agent.cube");
-    compiler::compile(source).expect("conversation_agent.cube must still compile");
+    let err = compiler::compile(source).expect_err(
+        "conversation_agent.cube uses un-encodable expression operands -- must fail to compile",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be encoded as an operand"),
+        "error should be the C11 operand diagnostic: {}",
+        msg
+    );
+    assert!(
+        ["BinOp", "MapLit", "StructLit", "UnaryOp", "Lambda"]
+            .iter()
+            .any(|f| msg.contains(f)),
+        "error should name the offending expression form: {}",
+        msg
+    );
 }
 
 // ── Task 8: `@external public` is redundant ceremony on interface members ──

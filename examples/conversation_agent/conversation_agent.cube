@@ -8,6 +8,38 @@
 # `ISolverLearn` (src/vm/interfaces.rs), which backs both examples now. This
 # program already provides a real, non-stub `learn`, so the registry's
 # stronger "learn is required, not optional" contract costs nothing here.
+#
+# STATUS (see docs/DRIFT.md "Bugs found" #2): this file does NOT compile, in
+# any mode, as of the 2026-09-14 fixes -- previously it at least got as far
+# as a RUNTIME error ({"ok":false,"error":"CALL: unresolved function name"})
+# under a plain loose `run`; now it fails earlier, at COMPILE time, for the
+# same underlying reason as gsm8k.cube's C11 fix: this file uses arithmetic/
+# string-concatenation (`BinOp`), struct literals (`StructLit`), and method
+# calls (`MethodCall`) as call arguments and `let` RHS values throughout
+# (`build_state`, `retrieve_memories`, `classify_intent`, `compose_reply`,
+# `render_body`, `render_ending`, `estimate_confidence`, ...) -- shapes
+# `compile_expr_operand` cannot encode. That is now a HARD COMPILE ERROR IN
+# EVERY MODE (not just `--strict`; `--loose` does not help), fixed from a
+# silent OP_NONE placeholder that is exactly what made "CALL: unresolved
+# function name" possible in the first place (a garbage callee/argument from
+# the placeholder). On top of that, `cubelang run`/`compile`/`check` are now
+# STRICT BY DEFAULT too, so this file's map-index `assign`s onto `self.*`
+# and its 3 `match` statements (docs/DRIFT.md §C3/§C4) are ALSO reported.
+# The only harness in this repo that runs anything from this directory
+# (examples/run_conversation_min.rs) exercises the much simpler sibling
+# file, conversation_min.cube, never this one. Kept (not deleted, and NOT
+# rewritten to "fix" its logic -- per the task brief, it fails honestly now
+# instead of failing confusingly) as a forward-looking fixture for the
+# intended shape of a full ISolverLearn conversational agent (memory
+# retrieval, intent classification, dialogue-act planning); treat it as a
+# design sketch, not a working reference.
+#
+# Run (fails to build): $CUBELANG_EXE run examples/conversation_agent/conversation_agent.cube --json
+# Expect:                a compile error naming "BinOp"/"StructLit"/
+#                        "MethodCall" (C11), plus, under the default strict
+#                        compile, "match" and "assign" violations too -- see
+#                        tests/examples_pinned.rs for the exact pin.
+# See instead: examples/conversation_agent/conversation_min.cube (works).
 
 event ReplyGenerated {
     program: str;

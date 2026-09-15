@@ -7,6 +7,13 @@
 #
 # Every opcode here executes. QUERY does an exact hash lookup with provenance;
 # ASK suspends and resumes. Zero embeddings, zero forward passes.
+#
+# Demonstrates: ISolve, real QUERY (see docs/REFERENCE.md 3.4 -- QUERY is NOT
+# trace-only despite docs/ASK_SUSPEND.md's own stale table), LEN/INDEX, ASK.
+# Run:    $CUBELANG_EXE run examples/ground_min.cube --json --knowledge examples/facts_min.jsonl --arg "printing press"
+# Expect: with no --knowledge file: {"result":0,...}  (QUERY finds nothing -> gap)
+#         with --knowledge examples/facts_min.jsonl and mention "mercury"
+#         (2 facts on that key): the program ASKs and suspends instead.
 
 program Ground implements ISolve {
 

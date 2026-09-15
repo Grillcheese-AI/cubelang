@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::parser::ParseError;
+use crate::token::Span;
 // The registry is a static, deterministic capability table (see its module
 // doc), not live VM execution state -- the compiler needs read-only access
 // to it purely to validate `override` declarations at compile time.
@@ -59,6 +60,16 @@ pub mod op {
     pub const MAKE_ARRAY: u8 = 0x3A;
     pub const LEN: u8        = 0x3B;
     pub const INDEX: u8      = 0x3C;
+    /// DRIFT.md §C4 fix (2026-09-14): `container[key] = value`.
+    /// Operands: [container, key, value]. Works on both `Value::Array`
+    /// (integer key) and `Value::Map` (string key). Before this existed,
+    /// an index assignment target compiled to ZERO bytecode, silently --
+    /// the single most common violation across the complex examples.
+    ///
+    /// Not yet present in the sibling `opcode-vsa-rs` / Python VM tables;
+    /// `tests/opcode_sync.rs` only enforces bytes for names present in
+    /// BOTH, so it is listed there and will be enforced once ported.
+    pub const SET_INDEX: u8  = 0x3D;
     pub const SKIP: u8       = 0xFF;
 
     // Extended reasoning opcodes (canonical values from opcode-vsa-rs ir.rs).
@@ -602,6 +613,28 @@ pub struct Compiler {
     /// truly unknown *byte* reaching the VM, which is a bytecode invariant
     /// violation the engine itself rejects) -- it belongs at compile time.
     asm_errors: Vec<ParseError>,
+    /// DRIFT.md §C11 fix: `compile_expr_operand` only has a real encoding
+    /// for a literal, a bare identifier, `self.field`, and a simple
+    /// `expr.field`. Every other expression shape (`BinOp`, `UnaryOp`,
+    /// `StructLit`, `MapLit`, `Lambda`, `Await`, `Deploy`, `Proxy`, a nested
+    /// `Call`/`MethodCall`, `Index`, ...) used to silently fall through to
+    /// an opaque `OP_NONE` placeholder -- e.g. `double_it(x - y)` compiled
+    /// clean and ran as `double_it(<garbage>)`, and `--strict` never
+    /// noticed because it checks statement SHAPES, never descends into an
+    /// individual operand. Pushed to whenever that catch-all fires, and
+    /// checked UNCONDITIONALLY (like `capability_errors`/`interface_errors`/
+    /// `asm_errors` above) -- not just under `--strict` -- since this is the
+    /// one silent-garbage path strict mode could not catch, so a mode flag
+    /// is not an acceptable gate for it.
+    operand_errors: Vec<ParseError>,
+    /// Best-effort source location for `operand_errors` messages. Updated at
+    /// the top of `compile_stmt` from whichever `Stmt` variants carry a
+    /// `Span` (see `stmt_span`); left at its previous value for statements
+    /// that don't (e.g. `Stmt::Return`), so an operand error deep inside one
+    /// of those still reports the nearest enclosing statement's line rather
+    /// than nothing. Reset to `None` at the start of every function so a
+    /// span never leaks from one function into the next.
+    current_span: Option<Span>,
 }
 
 impl Compiler {
@@ -621,6 +654,8 @@ impl Compiler {
             inline_interfaces: HashMap::new(),
             interface_errors: Vec::new(),
             asm_errors: Vec::new(),
+            operand_errors: Vec::new(),
+            current_span: None,
         }
     }
 
@@ -718,6 +753,9 @@ impl Compiler {
         self.labels.clear();
         self.debug_lines.clear();
         self.current_function = func.sig.name.clone();
+        // DRIFT.md §C11: don't let an operand-error span from a PREVIOUS
+        // function leak into this one's error messages.
+        self.current_span = None;
 
         // Task 3: a postfix `override` is only meaningful -- and only
         // compiles cleanly -- if the name it claims is genuinely overridable
@@ -971,10 +1009,13 @@ impl Compiler {
     fn strict_check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             // ── Known non-executing constructs (unchanged from before) ──
-            Stmt::Match(m) => {
-                self.strict_violation("match (no arm selection at runtime)",
-                    Some(m.span.line));
-            }
+            // `match` was on this blocklist because every arm's body ran
+            // unconditionally (DRIFT.md C3). `compile_match` now emits a
+            // real COMPARE/COND chain, so the construct executes and is no
+            // longer a strict violation. Arm bodies are strict-checked by
+            // the ordinary recursion (`compile_match` -> `compile_stmt` ->
+            // `strict_check_stmt`), same as if/while/try bodies.
+            Stmt::Match(_) => {}
             Stmt::Opcode(OpcodeStmt::Extended { op: ext, .. }) => {
                 if is_trace_only_ext_op(*ext) {
                     self.strict_violation(&format!("opcode {} (trace-only)", ext_name(*ext)), None);
@@ -999,12 +1040,12 @@ impl Compiler {
             // strict-mode check is needed on top of that.
             Stmt::Let(_) | Stmt::If(_) | Stmt::For(_) | Stmt::While(_)
             | Stmt::Return(_) | Stmt::Atomic(_) | Stmt::Emit(_) | Stmt::Asm(_) => {}
-            // try/catch bodies are real (LABEL/JMP scaffolding); nested
-            // statements are independently re-checked via recursion.
-            // NOTE: `finally_body` is a separate, pre-existing gap --
-            // compile_stmt's TryCatch arm never compiles it at all (not
-            // even to a SKIP), so no per-statement bytecode check can catch
-            // it here. Out of scope for this fix; see task report.
+            // try/catch/finally bodies are all real (LABEL/JMP scaffolding,
+            // and -- DRIFT.md §C8 fix -- `finally_body`'s statements are now
+            // compiled onto the shared try/catch convergence point too);
+            // nested statements in all three are independently re-checked
+            // via recursion (`compile_stmt` calls itself on each), so no
+            // separate check is needed at this level.
             Stmt::TryCatch(_) => {}
 
             // ── Explicitly-whitelisted no-ops ────────────────────────────
@@ -1026,18 +1067,16 @@ impl Compiler {
                         Some(a.span.line));
                 }
             }
-            Stmt::Assign(a) => {
-                // compile_stmt's Assign arm only handles `self.field` and a
-                // bare identifier target. An index target (`arr[0] = x`),
-                // nested field access, or anything else silently compiles
-                // to ZERO bytecode -- the sibling silent-drop from the audit.
-                if !matches!(a.target, Expr::SelfAccess(_) | Expr::Ident(_)) {
-                    self.strict_violation(
-                        &format!("assign (unsupported assignment target `{:?}` -- only \
-                         `self.field` and a bare identifier compile)", a.target),
-                        Some(a.span.line));
-                }
-            }
+            // DRIFT.md §C4 fix (2026-09-14). `compile_assign` now handles a
+            // bare identifier, `self.field`, and a single index into either
+            // (`name[key] = v` -> SET_INDEX). Every OTHER target shape --
+            // nested field, nested index, call result -- is a hard
+            // `operand_errors` failure in EVERY mode rather than a
+            // `--strict`-only warning, for the same reason as C11: a
+            // statement that cannot be encoded must not silently vanish, and
+            // a mode flag is not an acceptable gate for a silent drop. So
+            // there is nothing left for strict mode to add here.
+            Stmt::Assign(_) => {}
             Stmt::Expr(e) => {
                 // compile_expr_discard only emits real bytecode (CALL+POP)
                 // for a Call/MethodCall; any other expression used as a
@@ -1071,6 +1110,15 @@ impl Compiler {
     // ── Statement compilation ───────────────────────────────────────────
 
     fn compile_stmt(&mut self, stmt: &Stmt) {
+        // DRIFT.md §C11: track the nearest enclosing statement span so an
+        // operand-encoding error deep inside (e.g. a `let`/`assign` RHS, a
+        // call argument) can name a source line. Not every `Stmt` variant
+        // carries a `Span` (see `stmt_span`); when one doesn't, the
+        // previously-seen span is left in place rather than cleared, since
+        // "the nearest known line" is more useful than nothing.
+        if let Some(span) = stmt_span(stmt) {
+            self.current_span = Some(span);
+        }
         if self.strict {
             self.strict_check_stmt(stmt);
         }
@@ -1153,35 +1201,48 @@ impl Compiler {
                 self.emit_global(&e.event_name);
             }
             Stmt::TryCatch(tc) => {
+                // DRIFT.md §C8 fix: `finally_body` used to be parsed and
+                // then never compiled at all, in any mode -- the one
+                // construct on the non-executing list that even `--strict`
+                // couldn't catch (per-statement checks can't see a body
+                // `compile_stmt` never visits).
+                //
+                // The normal path is `try_body; JMP <join>` (skip the catch
+                // body entirely); the caught path is `LABEL catch; catch_body`
+                // falling through into the same `<join>` point. A `finally`
+                // block must run on BOTH paths, which means it has to be
+                // compiled AT that join point, not after it -- putting it
+                // between the join label and a separate trailing label (an
+                // earlier version of this fix did exactly that) would let
+                // the normal path's JMP skip over the finally body too,
+                // since the JMP lands on the join label and everything
+                // after it -- catch body AND finally body alike -- runs
+                // only via fall-through. So when there IS a finally block,
+                // the join label IS the finally label: the JMP targets the
+                // spot right before the finally body, not right after it.
                 let catch_label = self.fresh_label("catch");
+                let join_label = if tc.finally_body.is_some() {
+                    self.fresh_label("finally")
+                } else {
+                    self.fresh_label("try_end")
+                };
                 self.emit_debug(op::LABEL, "try_start");
                 for s in &tc.try_body {
                     self.compile_stmt(s);
                 }
-                let end_label = self.fresh_label("try_end");
-                self.emit_jmp(&end_label);
+                self.emit_jmp(&join_label);
                 self.emit_label(&catch_label);
                 for s in &tc.catch_body {
                     self.compile_stmt(s);
                 }
-                self.emit_label(&end_label);
-            }
-            Stmt::Assign(a) => {
-                // x = expr or x += expr
-                if let Expr::SelfAccess(field) = &a.target {
-                    self.emit_debug(op::ASSIGN, &format!("self.{} = ...", field));
-                    self.emit_byte(op::ASSIGN);
-                    self.emit_byte(2);
-                    self.emit_named(field);
-                    self.compile_expr_operand(&a.value);
-                } else if let Expr::Ident(name) = &a.target {
-                    self.emit_debug(op::ASSIGN, &format!("{} = ...", name));
-                    self.emit_byte(op::ASSIGN);
-                    self.emit_byte(2);
-                    self.emit_named(name);
-                    self.compile_expr_operand(&a.value);
+                self.emit_label(&join_label);
+                if let Some(finally_body) = &tc.finally_body {
+                    for s in finally_body {
+                        self.compile_stmt(s);
+                    }
                 }
             }
+            Stmt::Assign(a) => self.compile_assign(a),
             Stmt::Expr(e) => {
                 self.compile_expr_discard(e);
             }
@@ -1539,17 +1600,177 @@ impl Compiler {
         self.emit_label(&end_label);
     }
 
+    /// Real arm selection (DRIFT.md §C3 / §A7 fix, 2026-09-14).
+    ///
+    /// This used to compile every arm's body unconditionally, in source
+    /// order, with no comparison and no jumps at all -- the `end_label` was
+    /// emitted but nothing ever targeted it. It looked exactly like working
+    /// branching logic and produced a plausible, wrong answer instead of an
+    /// error, which DRIFT.md called the single most dangerous entry on the
+    /// non-executing list.
+    ///
+    /// `match (subject) { p1 => b1; p2 => b2; _ => bN; }` now lowers to the
+    /// same COMPARE/COND primitive `compile_if` already uses -- an if/else-if
+    /// chain, which is all a match over scalar patterns is:
+    ///
+    /// ```text
+    ///     COMPARE subject, p1, kind=0(eq)
+    ///     COND  -> _arm_2          ; COND jumps when the flag is FALSE
+    ///     <b1>
+    ///     JMP   -> _endmatch
+    ///   LABEL _arm_2
+    ///     COMPARE subject, p2, kind=0
+    ///     COND  -> _arm_3
+    ///     <b2>
+    ///     JMP   -> _endmatch
+    ///   LABEL _arm_3
+    ///     <bN>                     ; wildcard: no test, always taken
+    ///   LABEL _endmatch
+    /// ```
+    ///
+    /// Two things this depends on, both of which had to be true first:
+    /// - `op::COMPARE` compares strings AS strings (fixed the same day in
+    ///   `src/vm/engine.rs`). Before that every `Value::Str` resolved to 0,
+    ///   so every string arm would have matched and the first arm would
+    ///   always have won -- swapping one silent wrong answer for another.
+    /// - The subject and every pattern must be operand-encodable (C11).
+    ///   A subject like `match (op[0])` is now a compile error, not silent
+    ///   garbage; write `index o, op, 0; match (o) { ... }`.
+    ///
+    /// `_` is the wildcard/default arm. It takes no test, and arms written
+    /// after it are unreachable, so emission stops there rather than
+    /// emitting dead bytecode.
     fn compile_match(&mut self, match_stmt: &MatchStmt) {
         let end_label = self.fresh_label("endmatch");
-        self.emit_debug(op::COMPARE, "match");
 
         for arm in &match_stmt.arms {
+            if is_wildcard_pattern(&arm.pattern) {
+                // Default arm: reached only by falling through every
+                // preceding arm's COND, so it needs no test of its own.
+                for s in &arm.body {
+                    self.compile_stmt(s);
+                }
+                // Anything after `_` can never run. Don't emit it.
+                break;
+            }
+
+            let next_label = self.fresh_label("arm");
+
+            // COMPARE subject, pattern, kind 0 (eq) -- same layout as
+            // `compile_condition`'s comparison path.
+            self.emit_debug(op::COMPARE, "match arm ==");
+            self.emit_byte(op::COMPARE);
+            self.emit_byte(3);
+            self.compile_expr_operand(&match_stmt.expr);
+            self.compile_expr_operand(&arm.pattern);
+            self.emit_imm(0);
+            // COND jumps when the flag is FALSE, i.e. on a non-match, so it
+            // targets the NEXT arm's test.
+            self.emit_cond_jump(&next_label);
+
             for s in &arm.body {
                 self.compile_stmt(s);
             }
+            // Leave the match once an arm has run: without this the body
+            // would fall straight into the next arm's COMPARE and the
+            // construct would silently behave like the run-every-arm bug
+            // this replaces. Emitted unconditionally -- on the final arm it
+            // targets the label immediately following, which is harmless.
+            self.emit_jmp(&end_label);
+            self.emit_label(&next_label);
         }
 
         self.emit_label(&end_label);
+    }
+
+    /// Assignment statements. Two DRIFT.md fixes landed here on 2026-09-14;
+    /// before them this was a bare if/else-if over two target shapes that
+    /// emitted nothing at all for anything else, and ignored the operator.
+    ///
+    /// **§C4 — index-assignment targets emitted ZERO bytecode.** `arr[0] = x`,
+    /// `regs[reg] = v`, `self.patterns[k] = h` all fell off the end of the
+    /// chain silently. It is the mechanism behind `examples/gsm8k.cube`
+    /// returning a meaningless 0, and the most common single violation across
+    /// the complex examples. They now emit `SET_INDEX [container, key, value]`.
+    ///
+    /// **Compound assignment was compiled as plain assignment.** `a.op` was
+    /// parsed into the AST and then never read, so `total += 5` emitted
+    /// `ASSIGN total, 5` -- `total = 10; total += 5;` returned **5**, not 15,
+    /// with no error. `+=`/`-=`/`*=`/`/=` now emit ADD/SUB/MUL/DIV, which
+    /// already do a read-modify-write on the register.
+    fn compile_assign(&mut self, a: &AssignStmt) {
+        // The register (or self-field) name the operator applies to, for the
+        // two simple target shapes. `self.field` and a bare identifier are
+        // the same thing at the bytecode level: a named register.
+        let simple_target: Option<String> = match &a.target {
+            Expr::SelfAccess(field) => Some(field.clone()),
+            Expr::Ident(name) => Some(name.clone()),
+            _ => None,
+        };
+
+        if let Some(name) = simple_target {
+            let opcode = match a.op {
+                AssignOp::Eq => op::ASSIGN,
+                AssignOp::PlusEq => op::ADD,
+                AssignOp::MinusEq => op::SUB,
+                AssignOp::StarEq => op::MUL,
+                AssignOp::SlashEq => op::DIV,
+            };
+            self.emit_debug(opcode, &format!("{} {:?} ...", name, a.op));
+            self.emit_byte(opcode);
+            self.emit_byte(2);
+            self.emit_named(&name);
+            self.compile_expr_operand(&a.value);
+            return;
+        }
+
+        // Index target: `container[key] = value`.
+        if let Expr::Index(base, key) = &a.target {
+            // The container has to name a register. `a[i][j] = v` (a nested
+            // index) and `f()[0] = v` do not, and there is no temporary to
+            // hold the intermediate container -- see C11 on why this compiler
+            // has no lowering pass. Fall through to the error below rather
+            // than emitting something that looks right.
+            let container = match base.as_ref() {
+                Expr::Ident(name) => Some(name.clone()),
+                Expr::SelfAccess(field) => Some(field.clone()),
+                _ => None,
+            };
+            if let Some(container) = container {
+                if !matches!(a.op, AssignOp::Eq) {
+                    // `m[k] += 1` would need a read-modify-write through a
+                    // temporary the compiler cannot allocate. Refuse loudly.
+                    self.operand_errors.push(ParseError {
+                        message: format!(
+                            "compound assignment `{:?}` to an index target (`{}[...]`) is not \
+                             supported -- read the element into a register, apply the operator \
+                             there, then assign it back",
+                            a.op, container),
+                        span: a.span,
+                    });
+                    return;
+                }
+                self.emit_debug(op::SET_INDEX, &format!("{}[...] = ...", container));
+                self.emit_byte(op::SET_INDEX);
+                self.emit_byte(3);
+                self.emit_named(&container);
+                self.compile_expr_operand(key);
+                self.compile_expr_operand(&a.value);
+                return;
+            }
+        }
+
+        // Anything else: a nested field (`a.b.c = v`), a nested index, a call
+        // result. These used to compile to nothing at all. They are now a
+        // hard error in every mode, for the same reason as C11 -- a statement
+        // that cannot be encoded must not silently disappear.
+        self.operand_errors.push(ParseError {
+            message: format!(
+                "assignment target `{:?}` cannot be encoded -- only a bare identifier, \
+                 `self.field`, and a single index into either (`name[key]`) are supported",
+                a.target),
+            span: a.span,
+        });
     }
 
     fn compile_let(&mut self, let_stmt: &LetStmt) {
@@ -1602,14 +1823,27 @@ impl Compiler {
                 }
             }
             // let x = arr[i] → INDEX x, arr, i
+            //
+            // DRIFT.md §C4 (2026-09-14): `self.field[key]` reads here too.
+            // This arm used to accept only `Expr::Ident` as the container, so
+            // `let got = self.patterns["k"];` fell through to the operand
+            // encoder and failed -- asymmetric with `compile_assign`, which
+            // accepts `self.field[key]` as a WRITE target. At the bytecode
+            // level a storage field and a local are both just named
+            // registers, so the same operand shape works for both.
             Expr::Index(arr_expr, idx_expr) => {
-                if let Expr::Ident(arr) = arr_expr.as_ref() {
+                let container = match arr_expr.as_ref() {
+                    Expr::Ident(name) => Some(name.clone()),
+                    Expr::SelfAccess(field) => Some(field.clone()),
+                    _ => None,
+                };
+                if let Some(arr) = container {
                     self.emit_debug(op::INDEX,
                         &format!("index {} = {}[...]", let_stmt.name, arr));
                     self.emit_byte(op::INDEX);
                     self.emit_byte(3);
                     self.emit_named(&let_stmt.name);
-                    self.emit_named(arr);
+                    self.emit_named(&arr);
                     self.compile_expr_operand(idx_expr);
                     return;
                 }
@@ -1667,7 +1901,37 @@ impl Compiler {
                 }
             }
             _ => {
-                // Complex expressions: emit as opaque reference
+                // DRIFT.md §C11: this used to silently emit an opaque
+                // OP_NONE placeholder here -- e.g. `double_it(x - y)`
+                // compiled clean (even under `--strict`, which only checks
+                // statement SHAPES and never descends into an individual
+                // operand) and ran as `double_it(<garbage>)`, returning 0
+                // instead of 4. That is now a hard compile error in EVERY
+                // mode, not just `--strict`: this is the one silent-garbage
+                // path strict mode could never catch, so a mode flag is not
+                // an acceptable gate for it. Reached from call arguments
+                // (`emit_call`), array-literal elements, index expressions,
+                // and any `let`/`assign` RHS that isn't one of the
+                // specially-handled shapes above.
+                let form = expr_form_name(expr);
+                let message = format!(
+                    "expression form {} cannot be encoded as an operand{}; compute it into a \
+                     register first with add/sub/mul/div, then pass the register",
+                    form,
+                    if self.current_program.is_empty() && self.current_function.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" in {}::{}", self.current_program, self.current_function)
+                    },
+                );
+                self.operand_errors.push(ParseError {
+                    message,
+                    span: self.current_span.unwrap_or(Span { line: 0, col: 0, offset: 0 }),
+                });
+                // Still emit a well-formed (if meaningless) operand so the
+                // surrounding bytecode's operand count stays consistent --
+                // harmless, since `compile_ast`/`compile_ast_strict` never
+                // hand back bytecode when `operand_errors` is non-empty.
                 self.emit_byte(OP_NONE);
                 self.emit_byte(0x00);
                 self.emit_byte(0x00);
@@ -1845,6 +2109,16 @@ impl Compiler {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Is this match arm the wildcard/default arm?
+///
+/// The parser reads an arm's pattern with the ordinary expression parser
+/// (`parse_match_stmt`), so `_` arrives as `Expr::Ident("_")` rather than a
+/// dedicated pattern node. There is no `Pattern` type in the AST today;
+/// when one is added this is the single place that has to learn about it.
+fn is_wildcard_pattern(pattern: &Expr) -> bool {
+    matches!(pattern, Expr::Ident(name) if name == "_")
+}
+
 fn type_name(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Named(n) => n.clone(),
@@ -1852,6 +2126,57 @@ fn type_name(ty: &TypeExpr) -> String {
         TypeExpr::Map(_, _) => "map".into(),
         TypeExpr::Void => "void".into(),
         _ => "any".into(),
+    }
+}
+
+/// Best-effort source span for a statement, used to locate an
+/// `operand_errors` finding (DRIFT.md §C11) at the nearest enclosing
+/// statement. Not every `Stmt` variant carries a `Span` in the current AST
+/// (`Return`, `Throw`, `Opcode`, `Expr`, `Commit`, `Rollback`) -- those
+/// return `None` and `compile_stmt` simply keeps whatever span it last saw.
+fn stmt_span(stmt: &Stmt) -> Option<Span> {
+    match stmt {
+        Stmt::Let(l) => Some(l.span),
+        Stmt::Assign(a) => Some(a.span),
+        Stmt::If(i) => Some(i.span),
+        Stmt::For(f) => Some(f.span),
+        Stmt::While(w) => Some(w.span),
+        Stmt::Match(m) => Some(m.span),
+        Stmt::Emit(e) => Some(e.span),
+        Stmt::TryCatch(tc) => Some(tc.span),
+        Stmt::Assert(a) => Some(a.span),
+        Stmt::Atomic(a) => Some(a.span),
+        Stmt::Asm(b) => Some(b.span),
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Opcode(_) | Stmt::Expr(_)
+        | Stmt::Commit | Stmt::Rollback => None,
+    }
+}
+
+/// Human-readable name for an expression form that `compile_expr_operand`
+/// cannot encode (DRIFT.md §C11) -- named in the resulting compile error so
+/// it's clear exactly what needs to be computed into a register first.
+fn expr_form_name(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_) | Expr::BoolLit(_)
+        | Expr::Null | Expr::Ident(_) | Expr::SelfAccess(_) | Expr::Field(..) => {
+            // Unreachable in practice -- these all have their own arms
+            // above and never reach this function -- but named rather than
+            // `unreachable!()` so a future refactor that DOES route one of
+            // these here fails loudly with a wrong name instead of a panic.
+            "expression"
+        }
+        Expr::Index(..) => "Index",
+        Expr::Call(..) => "Call",
+        Expr::MethodCall(..) => "MethodCall",
+        Expr::BinOp(..) => "BinOp",
+        Expr::UnaryOp(..) => "UnaryOp",
+        Expr::StructLit(..) => "StructLit",
+        Expr::ArrayLit(..) => "ArrayLit",
+        Expr::MapLit(..) => "MapLit",
+        Expr::Lambda(..) => "Lambda",
+        Expr::Await(..) => "Await",
+        Expr::Deploy(..) => "Deploy",
+        Expr::Proxy(..) => "Proxy",
     }
 }
 
@@ -1954,13 +2279,29 @@ pub fn compile_ast(source: &SourceFile) -> Result<Vec<CompiledProgram>, crate::p
     if let Some(e) = compiler.asm_errors.into_iter().next() {
         return Err(e);
     }
+    // DRIFT.md §C11: a non-encodable expression operand (BinOp, UnaryOp,
+    // StructLit, MapLit, Lambda, Await, Deploy, Proxy, a nested Call/
+    // MethodCall, Index, ...) used as a call argument, array-literal
+    // element, index expression, or `let`/`assign` RHS -- checked
+    // unconditionally, same as the three error categories above, since this
+    // is the one silent-garbage path `--strict` alone could never catch.
+    if let Some(e) = compiler.operand_errors.into_iter().next() {
+        return Err(e);
+    }
     Ok(programs)
 }
 
 /// Compile in strict mode (P0-1): rejects any construct that compiles but does
 /// not execute under the safe-subset VM — extended trace-only opcodes,
-/// `match`, intra-program `call`. Returns one combined error string listing
-/// every violation (named construct + source line when available).
+/// `match`, `unify`, and the other shapes `strict_check_stmt` names. Returns
+/// one combined error string listing every violation (named construct +
+/// source line when available).
+///
+/// Fix 4 (docs/DRIFT.md "Bugs found" #5): this comment used to list
+/// "intra-program `call`" among the rejected constructs -- stale since
+/// Plan-2 made CALL a genuinely executing opcode (see `src/validate.rs:16-17`
+/// and this file's own `strict_accepts_call_now_that_it_executes` test).
+/// CALL is not rejected here; corrected.
 ///
 /// NOTE: `for` is NOT in this list, despite an earlier version of this
 /// comment claiming it was -- `strict_check_stmt`'s `Stmt::For(_)` arm is a
@@ -1993,6 +2334,10 @@ pub fn compile_ast_strict(source: &SourceFile) -> Result<Vec<CompiledProgram>, S
     // Task 6: same treatment as capability/interface errors -- folded in
     // before the strict-mode findings, always checked.
     errors.extend(compiler.asm_errors.iter().map(|e| e.to_string()));
+    // DRIFT.md §C11: same unconditional treatment -- a non-encodable
+    // operand is a bug regardless of strict mode, so it's folded in here
+    // too, before the strict-only findings.
+    errors.extend(compiler.operand_errors.iter().map(|e| e.to_string()));
     errors.extend(compiler.strict_errors);
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -2160,29 +2505,31 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_gsm8k() {
+    fn test_compile_gsm8k_now_fails_even_loose_on_the_c11_operand_bug() {
+        // FIXED 2026-09-14 (DRIFT.md §C11): this test used to assert
+        // gsm8k.cube compiled clean under loose `compile()` and inspect its
+        // bytecode. It no longer can: `learn()`'s
+        // `let diff = expected.result - actual.result;` is a `BinOp` used
+        // directly as a `let` RHS, which `compile_expr_operand` cannot
+        // encode -- previously a silent OP_NONE placeholder, now a hard
+        // compile error in EVERY mode (not just `--strict`), per the C11
+        // fix. This is the correct, honest outcome: a program that could
+        // only ever silently return a meaningless answer (docs/DRIFT.md
+        // "Bugs found" #1) should not compile at all. See
+        // `tests/examples_pinned.rs` for the CLI-level pin of this same
+        // outcome.
         let source = include_str!("../examples/gsm8k.cube");
-        let programs = compile(source).unwrap();
-
-        assert_eq!(programs.len(), 1);
-        assert_eq!(programs[0].name, "GSM8K");
-        // Task 7: gsm8k.cube moved from its own inline `interface ISolver`
-        // (learn merely optional) to the registry's `ISolverLearn` (learn
-        // required) -- see examples/gsm8k.cube and src/vm/interfaces.rs.
-        assert_eq!(programs[0].implements, vec!["ISolverLearn"]);
-
-        // Should have constructor + parse + solve + verify + learn = 5 functions
-        assert_eq!(programs[0].functions.len(), 5);
-
-        let names: Vec<&str> = programs[0].functions.iter().map(|f| f.sig_name()).collect();
-        println!("Functions: {:?}", names);
-
-        // Print solve function bytecode
-        let solve = programs[0].functions.iter().find(|f| f.name == "solve").unwrap();
-        println!("solve() bytecode: {} bytes", solve.bytecode.len());
-        for dl in &solve.debug_lines {
-            println!("  0x{:04x}: 0x{:02x} {}", dl.offset, dl.opcode, dl.description);
-        }
+        let err = compile(source).expect_err(
+            "gsm8k.cube uses un-encodable expression operands -- must be a compile error now");
+        // WHICH violation fires first is traversal order, not a contract: the
+        // constructor's `MapLit` is reached before `learn()`'s `BinOp`. Assert the
+        // shape of the diagnostic, not the identity of whichever one is hit first,
+        // or this test breaks every time an unrelated statement moves.
+        let msg = err.to_string();
+        assert!(msg.contains("cannot be encoded as an operand"),
+            "error should be the C11 operand diagnostic: {}", msg);
+        assert!(["BinOp", "MapLit", "StructLit", "UnaryOp", "Lambda"].iter().any(|f| msg.contains(f)),
+            "error should name the offending expression form: {}", msg);
     }
 
     #[test]
@@ -2207,6 +2554,13 @@ mod tests {
 
     #[test]
     fn test_cubebin_roundtrip() {
+        // `solve` used to end `return Output { result: 9 };` -- a StructLit operand,
+        // which the C11 fix now rejects outright (DRIFT.md §C11, 2026-09-14). The
+        // roundtrip under test is serialize/deserialize, not struct literals, so the
+        // fixture returns the register it just computed instead.
+        // (Note for the next person: CubeLang comments with `#`, not `//` -- a `//`
+        // inside this raw string lexes as Slash and fails with "unexpected token in
+        // expression".)
         let programs = compile(r#"
             program GSM8K implements ISolver {
                 storage {
@@ -2227,7 +2581,7 @@ mod tests {
                     sum x;
                     query x;
                     remember x;
-                    return Output { result: 9 };
+                    return x;
                 }
 
                 @external
@@ -2324,10 +2678,24 @@ mod tests {
     }
 
     #[test]
-    fn strict_rejects_match() {
+    fn strict_accepts_match_now_that_arm_selection_is_real() {
+        // FLIPPED 2026-09-14 (DRIFT.md C3/A7). This was
+        // `strict_rejects_match`, and it was right to: `compile_match` used
+        // to run EVERY arm's body unconditionally, so `match` belonged on
+        // the `--strict` blocklist for exactly the stated reason ("no arm
+        // selection at runtime"). `compile_match` now emits a real
+        // COMPARE/COND chain, so the construct executes and strict mode has
+        // nothing to object to. See `tests/match_arms.rs` for the behavioural
+        // pins, including that strict still descends INTO arm bodies.
+        //
+        // The fixture also gained the `implements ISolve` clause every
+        // program has required since the interface registry landed -- without
+        // it this test would "pass" on an unrelated error.
         let source = r#"
-            program Test {
-                public function run(): void {
+            program Test implements ISolve {
+                public function solve(input: str): void {
+                    create x : number;
+                    assign x = 1;
                     match (x) {
                         1 => { sum x; }
                         _ => { query x; }
@@ -2335,10 +2703,8 @@ mod tests {
                 }
             }
         "#;
-        let err = compile_strict(source).expect_err("match must be rejected in --strict");
-        let low = err.to_lowercase();
-        assert!(low.contains("match"), "error must name 'match': got: {}", err);
-        assert!(err.contains("line"), "error must include source line: got: {}", err);
+        compile_strict(source)
+            .expect("match executes now, so --strict must accept it");
     }
 
     #[test]
@@ -2457,24 +2823,46 @@ mod tests {
     }
 
     #[test]
-    fn strict_rejects_unsupported_assign_target() {
-        // Stmt::Assign only handles `self.field` and a bare identifier
-        // target. An index target (`arr[0] = x`) or any other non-trivial
-        // target silently compiled to ZERO bytecode, with no error, before
-        // this fix — the sibling silent-drop named in the audit.
+    fn an_index_assign_target_compiles_and_a_nested_one_is_a_hard_error() {
+        // FLIPPED 2026-09-14 (DRIFT.md §C4). This was
+        // `strict_rejects_unsupported_assign_target`, and it was right to:
+        // `Stmt::Assign` only handled `self.field` and a bare identifier, so
+        // `arr[0] = 5` silently compiled to ZERO bytecode -- the sibling
+        // silent-drop named in the audit, and the mechanism behind
+        // `examples/gsm8k.cube` returning a meaningless 0.
+        //
+        // `compile_assign` now emits SET_INDEX for a single index into a
+        // register or a storage field, so this compiles and executes. The
+        // fixture also gained the `implements` clause every program has
+        // required since the interface registry landed -- without it the old
+        // test was passing on an unrelated error, not on the assign at all.
         let source = r#"
-            program T {
-                public function run(): void {
-                    create arr : array<u64>;
+            program T implements ISolve {
+                public function solve(input: str): void {
+                    create arr : array<number>;
                     arr[0] = 5;
                 }
             }
         "#;
-        let err = compile_strict(source).expect_err(
-            "an unsupported assignment target must be rejected under --strict");
-        let low = err.to_lowercase();
-        assert!(low.contains("assign"), "error must name the assign statement: {}", err);
-        assert!(err.contains("line"), "error must include a source line: got: {}", err);
+        compile_strict(source)
+            .expect("an index assign target executes now, so --strict must accept it");
+
+        // The guarantee the old test was really protecting -- that an
+        // un-encodable target does not silently vanish -- moves to the
+        // shapes that are STILL un-encodable. These are now hard errors in
+        // every mode (not just --strict), same rationale as C11.
+        let nested = r#"
+            program T implements ISolve {
+                public function solve(input: str): void {
+                    create grid : array<number>;
+                    grid[0][1] = 5;
+                }
+            }
+        "#;
+        let err = compile(nested).expect_err(
+            "a nested index target cannot be encoded and must not compile silently");
+        assert!(err.to_string().contains("cannot be encoded"),
+            "error must say the target cannot be encoded: {}", err);
     }
 
     #[test]
@@ -2559,28 +2947,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cubebin_gsm8k_full() {
+    fn test_cubebin_gsm8k_full_now_fails_to_compile_on_the_c11_operand_bug() {
+        // FIXED 2026-09-14 (DRIFT.md §C11): this test used to compile
+        // gsm8k.cube whole and roundtrip it through .cubebin. It can no
+        // longer compile at all -- see
+        // `test_compile_gsm8k_now_fails_even_loose_on_the_c11_operand_bug`
+        // above for why (a `BinOp` used directly as a `let` RHS in
+        // `learn()`). Nothing left to roundtrip; this test now just pins
+        // the same honest failure so a future change that silently starts
+        // tolerating the bug again is caught here too.
         let source = include_str!("../examples/gsm8k.cube");
-        let programs = compile(source).unwrap();
-        let prog = &programs[0];
-
-        let bin = prog.to_cubebin();
-        println!(".cubebin size: {} bytes", bin.len());
-        println!("  magic: {:?}", std::str::from_utf8(&bin[0..4]).unwrap());
-        println!("  version: {}", bin[4]);
-        println!("  program: {}", prog.name);
-        println!("  functions: {}", prog.functions.len());
-        for f in &prog.functions {
-            println!("    {}(): {} bytes bytecode", f.name, f.bytecode.len());
-        }
-
-        // Roundtrip
-        let loaded = CompiledProgram::from_cubebin(&bin).unwrap();
-        assert_eq!(loaded.name, prog.name);
-        assert_eq!(loaded.functions.len(), prog.functions.len());
-        for (a, b) in loaded.functions.iter().zip(prog.functions.iter()) {
-            assert_eq!(a.name, b.name);
-            assert_eq!(a.bytecode, b.bytecode, "bytecode mismatch for {}", a.name);
-        }
+        compile(source).expect_err(
+            "gsm8k.cube must not compile -- see the C11 operand-encoding fix");
     }
 }

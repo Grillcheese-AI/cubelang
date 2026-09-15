@@ -1,11 +1,15 @@
 //! CubeLang CLI — compile, inspect, and run .cube programs.
 //!
 //! Usage:
-//!   cubelang compile <file.cube>              → file.cubebin
+//!   cubelang compile <file.cube>              → file.cubebin (strict by
+//!                                                default; --loose to opt out)
 //!   cubelang compile <file.cube> -o out.cubebin
+//!   cubelang run     <file.cube|file.cubebin> → execute (strict by default;
+//!                                                --loose to opt out)
 //!   cubelang inspect <file.cubebin>           → print program info
 //!   cubelang disasm  <file.cubebin>           → disassemble bytecode
-//!   cubelang check   <file.cube>              → parse + type check only
+//!   cubelang check   <file.cube>              → full strict compile, NOT
+//!                                                parse-only (--loose to opt out)
 //!   cubelang version
 
 use std::io::{Read, Write};
@@ -51,19 +55,37 @@ USAGE:
     cubelang <command> [options] <file>
 
 COMMANDS:
-    compile,  c    Compile .cube to .cubebin (use --strict to reject stubs)
-    run,      r    Compile (or load .cubebin) and execute a program
+    compile,  c    Compile .cube to .cubebin (strict by default; --loose to
+                   accept non-executing constructs as silent no-ops instead
+                   of a compile error)
+    run,      r    Compile (or load .cubebin) and execute a program (strict
+                   by default; --loose to opt out, same as compile)
     run-proto      Read a length-prefixed RunRequest from stdin, run it from
                    source, write a length-prefixed RunResult to stdout
+                   (always strict -- no --loose over this transport)
     inspect,  i    Show .cubebin program info
     disasm,   d    Disassemble .cubebin to readable opcodes
-    check,    k    Parse and check .cube without compiling
+    check,    k    Fully compile .cube in strict mode (NOT parse-only --
+                   this is the same verification `compile`/`run` do by
+                   default; pass --loose for a looser compile instead)
     validate, vd   Report executing vs trace-only opcodes per function
     version,  v    Print version
 
+NOTE: `compile`/`run`/`check` reject every non-executing construct (trace-
+only opcodes, `match`, `unify`, an unsupported assign/assert/expr-statement
+shape, `throw`, ...) as a hard compile error by default -- this is what
+"strict" used to mean and now just means; --strict is still accepted
+everywhere as an explicit no-op alias for the default. Pass --loose to get
+the old, permissive behavior back for THOSE constructs (silently compiling
+them to a no-op instead of erroring). --loose does NOT bring back a
+non-encodable expression operand (a `BinOp`/`UnaryOp`/... used where only a
+literal, a bare identifier, or `self.field` can be encoded) -- that is
+always a hard error, in every mode, because it is the one silent-garbage
+path strict mode itself could never catch (see docs/DRIFT.md §C11).
+
 EXAMPLES:
     cubelang compile examples/gsm8k.cube
-    cubelang compile --strict examples/qc_decision.cube
+    cubelang compile --loose examples/qc_decision.cube
     cubelang compile examples/gsm8k.cube -o build/gsm8k.cubebin
     cubelang inspect build/gsm8k.cubebin
     cubelang disasm build/gsm8k.cubebin
@@ -81,23 +103,29 @@ fn cmd_version() {
 fn cmd_compile(args: &[String]) {
     if args.is_empty() {
         eprintln!("error: missing input file");
-        eprintln!("usage: cubelang compile [--strict] <file.cube> [-o output.cubebin]");
+        eprintln!("usage: cubelang compile [--loose] <file.cube> [-o output.cubebin]");
         process::exit(1);
     }
 
-    // Parse flags and positional args. `--strict` (P0-1) rejects non-executing
-    // constructs (trace-only opcodes, `match`, intra-program `call` -- NOT
-    // `for`, which always lowers to real loop scaffolding; see
-    // `compiler::compile_strict`'s doc).
-    let mut strict = false;
+    // Parse flags and positional args. Strict verification (P0-1: rejects
+    // non-executing constructs -- trace-only opcodes, `match`, `unify`, ...
+    // NOT `for`, which always lowers to real loop scaffolding; see
+    // `compiler::compile_strict`'s doc) is now the DEFAULT (see docs/DRIFT.md
+    // "the language's accepted surface should equal its executing surface").
+    // `--strict` is kept as an accepted, explicit no-op for anyone still
+    // typing it out of habit or in an existing script; `--loose` is the new
+    // opt-out.
+    let mut strict = true;
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
-        if arg == "--strict" { strict = true; } else { positional.push(arg); }
+        if arg == "--strict" { strict = true; }
+        else if arg == "--loose" { strict = false; }
+        else { positional.push(arg); }
     }
 
     if positional.is_empty() {
         eprintln!("error: missing input file");
-        eprintln!("usage: cubelang compile [--strict] <file.cube> [-o output.cubebin]");
+        eprintln!("usage: cubelang compile [--loose] <file.cube> [-o output.cubebin]");
         process::exit(1);
     }
 
@@ -126,7 +154,8 @@ fn cmd_compile(args: &[String]) {
         match compiler::compile_ast_strict(&merged) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("error (--strict): {}", e);
+                eprintln!("error (strict compile -- pass --loose to accept non-executing \
+                           constructs instead): {}", e);
                 process::exit(1);
             }
         }
@@ -324,16 +353,36 @@ fn opcode_name(code: u8) -> &'static str {
 
 fn cmd_check(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: cubelang check <file.cube>");
+        eprintln!("usage: cubelang check [--loose] <file.cube>");
         process::exit(1);
     }
 
+    // Fix 4 (docs/DRIFT.md §A4/B7): `check` was never parse-only -- it has
+    // always fully compiled (see the comment on the compile call below) --
+    // and this usage/help text no longer claims otherwise (see also
+    // `print_usage`'s COMMANDS entry for `check`). Strict-by-default (this
+    // is the same flip `compile`/`run` got): `--loose` opts `check` out of
+    // strict verification into a plain compile; `--strict` is accepted as
+    // an explicit no-op alias for the default, same as the other commands.
+    let mut strict = true;
+    let mut positional: Vec<&String> = Vec::new();
+    for arg in args {
+        if arg == "--strict" { strict = true; }
+        else if arg == "--loose" { strict = false; }
+        else { positional.push(arg); }
+    }
+    if positional.is_empty() {
+        eprintln!("usage: cubelang check [--loose] <file.cube>");
+        process::exit(1);
+    }
+    let input = positional[0];
+
     // Load + merge (Task 5: `import`) instead of a bare parse -- `check`
     // should see the whole compilation unit, imports included.
-    let ast = match loader::load(Path::new(&args[0])) {
+    let ast = match loader::load(Path::new(input)) {
         Ok(ast) => ast,
         Err(e) => {
-            eprintln!("  {} error: {}", args[0], e);
+            eprintln!("  {} error: {}", input, e);
             process::exit(1);
         }
     };
@@ -342,11 +391,18 @@ fn cmd_check(args: &[String]) {
     // parse-only -- a program that parses but fails real compilation (a
     // missing `implements`, an unknown `asm` mnemonic, or a strict-mode
     // violation like a trace-only ext op) silently reported "ok". Actually
-    // compile it, in strict mode, so `check` is an honest "will this run
-    // safely" preflight rather than just a syntax check -- the same
-    // strict verifier `compile --strict` and `run --strict` use.
-    if let Err(e) = compiler::compile_ast_strict(&ast) {
-        eprintln!("  {} error: {}", args[0], e);
+    // compile it -- in strict mode by default, so `check` is an honest
+    // "will this run safely" preflight rather than just a syntax check, the
+    // same strict verifier `compile`/`run` now use by default too; --loose
+    // falls back to a plain (non-strict) compile for anyone who wants the
+    // looser check.
+    let compile_result = if strict {
+        compiler::compile_ast_strict(&ast).map(|_| ())
+    } else {
+        compiler::compile_ast(&ast).map(|_| ()).map_err(|e| e.to_string())
+    };
+    if let Err(e) = compile_result {
+        eprintln!("  {} error: {}", input, e);
         process::exit(1);
     }
 
@@ -367,7 +423,7 @@ fn cmd_check(args: &[String]) {
     }
 
     println!("  {} ok ({} items: {} programs, {} interfaces, {} structs, {} enums)",
-        args[0], n_items, n_programs, n_interfaces, n_structs, n_enums);
+        input, n_items, n_programs, n_interfaces, n_structs, n_enums);
 }
 
 // ── validate ────────────────────────────────────────────────────────────────
@@ -406,7 +462,7 @@ fn cmd_validate(args: &[String]) {
 fn cmd_run(args: &[String]) {
     if args.is_empty() {
         eprintln!("usage: cubelang run <file.cube|file.cubebin> \
-                   [--strict] [--fn name] [--trace] [--json] [--arg VALUE]... \
+                   [--loose] [--fn name] [--trace] [--json] [--arg VALUE]... \
                    [--knowledge facts.jsonl]");
         process::exit(1);
     }
@@ -415,11 +471,15 @@ fn cmd_run(args: &[String]) {
     let mut target_fn = "solve".to_string();
     let mut trace = false;
     let mut json_out = false;
-    // Task 8 (Feature B, verify-before-execute): mirrors `cmd_compile`'s
-    // `--strict` (P0-1) -- rejects non-executing constructs (trace-only
-    // opcodes, `match`, ...; see `compile_strict`'s doc for the exact list)
-    // for the `.cube`-from-source path here too, not just `compile`.
-    let mut strict = false;
+    // Task 8 (Feature B, verify-before-execute) / strict-by-default: rejects
+    // non-executing constructs (trace-only opcodes, `match`, ...; see
+    // `compile_strict`'s doc for the exact list) for the `.cube`-from-source
+    // path, same as `compile`. Strict is now the DEFAULT here too (see
+    // docs/DRIFT.md: "the language's accepted surface should equal its
+    // executing surface, so a model trained on it learns one consistent
+    // thing"). `--strict` remains an accepted explicit no-op; `--loose`
+    // opts out.
+    let mut strict = true;
     let mut knowledge_path: Option<String> = None;
     let mut call_args: Vec<Value> = Vec::new();
     let mut i = 1;
@@ -429,6 +489,7 @@ fn cmd_run(args: &[String]) {
             "--trace" | "-t" => trace = true,
             "--json" | "-j" => json_out = true,
             "--strict" => strict = true,
+            "--loose" => strict = false,
             // Facts for QUERY. Without this the VM has no knowledge and
             // abstains on every query -- which is correct, but not useful.
             "--knowledge" | "-k" => {
@@ -474,14 +535,16 @@ fn cmd_run(args: &[String]) {
             Ok(ast) => ast,
             Err(e) => { eprintln!("error: {}", e); process::exit(1); }
         };
-        // Task 8: same strict/loose split as `cmd_compile` above -- `--strict`
-        // surfaces non-executing constructs as hard errors instead of
-        // silently compiling them to no-ops.
+        // Task 8 / strict-by-default: same strict/loose split as `cmd_compile`
+        // above -- strict (the default) surfaces non-executing constructs as
+        // hard errors instead of silently compiling them to no-ops; --loose
+        // opts out.
         let programs = if strict {
             match compiler::compile_ast_strict(&merged) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("error (--strict): {}", e);
+                    eprintln!("error (strict compile -- pass --loose to accept non-executing \
+                               constructs instead): {}", e);
                     process::exit(1);
                 }
             }

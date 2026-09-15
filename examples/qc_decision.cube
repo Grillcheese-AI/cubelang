@@ -8,7 +8,7 @@
 #   if/else, compare(register-or-literal). Flat operands only.
 # It deliberately avoids: for, match, return-as-branch, and every extended
 # reasoning opcode (predict/match/score/...), which currently trace but do
-# NOT compute a value (see CUBELANG_FIXES.md P0-1).
+# NOT compute a value (see docs/DRIFT.md §C for the full list).
 #
 # HOST SHIM CONTRACT (Rust/Python caller):
 #   1. vm.load(program); vm.init("QCDecision")   # constructor sets thresholds
@@ -22,6 +22,19 @@
 #      read audit counters from vm.storage (pass_count/reject_count/review_count/total_count)
 #   IMPORTANT: do NOT `create in_class`/`create in_conf` inside solve() — that
 #   resets them to null and clobbers the injected inputs.
+#
+# WARNING (see docs/DRIFT.md "Bugs found" #4): plain `cubelang run
+# examples/qc_decision.cube --json`, with no register injection, does NOT
+# exercise the host shim contract above — `in_class`/`in_conf` are simply
+# unset (resolve to 0), so `in_conf < min_confidence` (0 < 70) is always
+# true and the disposition is always REVIEW. That is expected given the
+# missing injection, not a VM bug.
+#
+# Demonstrates: ISolver, storage+constructor, the host-injects-registers
+# pattern (a case where the model/program does NOT own all its own inputs).
+# Run:    $CUBELANG_EXE run examples/qc_decision.cube --json
+# Expect: {"result":2,...}  (REVIEW — see WARNING above; this is the plain
+#          `run` invocation, not the host-shim-injected one)
 
 program QCDecision implements ISolver {
     type Input = number;

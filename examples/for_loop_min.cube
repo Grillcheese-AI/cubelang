@@ -1,0 +1,49 @@
+# for_loop_min.cube - real `for (let x of arr)`, distinct from the raw LOOP opcode.
+#
+# `for` lowers to a real index-based `while` using MAKE_ARRAY/LEN/INDEX --
+# see docs/REFERENCE.md §8. This is a genuinely different, working construct
+# from the bare `loop`/LOOP opcode keyword (0x12), which is ALWAYS a
+# structural trace marker and never iterates anything on its own (see
+# docs/DRIFT.md §C9) -- every other example in this repo uses `while` for
+# iteration; this is the only one that exercises the array-based `for` form.
+#
+# Demonstrates: ISolver, array literals (MAKE_ARRAY), real `for`, LEN/INDEX.
+# Run:    $CUBELANG_EXE run examples/for_loop_min.cube --json
+# Expect: {"result":60,...}   (10 + 20 + 30)
+
+program ForLoopMin implements ISolver {
+    type Input = number;
+    type Output = number;
+
+    storage {
+        elements_summed: mutable u64 = 0;
+    }
+
+    @system @once
+    public function constructor() {
+        assign elements_summed = 0;
+    }
+
+    function parse(raw: str): Input {
+        return raw;
+    }
+
+    function solve(input: Input): Output {
+        let xs = [10, 20, 30];
+
+        create total : number;
+        assign total = 0;
+
+        for (let x of xs) {
+            add total, x;
+            add elements_summed, 1;
+        }
+
+        sum total;
+        return total;
+    }
+
+    pure function verify(input: Input, output: Output): bool {
+        return true;
+    }
+}
