@@ -11,6 +11,10 @@ tagged **[read]**, **[ran]**, or **[test]** for how it was verified. See
 ## A. Documented but wrong or absent
 
 ### A1. Permission attributes are advertised as enforced; none of them are enforced **(highest-value finding)**
+
+> **Resolved 2026-10-24** (A2's `private` too): every attribute in the table below is enforced
+> (`@once`/`@internal`/`@system` since VM step 0; `@restricted`, `@ratelimit`, `@cron` and `private`
+> now), with signed callers over run-proto. See `docs/CONTRACTS.md` and `tests/contracts.rs`.
 README.md:51-60 and docs/SPEC.md:52-60 carry an identical table:
 
 > `@external` | Callable by other programs and outside requests (API, user)

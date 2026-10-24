@@ -241,7 +241,58 @@ pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
 /// arguments to and synthesized `arg0`/`arg1`, so a function declared
 /// `solve(mention: str)` read an unbound register. v2 files still load: their
 /// `params` is empty and `call` falls back to the old synthesis.
-pub const CUBEBIN_VERSION: u8 = 3;
+///
+/// v4 (2026-10-24) appends the contract trailer after the symbol table: a
+/// u32 LE length, then JSON (`ProgramMeta`): `used_modules`, the file's
+/// types, and per function its override flag, access, `@once`,
+/// `@restricted`, `@ratelimit`, `@cron` and declared types.
+pub const CUBEBIN_VERSION: u8 = 4;
+
+/// The v4 contract trailer (see `CUBEBIN_VERSION`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProgramMeta {
+    used_modules: Vec<String>,
+    types: crate::types::TypeTable,
+    functions: Vec<FunctionMeta>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FunctionMeta {
+    is_override: bool,
+    access: u8,
+    once: bool,
+    restricted: Option<Vec<String>>,
+    ratelimit: Option<(u32, u64)>,
+    cron: Option<u64>,
+    param_types: Vec<crate::types::TypeSpec>,
+    return_type: crate::types::TypeSpec,
+}
+
+impl FunctionMeta {
+    fn of(f: &CompiledFunction) -> Self {
+        FunctionMeta {
+            is_override: f.is_override,
+            access: f.access.code(),
+            once: f.once,
+            restricted: f.restricted.clone(),
+            ratelimit: f.ratelimit,
+            cron: f.cron,
+            param_types: f.param_types.clone(),
+            return_type: f.return_type.clone(),
+        }
+    }
+
+    fn apply(self, f: &mut CompiledFunction) {
+        f.is_override = self.is_override;
+        f.access = Access::from_code(self.access);
+        f.once = self.once;
+        f.restricted = self.restricted;
+        f.ratelimit = self.ratelimit;
+        f.cron = self.cron;
+        f.param_types = self.param_types;
+        f.return_type = self.return_type;
+    }
+}
 
 /// A compiled CubeLang program — serializable to `.cubebin` format.
 ///
@@ -294,7 +345,13 @@ pub struct CompiledProgram {
     /// CUBEBIN_VERSION 3). Fine for in-memory compile+run, which is all
     /// Task 3 exercises; a future task should decide whether shipping
     /// `use`-dependent programs as `.cubebin` needs a version bump first.
+    ///
+    /// 2026-10-24: carried since `.cubebin` v4, with every function's
+    /// contract and types, so a saved program keeps its permissions.
     pub used_modules: Vec<String>,
+    /// The struct, enum and alias declarations of the source file, for the
+    /// run-time type checks and struct values (2026-10-24, `.cubebin` v4).
+    pub types: crate::types::TypeTable,
 }
 
 impl CompiledProgram {
@@ -349,6 +406,20 @@ impl CompiledProgram {
             buf.extend_from_slice(sym.as_bytes());
         }
 
+        // v4 (2026-10-24): the contract trailer -- `use`d modules, the file's
+        // types, and per function its override flag, access, `@once`,
+        // `@restricted`, `@ratelimit`, `@cron` and declared types. Before v4 a
+        // saved program came back with every permission dropped, so the
+        // access rules were one `compile -o` away from not existing.
+        let meta = ProgramMeta {
+            used_modules: self.used_modules.clone(),
+            types: self.types.clone(),
+            functions: self.functions.iter().map(FunctionMeta::of).collect(),
+        };
+        let json = serde_json::to_vec(&meta).expect("the contract trailer always serializes");
+        buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&json);
+
         buf
     }
 
@@ -367,7 +438,8 @@ impl CompiledProgram {
         // v1: functions only. v2: + trailing symbol-name table.
         // v3: + per-function declared parameter names. All three still load;
         // older files simply carry no params and fall back to `argN` binding.
-        if version != 1 && version != 2 && version != 3 {
+        // v4: + the contract trailer (see `to_cubebin`).
+        if !(1..=4).contains(&version) {
             return Err(format!("unsupported .cubebin version: {}", version));
         }
 
@@ -423,16 +495,23 @@ impl CompiledProgram {
             let bytecode = data[pos..pos + bc_len].to_vec();
             pos += bc_len;
 
+            let n_params = params.len();
             functions.push(CompiledFunction {
                 name: fn_name,
                 params,
                 bytecode,
                 labels: Vec::new(),
                 debug_lines: Vec::new(),
-                // Task 3: not in the .cubebin format yet -- see the field doc.
+                // Before v4 none of this was in the file; the v4 trailer below
+                // overwrites it. A v1-v3 file loads as it always did.
                 is_override: false,
                 access: Access::External,
                 once: false,
+                restricted: None,
+                ratelimit: None,
+                cron: None,
+                param_types: vec![crate::types::TypeSpec::Any; n_params],
+                return_type: crate::types::TypeSpec::Any,
             });
         }
 
@@ -451,11 +530,33 @@ impl CompiledProgram {
             }
         }
 
-        // Task 3: `used_modules` isn't in the .cubebin format yet (see the
-        // field doc on `CompiledProgram`) -- a round-tripped program always
-        // comes back with none `use`'d, same forward-compatible shape as a
-        // pre-v3 file's empty `params`.
-        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules: Vec::new() })
+        // v4: the contract trailer. A v4 file without one (truncated) is an
+        // error, not a program with its permissions silently dropped.
+        let mut used_modules = Vec::new();
+        let mut types = crate::types::TypeTable::default();
+        if version >= 4 {
+            if pos + 4 > data.len() {
+                return Err("invalid .cubebin v4: missing the contract trailer".into());
+            }
+            let n = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            pos += 4;
+            if pos + n > data.len() {
+                return Err("invalid .cubebin v4: truncated contract trailer".into());
+            }
+            let meta: ProgramMeta = serde_json::from_slice(&data[pos..pos + n])
+                .map_err(|e| format!("invalid .cubebin v4 contract trailer: {}", e))?;
+            if meta.functions.len() != functions.len() {
+                return Err(format!(
+                    "invalid .cubebin v4: the trailer describes {} function(s), the file has {}",
+                    meta.functions.len(), functions.len()));
+            }
+            for (f, m) in functions.iter_mut().zip(meta.functions) {
+                m.apply(f);
+            }
+            used_modules = meta.used_modules;
+            types = meta.types;
+        }
+        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules, types })
     }
 
     /// Save to a `.cubebin` file.
@@ -468,31 +569,13 @@ impl CompiledProgram {
     /// `compile foo.cube -o foo.cubebin` + `run foo.cubebin` of the exact
     /// same program would error, because the reloaded program `use`s
     /// nothing. Refuse instead of producing a binary that silently
-    /// disagrees with its own source. A program using neither is unaffected
-    /// -- `to_cubebin`/`from_cubebin` themselves are unchanged.
+    /// disagrees with its own source.
+    ///
+    /// 2026-10-24: `.cubebin` v4 carries `used_modules`, `is_override` and
+    /// every function's contract and types, so a saved program is the same
+    /// program; the refusal is gone.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(reason) = self.capability_conflict() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, reason));
-        }
         std::fs::write(path, self.to_cubebin())
-    }
-
-    /// Fix-round-1 (Task 3): `Some(reason)` when this program can't be
-    /// faithfully represented by the current `.cubebin` format -- it `use`s
-    /// at least one module, or declares at least one `override` function --
-    /// `None` when it's safe to serialize as-is.
-    fn capability_conflict(&self) -> Option<String> {
-        let has_override = self.functions.iter().any(|f| f.is_override);
-        if self.used_modules.is_empty() && !has_override {
-            return None;
-        }
-        Some(format!(
-            "cannot serialize program `{}` to .cubebin: it uses `use`/`override` \
-             (used modules: [{}]) and the binary format does not yet carry \
-             capability info -- run from source instead",
-            self.name,
-            self.used_modules.join(", "),
-        ))
     }
 
     /// Load from a `.cubebin` file.
@@ -533,12 +616,31 @@ pub struct CompiledFunction {
     /// `is_override`).
     pub access: Access,
     /// `@once`: the VM refuses a second run of this function
-    /// (`VM::exec_function`). Not carried through `.cubebin`.
+    /// (`VM::exec_function`). Carried through `.cubebin` since v4.
     pub once: bool,
+    /// `@restricted(...)` (2026-10-24): the programs allowed to call this
+    /// function from outside, named by the host as `VM::caller`; a
+    /// container's `grant P.f to Q` adds to it (`VM::grants`). `None`: no
+    /// restriction. `Some([])` (a bare `@restricted`): only granted callers.
+    pub restricted: Option<Vec<String>>,
+    /// `@ratelimit(n, period)`: at most `n` calls from outside per `period`
+    /// milliseconds, counted by `VM::governor` (which a resident host keeps
+    /// across requests). `None`: unlimited.
+    pub ratelimit: Option<(u32, u64)>,
+    /// `@cron(interval)`: run by the VM's scheduler (`VM::tick`) every
+    /// `interval` milliseconds, and refused as an entry from outside.
+    pub cron: Option<u64>,
+    /// The declared parameter and return types (2026-10-24). Checked at run
+    /// time on what crosses the function's boundary: the arguments on entry,
+    /// the value on return (`VM::check_boundary`). `Any` when undeclared.
+    pub param_types: Vec<crate::types::TypeSpec>,
+    pub return_type: crate::types::TypeSpec,
 }
 
 /// Who may call a function, from its access attribute. The three the SPEC
 /// names; every unmarked function is `External`, as it always effectively was.
+/// `private` (the modifier) is `Internal` when no access attribute says
+/// otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     External,
@@ -546,24 +648,76 @@ pub enum Access {
     System,
 }
 
+impl Access {
+    fn code(self) -> u8 {
+        match self { Access::External => 0, Access::Internal => 1, Access::System => 2 }
+    }
+    fn from_code(c: u8) -> Self {
+        match c { 1 => Access::Internal, 2 => Access::System, _ => Access::External }
+    }
+}
+
+/// Everything a signature's attributes promise about who may call it, how
+/// often and when (2026-10-24: all enforced; `@hook`/`@before`/`@after` are
+/// still strict errors -- the VM has no event bus or middleware).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnContract {
+    pub access: Access,
+    pub once: bool,
+    pub restricted: Option<Vec<String>>,
+    pub ratelimit: Option<(u32, u64)>,
+    pub cron: Option<u64>,
+}
+
 /// The access attribute a signature declares, and the `@once` flag.
-/// `@hook`/`@before`/`@after`/`@cron` are not access and are not here: the
-/// VM has no event bus, middleware or scheduler, so under strict they are
-/// compile errors (`Compiler::check_permissions`) and under `--loose` they
-/// are ignored, as before.
 pub fn access_of(sig: &FunctionSig) -> (Access, bool) {
-    let mut access = Access::External;
-    let mut once = false;
+    let (c, _) = contract_of(sig);
+    (c.access, c.once)
+}
+
+/// The contract a signature's attributes declare, with every attribute that
+/// cannot mean anything (a malformed period, a zero rate, `private` beside
+/// `@external`) reported as an error -- an attribute the VM cannot honour is
+/// worse than none.
+pub fn contract_of(sig: &FunctionSig) -> (FnContract, Vec<String>) {
+    let mut c = FnContract { access: Access::External, once: false, restricted: None, ratelimit: None, cron: None };
+    let mut errors = Vec::new();
+    let mut explicit_access = None;
     for p in &sig.permissions {
         match p {
-            Permission::External => access = Access::External,
-            Permission::Internal => access = Access::Internal,
-            Permission::System => access = Access::System,
-            Permission::Once => once = true,
-            _ => {}
+            Permission::External => { c.access = Access::External; explicit_access = Some(Access::External); }
+            Permission::Internal => { c.access = Access::Internal; explicit_access = Some(Access::Internal); }
+            Permission::System => { c.access = Access::System; explicit_access = Some(Access::System); }
+            Permission::Once => c.once = true,
+            Permission::Restricted(names) => {
+                c.restricted.get_or_insert_with(Vec::new).extend(names.iter().cloned());
+            }
+            Permission::Ratelimit(n, period) => {
+                if *n <= 0 || *n > u32::MAX as i64 {
+                    errors.push(format!("@ratelimit({}, {:?}) on {}: the count must be at least 1", n, period, sig.name));
+                } else {
+                    match crate::vm::governor::parse_period(period) {
+                        Ok(d) => c.ratelimit = Some((*n as u32, d.as_millis() as u64)),
+                        Err(e) => errors.push(format!("@ratelimit on {}: {}", sig.name, e)),
+                    }
+                }
+            }
+            Permission::Cron(interval) => match crate::vm::governor::parse_period(interval) {
+                Ok(d) => c.cron = Some(d.as_millis() as u64),
+                Err(e) => errors.push(format!("@cron on {}: {}", sig.name, e)),
+            },
+            Permission::Hook(_) | Permission::Before(_) | Permission::After(_) => {}
         }
     }
-    (access, once)
+    if sig.modifiers.contains(&Modifier::Private) {
+        match explicit_access {
+            Some(Access::External) => errors.push(format!(
+                "{} is both `private` and `@external`: one says no outside caller, the other says any", sig.name)),
+            None => c.access = Access::Internal,
+            Some(_) => {}
+        }
+    }
+    (c, errors)
 }
 
 impl CompiledFunction {
@@ -676,6 +830,9 @@ pub struct Compiler {
     /// than nothing. Reset to `None` at the start of every function so a
     /// span never leaks from one function into the next.
     current_span: Option<Span>,
+    /// 2026-10-24: the source file's struct / enum / alias declarations
+    /// (`types::table_of`), gathered once per `compile()` like `used_modules`.
+    types: crate::types::TypeTable,
 }
 
 impl Compiler {
@@ -697,6 +854,7 @@ impl Compiler {
             asm_errors: Vec::new(),
             operand_errors: Vec::new(),
             current_span: None,
+            types: crate::types::TypeTable::default(),
         }
     }
 
@@ -743,6 +901,11 @@ impl Compiler {
             })
             .collect();
 
+        // 2026-10-24: the file's struct / enum / alias declarations, before
+        // any program compiles -- signatures, struct literals and the
+        // run-time checks all resolve type names through it.
+        self.types = crate::types::table_of(source);
+
         let mut programs = Vec::new();
         for item in &source.items {
             if let TopLevel::Program(p) = item {
@@ -786,6 +949,7 @@ impl Compiler {
             storage_fields,
             symbol_names: std::mem::take(&mut self.symbol_names),
             used_modules: self.used_modules.clone(),
+            types: self.types.clone(),
         }
     }
 
@@ -827,7 +991,17 @@ impl Compiler {
             self.compile_stmt(stmt);
         }
 
-        let (access, once) = access_of(&func.sig);
+        // 2026-10-24: the whole contract, enforced by the VM. An attribute
+        // that cannot mean anything (`@ratelimit(0, ...)`, `@cron("fast")`,
+        // `private` beside `@external`) is a compile error in every mode.
+        let (contract, contract_errors) = contract_of(&func.sig);
+        for message in contract_errors {
+            self.capability_errors.push(ParseError { message, span: func.sig.span });
+        }
+        let param_types = func.sig.params.iter()
+            .map(|p| crate::types::TypeSpec::from_expr(&p.ty, &self.types))
+            .collect();
+        let return_type = crate::types::TypeSpec::from_expr(&func.sig.return_type, &self.types);
         CompiledFunction {
             name: func.sig.name.clone(),
             params: func.sig.params.iter().map(|p| p.name.clone()).collect(),
@@ -835,8 +1009,13 @@ impl Compiler {
             labels: self.labels.clone(),
             debug_lines: self.debug_lines.clone(),
             is_override: func.sig.is_override,
-            access,
-            once,
+            access: contract.access,
+            once: contract.once,
+            restricted: contract.restricted,
+            ratelimit: contract.ratelimit,
+            cron: contract.cron,
+            param_types,
+            return_type,
         }
     }
 
@@ -847,16 +1026,18 @@ impl Compiler {
     /// event bus, middleware and a scheduler the VM does not have, and a
     /// program that compiles with them advertises behaviour it will not get.
     /// Advertised-and-unenforced is worse than absent.
+    ///
+    /// 2026-10-24: `@cron` (the VM's scheduler, `VM::tick`), `@restricted`
+    /// and `@ratelimit` are enforced now and pass; the three left here are
+    /// the ones still without a mechanism.
     fn check_permissions(&mut self, sig: &FunctionSig) {
         for p in &sig.permissions {
             let what = match p {
                 Permission::Hook(t) => format!("@hook({})", t),
                 Permission::Before(f) => format!("@before({})", f),
                 Permission::After(f) => format!("@after({})", f),
-                Permission::Cron(i) => format!("@cron({:?})", i),
-                Permission::Restricted(_) => "@restricted".to_string(),
-                Permission::Ratelimit(..) => "@ratelimit".to_string(),
-                Permission::External | Permission::Internal
+                Permission::Cron(_) | Permission::Restricted(_) | Permission::Ratelimit(..)
+                | Permission::External | Permission::Internal
                 | Permission::System | Permission::Once => continue,
             };
             self.strict_violation(

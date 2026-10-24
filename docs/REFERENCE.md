@@ -294,6 +294,11 @@ implementation > plain program-local function > error.**
 
 ## 6. Attributes / permissions / modifiers — parsed, essentially all decorative
 
+> **Superseded 2026-10-24.** `@external`, `@internal`, `@system`, `@once`, `@restricted`,
+> `@ratelimit`, `@cron` and the `private` modifier are now enforced, and `.cubebin` v4 carries
+> them; see `docs/CONTRACTS.md`. `@hook`/`@before`/`@after` remain unenforced (strict errors).
+> The audit text below describes the state before that.
+
 [src, `src/ast.rs:184-206` `Permission` enum, `188-206` `Modifier` enum;
 `src/parser.rs:700-822` `parse_permissions`/parses modifiers into
 `FunctionSig.permissions`/`FunctionSig.modifiers`]

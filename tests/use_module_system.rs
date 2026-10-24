@@ -261,39 +261,42 @@ fn a_plain_function_colliding_with_a_sealed_capability_is_a_compile_error() {
     assert!(msg.contains("demo"), "{}", msg);
 }
 
-// ── Fix round 1, item 1: .cubebin must not silently drop capability info ──
+// ── .cubebin carries capability info (v4, 2026-10-24) ─────────────────────
 //
-// The binary format doesn't carry `used_modules`/`is_override` (see those
-// fields' docs). Compiling a `use`/`override` program straight to .cubebin
-// used to succeed silently and then behave DIFFERENTLY once reloaded --
-// `use demo; return greet();` returns 42 run from source, but a save+load
-// round trip would drop the `use` and error at runtime instead, with no
-// warning anywhere. `CompiledProgram::save` now refuses instead.
+// Up to v3 the binary format did not carry `used_modules`/`is_override`, so
+// a `use`/`override` program would have behaved DIFFERENTLY once reloaded
+// (`use demo; return greet();` returns 42 from source, but a save+load
+// round trip dropped the `use`), and `save` refused such programs. v4 adds
+// a metadata trailer (used modules, override flags, the permission
+// contract, the types), so the round trip now behaves identically.
 
-#[test]
-fn use_demo_program_refuses_to_serialize_to_cubebin() {
-    let progs = compiler::compile(USE_DEMO).expect("compile");
-    let path = std::env::temp_dir().join("use_demo_capability_guard_test.cubebin");
+fn round_trip(source: &str, file: &str) -> (VM, String) {
+    let progs = compiler::compile(source).expect("compile");
+    let path = std::env::temp_dir().join(file);
     let _ = std::fs::remove_file(&path);
-
-    let err = progs[0].save(&path).expect_err(
-        "a program with a non-empty used_modules must refuse to serialize");
-    assert!(err.to_string().contains("use"), "{}", err);
-    assert!(!path.exists(), "save must refuse BEFORE writing anything, not after");
+    progs[0].save(&path).expect("a use/override program serializes since v4");
+    let mut vm = VM::new();
+    let name = vm.load_file(&path).expect("and loads back");
+    let _ = std::fs::remove_file(&path);
+    (vm, name)
 }
 
 #[test]
-fn override_program_also_refuses_to_serialize_to_cubebin() {
-    // Distinct from the case above: this program's guard-relevant signal is
-    // an `is_override` function, checked independently of `used_modules`
-    // (USE_DEMO_OVERRIDE happens to carry both, but the guard is an OR).
-    let progs = compiler::compile(USE_DEMO_OVERRIDE).expect("compile");
-    let path = std::env::temp_dir().join("use_demo_override_capability_guard_test.cubebin");
-    let _ = std::fs::remove_file(&path);
+fn use_demo_program_round_trips_through_cubebin() {
+    let (mut vm, name) = round_trip(USE_DEMO, "use_demo_capability_round_trip.cubebin");
+    match vm.call(&name, "solve", vec![]) {
+        ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 42),
+        other => panic!("the reloaded `use demo` must still reach the registry's greet(): {:?}", other),
+    }
+}
 
-    let err = progs[0].save(&path).expect_err("an override-marked function must also refuse");
-    assert!(!path.exists(), "save must refuse BEFORE writing anything, not after");
-    drop(err);
+#[test]
+fn override_program_round_trips_through_cubebin() {
+    let (mut vm, name) = round_trip(USE_DEMO_OVERRIDE, "use_demo_override_round_trip.cubebin");
+    match vm.call(&name, "solve", vec![]) {
+        ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(v.as_i64(), 999),
+        other => panic!("the reloaded override must still win: {:?}", other),
+    }
 }
 
 #[test]

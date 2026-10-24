@@ -110,8 +110,9 @@ fn an_absent_role_is_null_on_the_wire_with_its_reason() {
 
 #[test]
 fn unenforced_attributes_are_strict_errors_and_loose_warnings() {
+    // `@cron` left this list on 2026-10-24: the scheduler enforces it (tests/contracts.rs).
     for (attr, name) in [("@hook(Other.Event)", "@hook"), ("@before(solve)", "@before"),
-                         ("@after(solve)", "@after"), ("@cron(\"1h\")", "@cron")] {
+                         ("@after(solve)", "@after")] {
         let src = format!(r#"
 program P implements ISolve {{
     {attr}

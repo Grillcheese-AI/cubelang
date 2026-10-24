@@ -33,6 +33,31 @@ message RunRequest {
   // the VM default of 1,000,000, which is not a budget for a live turn).
   // Exceeding one is an error naming it, never a truncated answer.
   Budget budget = 7;
+  // The scheduler (2026-10-24): when set, `fn_name` is ignored and the VM runs
+  // every `@cron` function of the program that is due (the resident process
+  // keeps the cron clock and the `@ratelimit` windows across requests), each
+  // reported in `RunResult.crons`.
+  bool tick = 8;
+  // Who is calling (2026-10-24): checked against `@restricted(...)`. Honoured
+  // only with valid ML-DSA-87 AND Ed25519 signatures by a key in the keyring
+  // the process loaded at startup (`run-proto --keyring`); anything else is an
+  // anonymous caller, which no restricted function admits.
+  Caller caller = 9;
+}
+
+message Caller {
+  string name = 1;          // the keyring entry the caller claims to be
+  bytes ml_dsa = 2;         // ML-DSA-87 over `cubelang::auth::CallClaim::message()`
+  uint64 timestamp_ms = 3;  // Unix ms; outside the process's window => refused
+  uint64 nonce = 4;         // never accepted twice inside the window (no replays)
+  bytes ed25519 = 5;        // Ed25519 over the same bytes; BOTH must verify
+}
+
+message CronRun {
+  string function = 1;
+  bool ok = 2;
+  string value = 3;   // the result, as `RunResult.symbol` would carry it (empty for null)
+  string error = 4;
 }
 
 message Branch {
@@ -126,4 +151,6 @@ message RunResult {
   // and both `None` on a non-ok result, like `similarity`.
   optional double runner_up = 7;
   optional RecoverReason recover_reason = 8;
+  // A `tick` request's runs, in declaration order (2026-10-24).
+  repeated CronRun crons = 9;
 }

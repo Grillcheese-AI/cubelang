@@ -22,6 +22,7 @@ pub mod knowledge;
 pub mod engine;
 pub mod registry;
 pub mod interfaces;
+pub mod governor;
 
 // Re-export the engine's public surface so existing `use cubelang::vm::{VM, ...}`
 // call sites keep working after the flat vm.rs -> vm/ split.

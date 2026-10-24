@@ -783,6 +783,41 @@ impl Parser {
                     self.expect(&TokenKind::RParen)?;
                     perms.push(Permission::Cron(interval));
                 }
+                // `@restricted` (bare: only the programs a container `grant`s), `@restricted(A, B)`,
+                // or the SPEC's `@restricted(["A", "B"])`. Names are program names, quoted or not.
+                TokenKind::AtRestricted => {
+                    self.advance();
+                    let mut names = Vec::new();
+                    if self.eat(&TokenKind::LParen) {
+                        let bracketed = self.eat(&TokenKind::LBracket);
+                        loop {
+                            self.skip_newlines();
+                            match self.peek().clone() {
+                                TokenKind::StringLit(s) => { self.advance(); names.push(s); }
+                                TokenKind::Ident(s) => { self.advance(); names.push(s); }
+                                _ => break,
+                            }
+                            if !self.eat(&TokenKind::Comma) { break; }
+                        }
+                        if bracketed { self.expect(&TokenKind::RBracket)?; }
+                        self.expect(&TokenKind::RParen)?;
+                    }
+                    perms.push(Permission::Restricted(names));
+                }
+                // `@ratelimit(100, "1m")`: at most 100 calls from outside per minute.
+                TokenKind::AtRatelimit => {
+                    self.advance();
+                    self.expect(&TokenKind::LParen)?;
+                    let n = match self.peek().clone() {
+                        TokenKind::IntLit(n) => { self.advance(); n }
+                        other => return Err(self.err(format!(
+                            "@ratelimit expects a call count first, got {:?}", other))),
+                    };
+                    self.expect(&TokenKind::Comma)?;
+                    let period = self.expect_string()?;
+                    self.expect(&TokenKind::RParen)?;
+                    perms.push(Permission::Ratelimit(n, period));
+                }
                 _ => break,
             }
         }

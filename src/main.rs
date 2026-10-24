@@ -37,7 +37,11 @@ fn main() {
         "check"    | "k" => cmd_check(&args[2..]),
         "validate" | "vd" => cmd_validate(&args[2..]),
         "run"      | "r" => cmd_run(&args[2..]),
-        "run-proto"      => cmd_run_proto(),
+        "run-proto"      => cmd_run_proto(&args[2..]),
+        "tick"           => cmd_tick(&args[2..]),
+        "keygen"         => cmd_keygen(&args[2..]),
+        "keyring"        => cmd_keyring(&args[2..]),
+        "sign"           => cmd_sign(&args[2..]),
         "version"  | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
@@ -62,7 +66,24 @@ COMMANDS:
                    by default; --loose to opt out, same as compile)
     run-proto      Read a length-prefixed RunRequest from stdin, run it from
                    source, write a length-prefixed RunResult to stdout
-                   (always strict -- no --loose over this transport)
+                   (always strict -- no --loose over this transport).
+                   --keyring ring.json: verify signed callers (ML-DSA-87 +
+                   Ed25519) and refuse unsigned programs that are not
+                   deployed; --pin-root FINGERPRINT: the roots to trust;
+                   --contracts DIR: the deployed .cube contracts
+    tick           Run the @cron functions of a program as they come due
+                   (--every 1s, --ticks N; 0 = until stopped)
+    keygen         Make an identity: keygen NAME --kind user|agent|model|
+                   registrar --out key.json [--model-sha256 HEX]; the seed
+                   file is sealed (Argon2id + AES-256-GCM) with the passphrase
+                   in CUBELANG_KEY_PASSPHRASE or --passphrase-file; prints
+                   the public entry (never the seed)
+    keyring        check RING | add-root RING ENTRY.json | register RING
+                   --by REGISTRAR.key.json [--days N] ENTRY.json | revoke
+                   RING --by KEY.json NAME [--reason TEXT]
+    sign           Sign one call for run-proto: sign --key key.json
+                   --program FILE --fn NAME [--arg V]... [--answer J]...
+                   [--knowledge PATH] [--tick]; prints the Caller as JSON
     inspect,  i    Show .cubebin program info
     disasm,   d    Disassemble .cubebin to readable opcodes
     check,    k    Fully compile .cube in strict mode (NOT parse-only --
@@ -482,10 +503,15 @@ fn cmd_run(args: &[String]) {
     let mut strict = true;
     let mut knowledge_path: Option<String> = None;
     let mut call_args: Vec<Value> = Vec::new();
+    let mut caller: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--fn" | "-f" => { if i + 1 < args.len() { target_fn = args[i + 1].clone(); i += 1; } }
+            // The caller `@restricted` checks, asserted by the host itself: the local CLI IS the
+            // host (it could edit the source too), so no signature. Over run-proto a caller is
+            // honoured only with signatures.
+            "--as" => { if i + 1 < args.len() { caller = Some(args[i + 1].clone()); i += 1; } }
             "--trace" | "-t" => trace = true,
             "--json" | "-j" => json_out = true,
             "--strict" => strict = true,
@@ -507,6 +533,7 @@ fn cmd_run(args: &[String]) {
     // Load: compile .cube in-memory, or load a .cubebin directly.
     let mut vm = VM::new();
     vm.trace_enabled = trace;
+    vm.caller = caller;
 
     if let Some(kp) = &knowledge_path {
         match std::fs::read_to_string(kp) {
@@ -525,7 +552,18 @@ fn cmd_run(args: &[String]) {
         }
     }
 
-    let prog_name: String = if input.ends_with(".cubebin") {
+    let prog_name = load_input(&mut vm, input, strict);
+
+    // Run the constructor first if the program defines one (sets up
+    // storage), then the target function.
+    let result = call_with_constructor(&mut vm, &prog_name, &target_fn, call_args);
+    report_run(&mut vm, &prog_name, &target_fn, result, trace, json_out);
+}
+
+/// Compile a `.cube` in memory (strict unless `--loose`) or load a `.cubebin`, into `vm`; the first
+/// program's name. Exits on any error (the CLI commands that share it have nothing to do without it).
+fn load_input(vm: &mut VM, input: &str, strict: bool) -> String {
+    if input.ends_with(".cubebin") {
         match vm.load_file(Path::new(input)) {
             Ok(name) => name,
             Err(e) => { eprintln!("error: cannot load {}: {}", input, e); process::exit(1); }
@@ -561,13 +599,12 @@ fn cmd_run(args: &[String]) {
             eprintln!("error: no programs in {}", input);
             process::exit(1);
         }
-        load_programs(&mut vm, programs)
-    };
+        load_programs(vm, programs)
+    }
+}
 
-    // Run the constructor first if the program defines one (sets up
-    // storage), then the target function.
-    let result = call_with_constructor(&mut vm, &prog_name, &target_fn, call_args);
-
+/// Print one `run`'s outcome (and drive the debug ASK harness), exiting non-zero on an error.
+fn report_run(vm: &mut VM, prog_name: &str, target_fn: &str, result: ExecResult, trace: bool, json_out: bool) {
     if trace && !json_out {
         println!("# trace ({} ops):", vm.trace.len());
         for line in &vm.trace { println!("  {}", line); }
@@ -702,7 +739,30 @@ fn cmd_run(args: &[String]) {
 /// `drop(stdin)`) gets one result, then the loop reads EOF and exits 0. A
 /// TRUNCATED frame (EOF inside a length or body) is still an error: it
 /// means the client died mid-write, not that it finished.
-fn cmd_run_proto() {
+fn cmd_run_proto(args: &[String]) {
+    let mut keyring: Option<String> = None;
+    let mut contracts: Option<String> = None;
+    let mut pins: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--keyring" if i + 1 < args.len() => { keyring = Some(args[i + 1].clone()); i += 1; }
+            "--contracts" if i + 1 < args.len() => { contracts = Some(args[i + 1].clone()); i += 1; }
+            "--pin-root" if i + 1 < args.len() => { pins.push(args[i + 1].trim().to_ascii_lowercase()); i += 1; }
+            other => { eprintln!("error: run-proto: unknown option {}", other); process::exit(1); }
+        }
+        i += 1;
+    }
+    if keyring.is_some() && pins.is_empty() {
+        eprintln!("warning: the keyring's roots are not pinned (--pin-root FINGERPRINT): whoever can write \
+                   the keyring file can add a root. `cubelang keyring check` prints the fingerprints.");
+    }
+    // Fail closed: a keyring or contract set that does not load stops the process, rather than
+    // serving with checks the host asked for silently missing.
+    let mut host = match Host::open(keyring.as_deref(), contracts.as_deref(), pins) {
+        Ok(h) => h,
+        Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+    };
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let stdout = std::io::stdout();
@@ -719,6 +779,12 @@ fn cmd_run_proto() {
             }
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        // A frame's length is the sender's word: cap it before allocating, so a bad length cannot
+        // make the process reserve gigabytes. The stream cannot resynchronise after one, so stop.
+        if len > MAX_FRAME_BYTES {
+            eprintln!("error: a RunRequest of {} bytes is over the {}-byte limit", len, MAX_FRAME_BYTES);
+            process::exit(1);
+        }
 
         let mut req_buf = vec![0u8; len];
         if let Err(e) = input.read_exact(&mut req_buf) {
@@ -734,7 +800,7 @@ fn cmd_run_proto() {
             }
         };
 
-        let result = run_request_result(req);
+        let result = run_request_result(req, &mut host);
 
         let mut out_buf = Vec::new();
         // `Message::encode` into a `Vec<u8>` only fails on a writer error; a
@@ -746,6 +812,159 @@ fn cmd_run_proto() {
         let _ = out.write_all(&(out_buf.len() as u32).to_be_bytes());
         let _ = out.write_all(&out_buf);
         let _ = out.flush();
+    }
+}
+
+/// The largest RunRequest frame `run-proto` reads (programs travel as source; facts travel by path).
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// The budget a locked process imposes on a request that is not signed by a model or an agent: the
+/// request may ask for less, never more, and an unset field (zero, "unlimited") gets the cap.
+const UNTRUSTED_BUDGET: cubelang::reasoning::Budget = cubelang::reasoning::Budget {
+    max_jumps: 1_000_000,
+    max_ops: 5_000_000,
+    max_queries: 1_000,
+    max_wall_ms: 5_000,
+};
+
+fn clamp_budget(budget: &mut Option<cubelang::reasoning::Budget>) {
+    let cap = UNTRUSTED_BUDGET;
+    let b = budget.get_or_insert(cubelang::reasoning::Budget { max_jumps: 0, max_ops: 0, max_queries: 0, max_wall_ms: 0 });
+    let lower = |asked: u64, cap: u64| if asked == 0 { cap } else { asked.min(cap) };
+    b.max_jumps = lower(b.max_jumps as u64, cap.max_jumps as u64) as _;
+    b.max_ops = lower(b.max_ops as u64, cap.max_ops as u64) as _;
+    b.max_queries = lower(b.max_queries as u64, cap.max_queries as u64) as _;
+    b.max_wall_ms = lower(b.max_wall_ms as u64, cap.max_wall_ms as u64) as _;
+}
+
+/// What the resident `run-proto` keeps across requests (2026-10-24). Each request still runs on a
+/// fresh VM; these are the parts that would mean nothing if they reset per request:
+/// - the Governor: the `@ratelimit` windows and the `@cron` clock;
+/// - with `--keyring`: the verifier (public keys, pinned roots, the nonces seen), reloaded when the
+///   file's mtime moves, so a `cubelang keyring register` takes effect on the next request;
+/// - with `--contracts`: the SHA-384 of each deployed contract's source, and the directory itself.
+///
+/// Either option LOCKS the process. A request that is not signed by a model or an agent may run only
+/// a deployed contract, may name a knowledge file only inside the contracts directory, and runs
+/// under `UNTRUSTED_BUDGET`. Without either, the process serves its parent as before (a local pipe:
+/// only the host can write to it).
+struct Host {
+    governor: cubelang::vm::governor::Governor,
+    locked: bool,
+    keyring_path: Option<String>,
+    keyring_mtime: Option<std::time::SystemTime>,
+    verifier: Option<cubelang::auth::Verifier>,
+    contracts_dir: Option<PathBuf>,
+    deployed: std::collections::HashSet<[u8; 48]>,
+}
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+impl Host {
+    fn open(keyring: Option<&str>, contracts: Option<&str>, pins: Vec<String>) -> Result<Host, String> {
+        let mut h = Host {
+            governor: cubelang::vm::governor::Governor::new(),
+            locked: keyring.is_some() || contracts.is_some(),
+            keyring_path: None,
+            keyring_mtime: None,
+            verifier: None,
+            contracts_dir: None,
+            deployed: std::collections::HashSet::new(),
+        };
+        if let Some(p) = keyring {
+            let text = std::fs::read_to_string(p).map_err(|e| format!("--keyring {}: {}", p, e))?;
+            let ring = cubelang::auth::Keyring::from_json(&text).map_err(|e| format!("--keyring {}: {}", p, e))?;
+            h.verifier = Some(cubelang::auth::Verifier::new(ring, pins).map_err(|e| format!("--keyring {}: {}", p, e))?);
+            h.keyring_mtime = file_mtime(p);
+            h.keyring_path = Some(p.to_string());
+        }
+        if let Some(dir) = contracts {
+            let canon = std::fs::canonicalize(dir).map_err(|e| format!("--contracts {}: {}", dir, e))?;
+            let entries = std::fs::read_dir(&canon).map_err(|e| format!("--contracts {}: {}", dir, e))?;
+            for entry in entries {
+                let path = entry.map_err(|e| format!("--contracts {}: {}", dir, e))?.path();
+                if path.extension().is_some_and(|x| x == "cube") {
+                    let src = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("--contracts {}: {}", path.display(), e))?;
+                    // a contract that does not compile strictly is not deployed: refuse to start
+                    compiler::compile_strict(&src).map_err(|e| format!("--contracts {}: {}", path.display(), e))?;
+                    h.deployed.insert(cubelang::auth::program_digest(&src));
+                }
+            }
+            h.contracts_dir = Some(canon);
+        }
+        Ok(h)
+    }
+
+    /// Reload the keyring when its file changed. A reload that fails its chain keeps the previous
+    /// keyring (requests stay checked against keys that verified) and says so once on stderr.
+    fn refresh(&mut self) {
+        let (Some(p), Some(v)) = (&self.keyring_path, self.verifier.as_mut()) else { return };
+        let m = file_mtime(p);
+        if m == self.keyring_mtime {
+            return;
+        }
+        self.keyring_mtime = m;
+        let loaded = std::fs::read_to_string(p)
+            .map_err(|e| e.to_string())
+            .and_then(|t| cubelang::auth::Keyring::from_json(&t))
+            .and_then(|r| v.replace_keyring(r));
+        if let Err(e) = loaded {
+            eprintln!("warning: keyring {} changed but was refused (keeping the previous one): {}", p, e);
+        }
+    }
+
+    /// Who the request speaks for (`None`: anonymous) and whether it is trusted (an unlocked process,
+    /// or a signed model or agent), or why it is refused before anything runs.
+    fn admit_request(&mut self, req: &RunRequest) -> Result<(Option<String>, bool), String> {
+        use cubelang::auth::{CallClaim, HybridSignature, Kind, TICK};
+        let caller = match req.caller.as_ref().filter(|c| !c.name.is_empty()) {
+            None => None,
+            Some(c) => {
+                let Some(v) = self.verifier.as_mut() else {
+                    return Err(format!("the request claims to be {} but this process loaded no keyring \
+                                        (run-proto --keyring)", c.name));
+                };
+                let claim = CallClaim {
+                    program_source: &req.program,
+                    function: if req.tick { TICK } else { req.fn_name.as_str() },
+                    args: &req.args,
+                    answers: &req.answers,
+                    knowledge_path: &req.knowledge_path,
+                    caller: &c.name,
+                    timestamp_ms: c.timestamp_ms,
+                    nonce: c.nonce,
+                };
+                let sig = HybridSignature { ml_dsa: c.ml_dsa.clone(), ed25519: c.ed25519.clone() };
+                Some(v.check(&c.name, &sig, c.timestamp_ms, c.nonce, &claim.message(), cubelang::auth::now_ms())?)
+            }
+        };
+        if !self.locked {
+            return Ok((caller, true));
+        }
+        let kind = caller.as_deref().and_then(|n| self.verifier.as_ref().and_then(|v| v.kind_of(n)));
+        if matches!(kind, Some(Kind::Model | Kind::Agent)) {
+            return Ok((caller, true));
+        }
+        let who = match (&caller, kind) {
+            (Some(n), Some(k)) => format!("{} (a {})", n, k.as_str()),
+            _ => "an anonymous request".to_string(),
+        };
+        if !self.deployed.contains(&cubelang::auth::program_digest(&req.program)) {
+            return Err(format!("{} may run only a deployed contract (run-proto --contracts); this program \
+                                is not one -- only a signed model or agent may submit a new program", who));
+        }
+        if !req.knowledge_path.is_empty() {
+            let inside = self.contracts_dir.as_ref().is_some_and(|dir| {
+                std::fs::canonicalize(&req.knowledge_path).is_ok_and(|p| p.starts_with(dir))
+            });
+            if !inside {
+                return Err(format!("{} may name a knowledge file only inside the contracts directory", who));
+            }
+        }
+        Ok((caller, false))
     }
 }
 
@@ -893,37 +1112,70 @@ fn error_result(e: String, report: Option<cubelang::reasoning::BranchReport>) ->
     RunResult { ok: false, result: Some(run_result::Result::Error(e)), report, ..Default::default() }
 }
 
-fn run_request_result(req: RunRequest) -> RunResult {
+/// One request against the resident host: who is calling first (refused before anything compiles),
+/// then a fresh VM that borrows the host's Governor for the run and hands it back on every path.
+fn run_request_result(mut req: RunRequest, host: &mut Host) -> RunResult {
+    host.refresh();
     let branch_id = req.branch.as_ref().map(|b| b.id.clone()).unwrap_or_default();
+    let caller = match host.admit_request(&req) {
+        Ok((c, trusted)) => {
+            if !trusted {
+                clamp_budget(&mut req.budget);
+            }
+            c
+        }
+        Err(e) => return error_result(e, Some(branch_report(&VM::new(), &branch_id, &[], 0, 0))),
+    };
+    let mut vm = VM::new();
+    vm.caller = caller;
+    vm.governor = std::mem::take(&mut host.governor);
+    let result = run_request_on(&mut vm, req, &branch_id);
+    host.governor = std::mem::take(&mut vm.governor);
+    result
+}
+
+fn run_request_on(vm: &mut VM, req: RunRequest, branch_id: &str) -> RunResult {
+    let branch_id = branch_id.to_string();
     let programs = match compiler::compile_strict(&req.program) {
         Ok(p) => p,
-        Err(e) => return error_result(e.to_string(), Some(branch_report(&VM::new(), &branch_id, &[], 0, 0))),
+        Err(e) => return error_result(e.to_string(), Some(branch_report(vm, &branch_id, &[], 0, 0))),
     };
     if programs.is_empty() {
         return error_result("no programs in request".to_string(),
-                            Some(branch_report(&VM::new(), &branch_id, &[], 0, 0)));
+                            Some(branch_report(vm, &branch_id, &[], 0, 0)));
     }
 
-    let mut vm = VM::new();
     if !req.knowledge_path.is_empty() {
-        if let Err(e) = load_knowledge_cached(&mut vm, &req.knowledge_path) {
-            return error_result(e, Some(branch_report(&vm, &branch_id, &[], 0, 0)));
+        if let Err(e) = load_knowledge_cached(vm, &req.knowledge_path) {
+            return error_result(e, Some(branch_report(vm, &branch_id, &[], 0, 0)));
         }
     }
-    let (excluded, assumed) = match apply_branch(&mut vm, &req.branch) {
+    let (excluded, assumed) = match apply_branch(vm, &req.branch) {
         Ok(n) => n,
-        Err(e) => return error_result(e, Some(branch_report(&vm, &branch_id, &[], 0, 0))),
+        Err(e) => return error_result(e, Some(branch_report(vm, &branch_id, &[], 0, 0))),
     };
     // The budget clock starts here: the store is loaded and the branch
     // applied; what follows is the program's own work.
     let started = std::time::Instant::now();
-    apply_budget(&mut vm, &req.budget);
+    apply_budget(vm, &req.budget);
     let report = |vm: &VM| Some(branch_report(vm, &branch_id, &excluded, assumed,
                                               started.elapsed().as_millis().min(u32::MAX as u128) as u32));
-    let prog_name = load_programs(&mut vm, programs);
+    let prog_name = load_programs(vm, programs);
+
+    // A scheduler tick (2026-10-24): the runtime runs the constructor, then every `@cron` function
+    // of the program that is due by the host's clock (the Governor this request borrowed).
+    if req.tick {
+        let _ = vm.call(&prog_name, "constructor", Vec::new());
+        let crons = vm.tick(&prog_name, std::time::Instant::now())
+            .into_iter()
+            .map(|(function, r)| cron_run(function, r))
+            .collect();
+        return RunResult { ok: true, crons, report: report(vm), ..Default::default() };
+    }
+
     let call_args: Vec<Value> = req.args.into_iter().map(Value::Str).collect();
 
-    let mut exec_result = call_with_constructor(&mut vm, &prog_name, &req.fn_name, call_args);
+    let mut exec_result = call_with_constructor(vm, &prog_name, &req.fn_name, call_args);
 
     // ASK/resume over the one-shot transport (2026-08-30): the request may
     // carry answers to the program's ASKs, in order. Each is a JSON-encoded
@@ -942,18 +1194,18 @@ fn run_request_result(req: RunRequest) -> RunResult {
                     function: susp.function.clone(),
                 };
                 return RunResult { ok: true, result: Some(run_result::Result::Suspended(suspended)),
-                                   report: report(&vm), ..Default::default() };
+                                   report: report(vm), ..Default::default() };
             }
             Some(raw) => {
                 let parsed = match serde_json::from_str::<serde_json::Value>(&raw) {
                     Ok(j) => j,
                     Err(e) => return error_result(
-                        format!("resume: answer is not JSON ({}): {}", raw, e), report(&vm)),
+                        format!("resume: answer is not JSON ({}): {}", raw, e), report(vm)),
                 };
                 let answer = match json_to_value(&parsed) {
                     Ok(v) => v,
                     Err(e) => return error_result(
-                        format!("resume: bad answer {}: {}", raw, e), report(&vm)),
+                        format!("resume: bad answer {}: {}", raw, e), report(vm)),
                 };
                 exec_result = vm.resume(susp, answer);
             }
@@ -972,7 +1224,7 @@ fn run_request_result(req: RunRequest) -> RunResult {
     match exec_result {
         ExecResult::Ok(val) | ExecResult::Return(val) => {
             RunResult { ok: true, result: value_to_run_result(&val), similarity, runner_up, recover_reason,
-                        report: report(&vm) }
+                        report: report(vm), crons: Vec::new() }
         }
         // Task 8 (folded-in Minor from Task 7's review): both non-ok arms
         // below now hardcode `similarity: None` instead of threading through
@@ -988,10 +1240,345 @@ fn run_request_result(req: RunRequest) -> RunResult {
             // resumes) for every Suspend before this match runs. Kept as an
             // honest arm rather than an `unreachable!()` so a future refactor
             // that bypasses the loop still reports rather than panics.
-            error_result("suspended after the answers loop (internal)".to_string(), report(&vm))
+            error_result("suspended after the answers loop (internal)".to_string(), report(vm))
         }
-        ExecResult::Error(e) => error_result(e, report(&vm)),
+        ExecResult::Error(e) => error_result(e, report(vm)),
     }
+}
+
+/// One `@cron` run onto the wire. A cron that ASKs has no one to answer it: an error, never a guess.
+fn cron_run(function: String, r: ExecResult) -> cubelang::reasoning::CronRun {
+    use cubelang::reasoning::CronRun;
+    match r {
+        ExecResult::Ok(v) | ExecResult::Return(v) => {
+            let value = match value_to_run_result(&v) {
+                Some(run_result::Result::Symbol(s)) => s,
+                _ => String::new(),
+            };
+            CronRun { function, ok: true, value, error: String::new() }
+        }
+        ExecResult::Suspend(s) => CronRun {
+            function,
+            ok: false,
+            value: String::new(),
+            error: format!("asked {} with no one to answer: a @cron function runs unattended",
+                           value_to_json(&s.question)),
+        },
+        ExecResult::Error(e) => CronRun { function, ok: false, value: String::new(), error: e },
+    }
+}
+
+// ── tick / keygen / keyring / sign ─────────────────────────────────────────
+
+/// `cubelang tick FILE [--every 1s] [--ticks N] [--loose]`: one VM, its constructor, then a tick every
+/// interval, printing each `@cron` run. `--ticks 0` runs until stopped. Storage persists across ticks
+/// here (one VM), unlike `run-proto`, whose requests each get a fresh VM.
+fn cmd_tick(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: cubelang tick <file.cube|file.cubebin> [--every 1s] [--ticks N] [--loose]");
+        process::exit(1);
+    }
+    let mut every = std::time::Duration::from_secs(1);
+    let mut ticks: u64 = 1;
+    let mut strict = true;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--every" if i + 1 < args.len() => {
+                every = cubelang::vm::governor::parse_period(&args[i + 1]).unwrap_or_else(|e| {
+                    eprintln!("error: --every: {}", e);
+                    process::exit(1)
+                });
+                i += 1;
+            }
+            "--ticks" if i + 1 < args.len() => {
+                ticks = args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("error: --ticks takes a whole number (0 = until stopped)");
+                    process::exit(1)
+                });
+                i += 1;
+            }
+            "--loose" => strict = false,
+            "--strict" => strict = true,
+            other => { eprintln!("warning: ignoring unknown option {}", other); }
+        }
+        i += 1;
+    }
+    let mut vm = VM::new();
+    let prog = load_input(&mut vm, &args[0], strict);
+    if vm.due_crons(&prog, std::time::Instant::now()).is_empty() {
+        eprintln!("error: {} has no @cron function: nothing to tick", prog);
+        process::exit(1);
+    }
+    let _ = vm.call(&prog, "constructor", Vec::new());
+    let mut n = 0u64;
+    loop {
+        for (name, r) in vm.tick(&prog, std::time::Instant::now()) {
+            let run = cron_run(name, r);
+            if run.ok {
+                println!("  {}.{}() -> {}", prog, run.function, run.value);
+            } else {
+                eprintln!("  {}.{}() error: {}", prog, run.function, run.error);
+            }
+        }
+        n += 1;
+        if ticks != 0 && n >= ticks {
+            break;
+        }
+        std::thread::sleep(every);
+    }
+}
+
+/// The value after a flag, or exit naming the flag.
+fn flag_value(args: &[String], i: usize, flag: &str) -> String {
+    match args.get(i + 1) {
+        Some(v) => v.clone(),
+        None => { eprintln!("error: {} needs a value", flag); process::exit(1); }
+    }
+}
+
+/// Write a new file, never over an existing one; owner-only on Unix (a private key).
+fn write_new_private(path: &str, text: &str) -> Result<(), String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).map_err(|e| format!("{}: {}", path, e))?;
+    f.write_all(text.as_bytes()).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// Replace a file by writing a sibling and renaming it over (a crash leaves the old file whole).
+fn write_replace(path: &str, text: &str) -> Result<(), String> {
+    let tmp = format!("{}.tmp", path);
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {}", tmp, e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// The passphrase that seals or opens a key file: `--passphrase-file PATH` (its first line), else the
+/// `CUBELANG_KEY_PASSPHRASE` environment variable. Never a command-line argument (it would sit in the
+/// process list and the shell history).
+fn passphrase(file: Option<&str>) -> Option<zeroize::Zeroizing<String>> {
+    if let Some(p) = file {
+        let text = zeroize::Zeroizing::new(std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("error: --passphrase-file {}: {}", p, e);
+            process::exit(1)
+        }));
+        return Some(zeroize::Zeroizing::new(text.lines().next().unwrap_or("").to_string()));
+    }
+    std::env::var("CUBELANG_KEY_PASSPHRASE").ok().map(zeroize::Zeroizing::new)
+}
+
+/// Open a key file, with its passphrase when it is sealed.
+fn open_identity(path: &str, pass_file: Option<&str>) -> cubelang::auth::Identity {
+    let file: cubelang::auth::PrivateKeyFile = read_json(path);
+    let pass = passphrase(pass_file);
+    cubelang::auth::Identity::load(&file, pass.as_deref().map(|s| s.as_str()))
+        .unwrap_or_else(|e| { eprintln!("error: {}: {}", path, e); process::exit(1) })
+}
+
+/// `cubelang keygen NAME --kind KIND --out key.json [--model-sha256 HEX] [--passphrase-file P |
+/// --plaintext]`: a fresh identity. The seed file is sealed with the passphrase (Argon2id +
+/// AES-256-GCM) unless `--plaintext` says otherwise by name; it is never written over an existing
+/// file, and the seed is never printed. Prints the public entry to register.
+fn cmd_keygen(args: &[String]) {
+    use cubelang::auth::{keygen, Kind, Protect};
+    let Some(name) = args.first() else {
+        eprintln!("usage: cubelang keygen NAME --kind user|agent|model|registrar --out key.json \
+                   [--model-sha256 HEX] [--passphrase-file P | --plaintext]");
+        process::exit(1);
+    };
+    let (mut kind, mut out, mut model, mut pass_file, mut plaintext) = (None, None, None, None, false);
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" => { kind = Some(flag_value(args, i, "--kind")); i += 1; }
+            "--out" => { out = Some(flag_value(args, i, "--out")); i += 1; }
+            "--model-sha256" => { model = Some(flag_value(args, i, "--model-sha256")); i += 1; }
+            "--passphrase-file" => { pass_file = Some(flag_value(args, i, "--passphrase-file")); i += 1; }
+            "--plaintext" => plaintext = true,
+            other => { eprintln!("error: keygen: unknown option {}", other); process::exit(1); }
+        }
+        i += 1;
+    }
+    let (Some(kind), Some(out)) = (kind, out) else {
+        eprintln!("error: keygen needs --kind and --out");
+        process::exit(1);
+    };
+    let kind = Kind::parse(&kind).unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+    let pass = if plaintext { None } else {
+        Some(passphrase(pass_file.as_deref()).unwrap_or_else(|| {
+            eprintln!("error: keygen seals the key file: set CUBELANG_KEY_PASSPHRASE or pass --passphrase-file \
+                       (or --plaintext, for a throwaway test identity only)");
+            process::exit(1)
+        }))
+    };
+    let protect = match &pass { Some(p) => Protect::Passphrase(p.as_str()), None => Protect::Plaintext };
+    let (private, public) = keygen(name, kind, model, protect).unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+    let text = serde_json::to_string_pretty(&private).expect("a key file serializes");
+    if let Err(e) = write_new_private(&out, &text) {
+        eprintln!("error: cannot write the key file (it is never overwritten): {}", e);
+        process::exit(1);
+    }
+    eprintln!("  wrote {} (keep it private: never commit it, never put it in a .cube file or a request)", out);
+    println!("{}", serde_json::to_string_pretty(&public).expect("an entry serializes"));
+}
+
+fn read_keyring_or_empty(path: &str) -> cubelang::auth::Keyring {
+    match std::fs::read_to_string(path) {
+        Ok(t) => cubelang::auth::Keyring::from_json(&t).unwrap_or_else(|e| { eprintln!("error: {}: {}", path, e); process::exit(1) }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => cubelang::auth::Keyring::default(),
+        Err(e) => { eprintln!("error: {}: {}", path, e); process::exit(1); }
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> T {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| { eprintln!("error: {}: {}", path, e); process::exit(1) });
+    serde_json::from_str(&text).unwrap_or_else(|e| { eprintln!("error: {}: {}", path, e); process::exit(1) })
+}
+
+/// `cubelang keyring check RING` | `keyring add-root RING ENTRY.json` |
+/// `keyring register RING --by REGISTRAR.key.json [--days N] ENTRY.json` |
+/// `keyring revoke RING --by KEY.json NAME [--reason TEXT]`. Every change is checked exactly as a
+/// load checks it, then written by replacing the file whole. Sealed registrar keys take their
+/// passphrase from `--passphrase-file` or `CUBELANG_KEY_PASSPHRASE`.
+fn cmd_keyring(args: &[String]) {
+    use cubelang::auth::{fingerprint, register, revoke, KeyEntry};
+    let usage = "usage: cubelang keyring check RING | keyring add-root RING ENTRY.json | \
+                 keyring register RING --by REGISTRAR.key.json [--days N] ENTRY.json | \
+                 keyring revoke RING --by KEY.json NAME [--reason TEXT]   (sealed keys: --passphrase-file P)";
+    let (Some(sub), Some(ring_path)) = (args.first(), args.get(1)) else { eprintln!("{}", usage); process::exit(1) };
+    let (mut by, mut days, mut reason, mut pass_file, mut positional) = (None, None, String::new(), None, None);
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--by" => { by = Some(flag_value(args, i, "--by")); i += 1; }
+            "--days" => {
+                let d: u64 = flag_value(args, i, "--days").parse().unwrap_or_else(|_| { eprintln!("error: --days takes a whole number"); process::exit(1) });
+                days = Some(d);
+                i += 1;
+            }
+            "--reason" => { reason = flag_value(args, i, "--reason"); i += 1; }
+            "--passphrase-file" => { pass_file = Some(flag_value(args, i, "--passphrase-file")); i += 1; }
+            other if positional.is_none() => positional = Some(other.to_string()),
+            other => { eprintln!("error: keyring {}: unexpected {}", sub, other); process::exit(1); }
+        }
+        i += 1;
+    }
+    let save = |ring: &cubelang::auth::Keyring| {
+        if let Err(e) = write_replace(ring_path, &ring.to_json()) { eprintln!("error: {}", e); process::exit(1); }
+    };
+    match sub.as_str() {
+        "check" => {
+            let text = std::fs::read_to_string(ring_path).unwrap_or_else(|e| { eprintln!("error: {}: {}", ring_path, e); process::exit(1) });
+            match cubelang::auth::Keyring::from_json(&text) {
+                Ok(ring) => {
+                    let admitted = ring.admitted_names().unwrap_or_default();
+                    println!("  {}: the chain verifies ({} root(s), {} registered, {} revocation(s))",
+                             ring_path, ring.roots.len(), ring.keys.len(), ring.revocations.len());
+                    for e in ring.roots.iter().chain(ring.keys.iter()) {
+                        let by = e.registration.as_ref().map(|r| format!(" (registered by {})", r.by)).unwrap_or_else(|| " (root)".into());
+                        let state = if admitted.iter().any(|(n, _)| n == &e.name) { "" } else { "  REVOKED" };
+                        println!("    {} -- {}{}{}\n      fingerprint {}", e.name, e.kind.as_str(), by, state, fingerprint(e));
+                    }
+                }
+                Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+            }
+        }
+        "revoke" => {
+            let (Some(by), Some(name)) = (by, positional) else { eprintln!("{}", usage); process::exit(1) };
+            let mut ring = read_keyring_or_empty(ring_path);
+            let signer = open_identity(&by, pass_file.as_deref());
+            let target: KeyEntry = ring.keys.iter().find(|k| k.name == name).cloned()
+                .unwrap_or_else(|| { eprintln!("error: {} is not a registered entry of {}", name, ring_path); process::exit(1) });
+            let r = revoke(&signer, &target, cubelang::auth::now_ms(), &reason).unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            if let Err(e) = ring.add_revocation(r) { eprintln!("error: {}", e); process::exit(1); }
+            save(&ring);
+            println!("  {}: {} revoked by {}", ring_path, name, signer.name);
+        }
+        "add-root" => {
+            let Some(entry_path) = positional else { eprintln!("{}", usage); process::exit(1) };
+            let mut ring = read_keyring_or_empty(ring_path);
+            let entry: KeyEntry = read_json(&entry_path);
+            let fp = fingerprint(&entry);
+            if let Err(e) = ring.add_root(entry) { eprintln!("error: {}", e); process::exit(1); }
+            save(&ring);
+            println!("  {}: root added ({} root(s)); pin it: --pin-root {}", ring_path, ring.roots.len(), fp);
+        }
+        "register" => {
+            let (Some(by), Some(entry_path)) = (by, positional) else { eprintln!("{}", usage); process::exit(1) };
+            let mut ring = read_keyring_or_empty(ring_path);
+            let registrar = open_identity(&by, pass_file.as_deref());
+            let entry: KeyEntry = read_json(&entry_path);
+            let name = entry.name.clone();
+            let now = cubelang::auth::now_ms();
+            let until = days.map(|d| now + d * 86_400_000);
+            let signed = register(&registrar, entry, now, until)
+                .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            if let Err(e) = ring.add(signed) { eprintln!("error: {}", e); process::exit(1); }
+            save(&ring);
+            println!("  {}: {} registered by {}{}", ring_path, name, registrar.name,
+                     days.map(|d| format!(" for {} day(s)", d)).unwrap_or_default());
+        }
+        _ => { eprintln!("{}", usage); process::exit(1); }
+    }
+}
+
+/// `cubelang sign --key key.json --program FILE --fn NAME [--arg V]... [--answer J]...
+/// [--knowledge PATH] [--tick]`: the `Caller` for one run-proto request, as JSON (signatures hex).
+/// Sign the program text exactly as the request will carry it.
+fn cmd_sign(args: &[String]) {
+    use cubelang::auth::{CallClaim, Purpose, TICK};
+    use rand::RngCore;
+    let (mut key, mut program, mut function, mut knowledge, mut tick) = (None, None, None, String::new(), false);
+    let mut pass_file: Option<String> = None;
+    let (mut call_args, mut answers) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => { key = Some(flag_value(args, i, "--key")); i += 1; }
+            "--program" => { program = Some(flag_value(args, i, "--program")); i += 1; }
+            "--fn" => { function = Some(flag_value(args, i, "--fn")); i += 1; }
+            "--arg" => { call_args.push(flag_value(args, i, "--arg")); i += 1; }
+            "--answer" => { answers.push(flag_value(args, i, "--answer")); i += 1; }
+            "--knowledge" => { knowledge = flag_value(args, i, "--knowledge"); i += 1; }
+            "--passphrase-file" => { pass_file = Some(flag_value(args, i, "--passphrase-file")); i += 1; }
+            "--tick" => tick = true,
+            other => { eprintln!("error: sign: unknown option {}", other); process::exit(1); }
+        }
+        i += 1;
+    }
+    let (Some(key), Some(program)) = (key, program) else {
+        eprintln!("usage: cubelang sign --key key.json --program FILE (--fn NAME | --tick) [--arg V]... [--answer J]... [--knowledge PATH]");
+        process::exit(1);
+    };
+    let function = if tick { TICK.to_string() } else {
+        function.unwrap_or_else(|| { eprintln!("error: sign needs --fn NAME or --tick"); process::exit(1) })
+    };
+    let identity = open_identity(&key, pass_file.as_deref());
+    let source = std::fs::read_to_string(&program).unwrap_or_else(|e| { eprintln!("error: {}: {}", program, e); process::exit(1) });
+    let timestamp_ms = cubelang::auth::now_ms();
+    let nonce = rand::rngs::OsRng.next_u64();
+    let claim = CallClaim {
+        program_source: &source,
+        function: &function,
+        args: &call_args,
+        answers: &answers,
+        knowledge_path: &knowledge,
+        caller: &identity.name,
+        timestamp_ms,
+        nonce,
+    };
+    let sig = identity.sign(Purpose::Call, &claim.message()).unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+    println!("{}", serde_json::json!({
+        "name": identity.name,
+        "timestamp_ms": timestamp_ms,
+        "nonce": nonce,
+        "ml_dsa": cubelang::auth::to_hex(&sig.ml_dsa),
+        "ed25519": cubelang::auth::to_hex(&sig.ed25519),
+    }));
 }
 
 /// The value mapping `run-proto` and `run --json` (`value_to_json`) must

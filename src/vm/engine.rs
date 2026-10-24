@@ -243,6 +243,17 @@ pub struct VM {
     pub last_recover_reason: Option<RecoverReason>,
     /// `@once` functions that have already run in this VM (`program.fn`).
     once_called: HashSet<String>,
+    /// Who is calling from outside (2026-10-24): the program name the host
+    /// speaks as, checked against `@restricted(...)` at `call_entry`. `None`:
+    /// an anonymous caller, which no restricted function admits.
+    pub caller: Option<String>,
+    /// `program.fn` -> the callers a container's `permissions { grant ... }`
+    /// admitted on top of the function's own `@restricted` list (and past
+    /// `@internal`, which the SPEC opens to "programs it explicitly grants").
+    pub grants: HashMap<String, HashSet<String>>,
+    /// `@ratelimit` windows and the `@cron` clock. A resident host keeps one
+    /// across requests (`std::mem::take` in, then back out).
+    pub governor: crate::vm::governor::Governor,
 }
 
 /// What went into a frame register through BIND_ROLE, in bind order and
@@ -352,6 +363,9 @@ impl VM {
             last_recover_runner_up: None,
             last_recover_reason: None,
             once_called: HashSet::new(),
+            caller: None,
+            grants: HashMap::new(),
+            governor: crate::vm::governor::Governor::new(),
         };
         // Task 3: pre-register every registry function name into the
         // hash-reversal table, regardless of which modules any given
@@ -559,17 +573,95 @@ impl VM {
     /// `call`/`init`, which is the runtime. A function with no attribute is
     /// callable, as it always was.
     pub fn call_entry(&mut self, program: &str, function: &str, args: Vec<Value>) -> ExecResult {
-        let access = self.programs.get(program)
-            .and_then(|p| p.functions.iter().find(|f| f.name == function))
-            .map(|f| f.access);
-        match access {
-            Some(Access::Internal) => return ExecResult::Error(format!(
-                "{}.{} is @internal: not callable from outside the program", program, function)),
-            Some(Access::System) => return ExecResult::Error(format!(
-                "{}.{} is @system: only the VM runtime may call it", program, function)),
-            _ => {}
+        if let Err(e) = self.admit_entry(program, function, std::time::Instant::now()) {
+            return ExecResult::Error(e);
         }
         self.call(program, function, args)
+    }
+
+    /// Every rule a call from OUTSIDE must pass (2026-10-24), in the order a
+    /// refusal is most useful to read: who may call at all (`@system`,
+    /// `@cron`, `@internal` / `private`), who by name (`@restricted`, plus a
+    /// container's grants), then how often (`@ratelimit`, counted only when
+    /// everything before it admitted the call, so a refused caller cannot
+    /// spend the window). A function the program does not have falls through
+    /// to `call`, which says so.
+    pub fn admit_entry(&mut self, program: &str, function: &str, now: std::time::Instant) -> Result<(), String> {
+        let Some((access, cron, restricted, ratelimit)) = self.programs.get(program)
+            .and_then(|p| p.functions.iter().find(|f| f.name == function))
+            .map(|f| (f.access, f.cron, f.restricted.clone(), f.ratelimit))
+        else { return Ok(()) };
+        let key = format!("{}.{}", program, function);
+        let granted = self.caller.as_ref()
+            .is_some_and(|c| self.grants.get(&key).is_some_and(|g| g.contains(c)));
+        match access {
+            Access::System => return Err(format!("{} is @system: only the VM runtime may call it", key)),
+            Access::Internal if !granted => return Err(format!(
+                "{} is @internal (or private): not callable from outside the program{}",
+                key, if self.grants.contains_key(&key) { " except by the programs granted it" } else { "" })),
+            _ => {}
+        }
+        if cron.is_some() {
+            return Err(format!("{} is @cron: the VM's scheduler runs it (tick), nothing calls it", key));
+        }
+        if let Some(allowed) = &restricted {
+            let admitted = self.caller.as_ref()
+                .is_some_and(|c| allowed.iter().any(|a| a == c)) || granted;
+            if !admitted {
+                let who = self.caller.as_deref().unwrap_or("an anonymous caller");
+                let list = if allowed.is_empty() { "the programs a container grants it".to_string() } else { allowed.join(", ") };
+                return Err(format!("{} is @restricted to {}: {} may not call it", key, list, who));
+            }
+        }
+        if let Some((n, period_ms)) = ratelimit {
+            // Per caller: one busy agent cannot spend everyone's window. Every anonymous caller
+            // shares one window (a public front end limits its visitors before they get here).
+            let bucket = format!("{}#{}", key, self.caller.as_deref().unwrap_or("anonymous"));
+            self.governor.admit(&bucket, n, std::time::Duration::from_millis(period_ms), now)?;
+        }
+        Ok(())
+    }
+
+    /// The `@cron` functions of `program` due at `now`, in declaration order.
+    pub fn due_crons(&self, program: &str, now: std::time::Instant) -> Vec<String> {
+        let Some(p) = self.programs.get(program) else { return Vec::new() };
+        p.functions.iter()
+            .filter_map(|f| f.cron.map(|ms| (f, ms)))
+            .filter(|(f, ms)| self.governor.due(&format!("{}.{}", program, f.name),
+                                                std::time::Duration::from_millis(*ms), now))
+            .map(|(f, _)| f.name.clone())
+            .collect()
+    }
+
+    /// One tick of the scheduler (2026-10-24): run every `@cron` function of
+    /// `program` that is due at `now`, as the runtime (no entry rules apply:
+    /// the scheduler is the one caller a cron function admits). Each is
+    /// marked as run BEFORE it runs, so a cron that errors waits its full
+    /// interval like one that succeeded rather than retrying every tick.
+    /// The host drives the clock: `cubelang tick`, a `RunRequest` with
+    /// `tick`, or a library caller on its own timer.
+    pub fn tick(&mut self, program: &str, now: std::time::Instant) -> Vec<(String, ExecResult)> {
+        let mut out = Vec::new();
+        for name in self.due_crons(program, now) {
+            self.governor.mark_ran(&format!("{}.{}", program, name), now);
+            let r = self.call(program, &name, Vec::new());
+            out.push((name, r));
+        }
+        out
+    }
+
+    /// Admit `caller` to `program.function` on top of its own rules (what a
+    /// container's `grant program.function to caller;` does).
+    pub fn grant(&mut self, program: &str, function: &str, caller: &str) {
+        self.grants.entry(format!("{}.{}", program, function)).or_default().insert(caller.to_string());
+    }
+
+    /// Withdraw a grant (`revoke ... from caller;`). A function's own
+    /// `@restricted` list is not touched: a revoke takes back a grant only.
+    pub fn revoke(&mut self, program: &str, function: &str, caller: &str) {
+        if let Some(g) = self.grants.get_mut(&format!("{}.{}", program, function)) {
+            g.remove(caller);
+        }
     }
 
     /// Run the constructor of a program.
@@ -1227,6 +1319,15 @@ impl VM {
                     }
 
                     let own_fn = prog.functions.iter().find(|f| f.name == fn_name).cloned();
+                    // 2026-10-24: `@system` is "only callable by the VM runtime" -- the
+                    // program's own code is not the runtime. (`@internal`, `private`,
+                    // `@restricted`, `@ratelimit` govern OUTSIDE callers and are
+                    // admitted here: a program may always call itself.)
+                    if own_fn.as_ref().is_some_and(|f| f.access == Access::System) {
+                        return ExecResult::Error(format!(
+                            "{}.{} is @system: only the VM runtime may call it, not the program's own code",
+                            prog_name, fn_name));
+                    }
                     // (bool, fn ptr) is Copy: pulling both out of the
                     // registry entry here ends the immutable borrow of
                     // `self.registry` before any branch below needs
@@ -3056,6 +3157,11 @@ mod vsa_opcode_wiring_tests {
             is_override: false,
             access: Access::External,
             once: false,
+            restricted: None,
+            ratelimit: None,
+            cron: None,
+            param_types: Vec::new(),
+            return_type: crate::types::TypeSpec::Any,
         };
         let prog = CompiledProgram {
             name: "T".to_string(),
@@ -3066,6 +3172,7 @@ mod vsa_opcode_wiring_tests {
                 "frame".to_string(), "SUBJECT".to_string(), "cat".to_string(),
             ],
             used_modules: Vec::new(),
+            types: Default::default(),
         };
 
         let mut vm = VM::new();
