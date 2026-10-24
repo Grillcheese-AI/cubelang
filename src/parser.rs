@@ -518,9 +518,42 @@ impl Parser {
                 TokenKind::Permissions => {
                     self.advance();
                     self.expect(&TokenKind::LBrace)?;
-                    // skip permission parsing for now
+                    let stmts = self.parse_permission_stmts()?;
+                    self.expect(&TokenKind::RBrace)?;
+                    body.push(ContainerItem::Permissions(stmts));
+                }
+                // 2026-10-24: these used to fall through to the function
+                // parser and fail. `world` holds state fields, `safety` and
+                // `fusion` hold `key: value;` settings; the hardware blocks are
+                // recorded (so the compiler can say they do not run) and skipped.
+                TokenKind::WorldKw => {
+                    self.advance();
+                    self.expect(&TokenKind::LBrace)?;
+                    let fields = self.parse_storage_fields()?;
+                    self.expect(&TokenKind::RBrace)?;
+                    body.push(ContainerItem::World(fields));
+                }
+                TokenKind::Safety | TokenKind::Fusion => {
+                    let is_safety = self.at(&TokenKind::Safety);
+                    self.advance();
+                    self.expect(&TokenKind::LBrace)?;
+                    let fields = self.parse_config_fields()?;
+                    self.expect(&TokenKind::RBrace)?;
+                    body.push(if is_safety { ContainerItem::Safety(fields) } else { ContainerItem::Fusion(fields) });
+                }
+                TokenKind::Modalities | TokenKind::Sensors | TokenKind::Actuators => {
+                    let which = self.peek().clone();
+                    self.advance();
+                    self.expect(&TokenKind::LBrace)?;
                     self.skip_block()?;
-                    body.push(ContainerItem::Permissions(Vec::new()));
+                    body.push(match which {
+                        TokenKind::Modalities => ContainerItem::Modalities(Vec::new()),
+                        TokenKind::Sensors => ContainerItem::Sensors(Vec::new()),
+                        _ => ContainerItem::Actuators(Vec::new()),
+                    });
+                }
+                TokenKind::Struct => {
+                    body.push(ContainerItem::Struct(self.parse_struct()?));
                 }
                 _ => {
                     let func = self.parse_function_decl()?;
@@ -660,6 +693,14 @@ impl Parser {
         self.expect(&TokenKind::Storage)?;
         self.expect(&TokenKind::LBrace)?;
 
+        let fields = self.parse_storage_fields()?;
+        self.expect(&TokenKind::RBrace)?;
+        Ok(StorageBlock { is_global, fields, span })
+    }
+
+    /// `name: [mutable|immutable] type [= default];` until the closing brace
+    /// (shared by `storage { }` and a container's `world { }`).
+    fn parse_storage_fields(&mut self) -> PResult<Vec<StorageField>> {
         let mut fields = Vec::new();
         loop {
             self.skip_newlines();
@@ -667,7 +708,7 @@ impl Parser {
             let fname = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let mutable = self.eat(&TokenKind::Mutable);
-            if !mutable { self.eat(&TokenKind::Immutable); }
+            let immutable = !mutable && self.eat(&TokenKind::Immutable);
             let ty = self.parse_type()?;
             let default = if self.eat(&TokenKind::Eq) {
                 Some(self.parse_expr()?)
@@ -675,11 +716,37 @@ impl Parser {
                 None
             };
             self.eat(&TokenKind::Semicolon);
-            fields.push(StorageField { name: fname, mutable, ty, default, span: self.span() });
+            fields.push(StorageField { name: fname, mutable, immutable, ty, default, span: self.span() });
         }
+        Ok(fields)
+    }
 
-        self.expect(&TokenKind::RBrace)?;
-        Ok(StorageBlock { is_global, fields, span })
+    /// `grant Program.function to Caller;` / `revoke Program.function from Caller;`
+    fn parse_permission_stmts(&mut self) -> PResult<Vec<PermissionStmt>> {
+        let mut stmts = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) { break; }
+            let span = self.span();
+            let action = if self.eat(&TokenKind::Grant) {
+                PermAction::Grant
+            } else if self.eat(&TokenKind::Revoke) {
+                PermAction::Revoke
+            } else {
+                return Err(self.err("a permissions block holds `grant P.f to Q;` and `revoke P.f from Q;`".into()));
+            };
+            let program = self.expect_ident()?;
+            self.expect(&TokenKind::Dot)?;
+            let function = self.expect_ident()?;
+            match action {
+                PermAction::Grant => { self.expect(&TokenKind::To)?; }
+                PermAction::Revoke => { self.expect(&TokenKind::From)?; }
+            }
+            let target = self.expect_ident()?;
+            self.eat(&TokenKind::Semicolon);
+            stmts.push(PermissionStmt { action, subject: format!("{}.{}", program, function), target, span });
+        }
+        Ok(stmts)
     }
 
     // ── IO block ────────────────────────────────────────────────────────

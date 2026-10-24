@@ -112,6 +112,8 @@ pub enum ContainerItem {
     Safety(Vec<ConfigField>),
     Fusion(Vec<ConfigField>),
     Function(FunctionDecl),
+    /// A struct declared inside the container (as the README's world example does).
+    Struct(StructDecl),
 }
 
 // ── Structs, Enums, Types ───────────────────────────────────────────────────
@@ -247,6 +249,10 @@ pub struct StorageBlock {
 pub struct StorageField {
     pub name: String,
     pub mutable: bool,
+    /// Declared `immutable` in so many words (2026-10-24): only the
+    /// constructor may set it. A field declared neither way stays writable,
+    /// as it always was.
+    pub immutable: bool,
     pub ty: TypeExpr,
     pub default: Option<Expr>,
     pub span: Span,

@@ -272,6 +272,18 @@ initialize `threshold` to 0 via the storage declaration; every example
 re-assigns it by hand inside `constructor()` because the declaration alone
 does nothing at runtime. Undocumented.
 
+> **Resolved 2026-10-24.** A default is the field's starting value, set when
+> the VM loads the program (before any constructor); it must be a constant
+> and match the field's type (compile errors otherwise), a map or array field
+> without one starts empty, `.cubebin` carries them, and `immutable` fields are
+> written only by the constructor. Also found and fixed: a called function's
+> `self.x` read a fresh, empty register scope (storage was set aside with the
+> caller's locals), so a helper could neither read nor update storage; and
+> every program loaded in one VM shared one register namespace, so two
+> programs with a field of the same name shared it and one could read what
+> another left in a register (each program's registers are now its own, parked
+> while another runs). Pinned by `tests/containers.rs`.
+
 ---
 
 ## C. Non-executing constructs — the full list (per the task: "must be named")
@@ -474,6 +486,20 @@ demonstrating syntax that **cannot be run at all** by the shipped VM — not
 > map this entry's C4 describes (the type operand is a hash and was compared
 > as `t_xxxx`); and `len()` of a map read 0. Pinned by `tests/structs.rs`.
 > `container`/`world`/`safety` and `event`/`extend` are still not visited.
+>
+> **Resolved 2026-10-24 (containers):** a `container`/`world`/`modal`/`robot`
+> compiles to a program of its own name, and a file with one runs it. `config`
+> and `world` are storage with constant starting values (`self.config.k`,
+> `self.world.time`; `config` and `immutable` world fields are written only by
+> the constructor and `on_start`), `programs { b: deploy P(); }` binds what it
+> runs (`self.programs.b.f(x)` / `b.f(x)`; any program can call `Other.f(x)`,
+> admitted with the calling program as the caller), `permissions` is
+> installed on load, `safety` caps each run entered through it (`max_jumps`,
+> `max_ops`, `max_queries`, `max_wall_ms`, `max_call_depth`, `deny` opcodes;
+> any other key is an error in every mode), and the VM boots it (bound
+> constructors, its constructor, `on_start`). `io`, `agents`, `modalities`,
+> `sensors`, `actuators`, `fusion`, `extends`, top-level `event` and `extend`
+> are strict errors: they still do not run. Pinned by `tests/containers.rs`.
 
 ### C11. A non-trivial expression used as a call argument (or general RHS) silently becomes garbage — and `--strict` does NOT catch it
 `compiler::Compiler::compile_expr_operand` (`src/compiler.rs:1648-1670`) has

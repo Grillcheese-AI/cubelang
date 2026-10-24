@@ -158,6 +158,16 @@ struct FrameState {
     vsa_frames: HashMap<String, VsaFrame>,
 }
 
+/// The VM's limits as they stood before a run entered a container.
+struct SavedLimits {
+    jump_budget: u64,
+    op_budget: u64,
+    query_budget: u64,
+    deadline: Option<std::time::Instant>,
+    max_call_depth: u32,
+    denied_ops: HashSet<u8>,
+}
+
 /// The CubeLang virtual machine.
 pub struct VM {
     /// Grounded facts, keyed by canonical surface form. Backs `QUERY`.
@@ -284,6 +294,26 @@ pub struct VM {
     /// `@ratelimit` windows and the `@cron` clock. A resident host keeps one
     /// across requests (`std::mem::take` in, then back out).
     pub governor: crate::vm::governor::Governor,
+    /// The register keys of the active program's storage fields
+    /// (2026-10-24). Storage is not a caller's local: a call leaves it in
+    /// place, so a helper's `self.x` is the program's `x` (it used to read a
+    /// fresh, empty register scope).
+    storage_keys: HashSet<String>,
+    /// Every loaded program's storage register keys.
+    storage_keys_of: HashMap<String, HashSet<String>>,
+    /// The program whose registers are the VM's `registers` (2026-10-24).
+    /// Each program's registers are its own: another program's storage, or
+    /// what its last run left behind, is parked while it is not running, so
+    /// two programs with a field of the same name never share it, and one
+    /// cannot read what another left in a register.
+    active: Option<String>,
+    parked: HashMap<String, FrameState>,
+    /// How deep calls may nest (64; a container's `safety { max_call_depth }`
+    /// lowers it).
+    pub max_call_depth: u32,
+    /// Opcodes refused at run time: a container's `safety { deny }`, added
+    /// the first time a run enters it.
+    pub denied_ops: HashSet<u8>,
 }
 
 /// What went into a frame register through BIND_ROLE, in bind order and
@@ -352,13 +382,22 @@ pub struct VmSnapshot {
     vsa_frames: HashMap<String, VsaFrame>,
     accumulator: Value,
     knowledge: crate::vm::knowledge::KnowledgeStore,
+    active: Option<String>,
+    parked: HashMap<String, FrameState>,
 }
 
-/// Conservative recursion cap. exec_function has a sizeable per-frame
-/// footprint (registers/stack clones, operands buffer, label_map clone via
-/// scan), so 64 is comfortably below the native test-thread stack limit while
-/// being plenty for hand-written CubeLang programs.
+/// Conservative recursion cap: plenty for hand-written CubeLang programs.
+/// It is the language's limit, not the native stack's: exec_function has a
+/// sizeable per-frame footprint (tens of KiB unoptimized), and a deep chain
+/// hops to a fresh stack every `STACK_HOP` levels (2026-10-24; at 64 levels
+/// it had grown past a 2 MiB test thread, and a Windows main thread has 1).
 const MAX_CALL_DEPTH: u32 = 64;
+
+/// A call chain moves to a fresh stack every this many levels
+/// (`VM::exec_on_fresh_stack`), each one this large: room for the levels
+/// between hops many times over, in any build.
+const STACK_HOP: u32 = 8;
+const HOP_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 impl VM {
     pub fn new() -> Self {
@@ -396,6 +435,12 @@ impl VM {
             caller: None,
             grants: HashMap::new(),
             governor: crate::vm::governor::Governor::new(),
+            storage_keys: HashSet::new(),
+            storage_keys_of: HashMap::new(),
+            active: None,
+            parked: HashMap::new(),
+            max_call_depth: MAX_CALL_DEPTH,
+            denied_ops: HashSet::new(),
         };
         // Task 3: pre-register every registry function name into the
         // hash-reversal table, regardless of which modules any given
@@ -423,6 +468,8 @@ impl VM {
             vsa_frames: self.vsa_frames.clone(),
             accumulator: self.accumulator.clone(),
             knowledge: self.knowledge.clone(),
+            active: self.active.clone(),
+            parked: self.parked.clone(),
         }
     }
 
@@ -436,6 +483,55 @@ impl VM {
         self.vsa_frames = snap.vsa_frames;
         self.accumulator = snap.accumulator;
         self.knowledge = snap.knowledge;
+        self.storage_keys = snap.active.as_ref()
+            .and_then(|p| self.storage_keys_of.get(p).cloned())
+            .unwrap_or_default();
+        self.active = snap.active;
+        self.parked = snap.parked;
+    }
+
+    /// Make `program`'s registers the VM's (2026-10-24): park the active
+    /// program's, bring back `program`'s. Registers the host set before any
+    /// program ran go to the first program activated.
+    fn activate(&mut self, program: &str) {
+        if self.active.as_deref() == Some(program) {
+            return;
+        }
+        let incoming = self.parked.remove(program).unwrap_or_default();
+        let current = FrameState {
+            registers: std::mem::take(&mut self.registers),
+            vsa_frames: std::mem::take(&mut self.vsa_frames),
+        };
+        match self.active.take() {
+            Some(prev) => {
+                self.parked.insert(prev, current);
+                self.registers = incoming.registers;
+                self.vsa_frames = incoming.vsa_frames;
+            }
+            None => {
+                self.registers = current.registers;
+                self.vsa_frames = current.vsa_frames;
+                for (k, v) in incoming.registers {
+                    self.registers.entry(k).or_insert(v);
+                }
+                for (k, v) in incoming.vsa_frames {
+                    self.vsa_frames.entry(k).or_insert(v);
+                }
+            }
+        }
+        self.storage_keys = self.storage_keys_of.get(program).cloned().unwrap_or_default();
+        self.active = Some(program.to_string());
+    }
+
+    /// A program's storage field as it stands, whether or not the program
+    /// is the active one (for a host reading a program's state).
+    pub fn storage_value(&self, program: &str, field: &str) -> Option<&Value> {
+        let key = Self::register_key(field);
+        if self.active.as_deref() == Some(program) {
+            self.registers.get(&key)
+        } else {
+            self.parked.get(program).and_then(|p| p.registers.get(&key))
+        }
     }
 
     /// Resume a program suspended by ASK, supplying the caller's answer.
@@ -462,6 +558,16 @@ impl VM {
     /// so `Suspension` carries back only the interpreter locals (pc, flag,
     /// jump_budget).
     pub fn resume(&mut self, susp: Suspension, answer: Value) -> ExecResult {
+        // 2026-10-24: a run entered through a container resumes under its
+        // safety limits, as it ran.
+        let outermost = susp.callers.last().map_or_else(|| susp.program.clone(), |c| c.program.clone());
+        let saved = self.enter_safety(&outermost);
+        let r = self.resume_run(susp, answer);
+        self.leave_safety(saved);
+        r
+    }
+
+    fn resume_run(&mut self, susp: Suspension, answer: Value) -> ExecResult {
         // Structural guard: the selection must be one the program offered.
         // Deliberately NOT `derive(PartialEq)` on Value -- Hvec holds floats and
         // "equal hypervectors" is a similarity question, not an equality one.
@@ -511,6 +617,7 @@ impl VM {
             Ok(f) => f,
             Err(e) => return ExecResult::Error(e),
         };
+        self.activate(&prog_name);
         // Deliver the answer the same way CALL delivers a result: via the stack.
         self.stack.push(answer);
         // A nested ASK inside the resumed run must report the same program.
@@ -596,18 +703,23 @@ impl VM {
                 Err(e) => return ExecResult::Error(e),
             }
         }
-        frames[n - 1].state = Some(FrameState {
-            registers: std::mem::take(&mut self.registers),
-            vsa_frames: std::mem::take(&mut self.vsa_frames),
-        });
+        // Each frame runs with its own program's registers (2026-10-24).
+        let outermost = frames[n - 1].program.clone();
+        self.activate(&outermost);
+        frames[n - 1].state = Some(self.take_locals());
         let prev_program = self.current_program.clone();
         let prev_depth = self.call_depth;
         let mut carry = answer;
         let mut i = 0;
         let outcome = loop {
             let state = frames[i].state.take().expect("checked above");
-            self.registers = state.registers;
-            self.vsa_frames = state.vsa_frames;
+            if i > 0 {
+                // the finished callee's locals go, as at a CALL's return
+                let _ = self.take_locals();
+            }
+            let program = frames[i].program.clone();
+            self.activate(&program);
+            self.put_locals(state);
             self.stack.push(carry);
             self.current_program = Some(frames[i].program.clone());
             self.call_depth = prev_depth + (n - 1 - i) as u32;
@@ -633,10 +745,7 @@ impl VM {
                     // As `exec_intra_call` would have: this frame's registers
                     // go into the suspension, then every frame still waiting
                     // above it, the outermost's back into the VM.
-                    let state = FrameState {
-                        registers: std::mem::take(&mut self.registers),
-                        vsa_frames: std::mem::take(&mut self.vsa_frames),
-                    };
+                    let state = self.take_locals();
                     match again.callers.last_mut() {
                         None => again.inner = Some(state),
                         Some(waiting) => waiting.state = Some(state),
@@ -644,8 +753,8 @@ impl VM {
                     for (j, mut waiting) in frames.drain(i + 1..).enumerate() {
                         if i + 1 + j == n - 1 {
                             let outer = waiting.state.take().expect("the outermost frame's registers");
-                            self.registers = outer.registers;
-                            self.vsa_frames = outer.vsa_frames;
+                            self.activate(&outermost);
+                            self.put_locals(outer);
                         }
                         again.callers.push(waiting);
                     }
@@ -655,8 +764,8 @@ impl VM {
                     // Put the outermost frame's registers back, so the VM is
                     // left as an erroring top-level run leaves it.
                     if let Some(outer) = frames[n - 1].state.take() {
-                        self.registers = outer.registers;
-                        self.vsa_frames = outer.vsa_frames;
+                        self.activate(&outermost);
+                        self.put_locals(outer);
                     }
                     break ExecResult::Error(e);
                 }
@@ -688,7 +797,110 @@ impl VM {
         for sym in &prog.symbol_names {
             self.register_name(sym);
         }
+        // 2026-10-24: `Program.function`, the name a call from another
+        // program carries.
+        for func in &prog.functions {
+            self.register_name(&format!("{}.{}", prog.name, func.name));
+        }
+        // Storage: the program's own (parked while it is not running), kept
+        // in place across its calls, and set to its declared starting value
+        // (a constant) unless it already holds one -- before any constructor
+        // runs (DRIFT B11).
+        let keys: HashSet<String> = prog.storage_fields.iter().map(|f| Self::register_key(f)).collect();
+        if self.active.as_deref() == Some(prog.name.as_str()) {
+            self.storage_keys = keys.clone();
+        }
+        self.storage_keys_of.insert(prog.name.clone(), keys);
+        let active = self.active.as_deref() == Some(prog.name.as_str());
+        for (field, value) in &prog.storage_defaults {
+            let regs = if active {
+                &mut self.registers
+            } else {
+                &mut self.parked.entry(prog.name.clone()).or_default().registers
+            };
+            regs.entry(Self::register_key(field)).or_insert_with(|| json_to_value(value));
+        }
+        // A container's `permissions { }`, in the order it wrote them.
+        if let Some(meta) = &prog.container {
+            for (program, function, caller, grant) in meta.permissions.clone() {
+                if grant {
+                    self.grant(&program, &function, &caller);
+                } else {
+                    self.revoke(&program, &function, &caller);
+                }
+            }
+        }
         self.programs.insert(prog.name.clone(), prog);
+    }
+
+    /// Boot a program as the runtime does before its first entry
+    /// (2026-10-24): a container first boots each program it binds (its
+    /// constructor, once), then runs its own `constructor`, then `on_start`.
+    /// A plain program runs its `constructor`. Only functions that exist are
+    /// run; the first error stops the boot and is returned.
+    pub fn boot(&mut self, program: &str) -> ExecResult {
+        let Some(prog) = self.programs.get(program) else {
+            return ExecResult::Error(format!("program not found: {}", program));
+        };
+        let has = |p: &CompiledProgram, f: &str| p.functions.iter().any(|x| x.name == f);
+        let mut steps: Vec<(String, &'static str)> = Vec::new();
+        if let Some(meta) = &prog.container {
+            for (_, bound) in &meta.programs {
+                let already = steps.iter().any(|(p, _)| p == bound);
+                if !already && self.programs.get(bound).is_some_and(|p| has(p, "constructor")) {
+                    steps.push((bound.clone(), "constructor"));
+                }
+            }
+            if has(prog, "constructor") {
+                steps.push((program.to_string(), "constructor"));
+            }
+            if has(prog, "on_start") {
+                steps.push((program.to_string(), "on_start"));
+            }
+        } else if has(prog, "constructor") {
+            steps.push((program.to_string(), "constructor"));
+        }
+        let mut last = ExecResult::Ok(Value::Null);
+        for (p, f) in steps {
+            last = self.call(&p, f, Vec::new());
+            match &last {
+                ExecResult::Error(e) => return ExecResult::Error(format!("booting {}: {}.{}: {}", program, p, f, e)),
+                ExecResult::Suspend(_) => return ExecResult::Error(format!(
+                    "booting {}: {}.{} asked a question; a constructor cannot wait for an answer", program, p, f)),
+                _ => {}
+            }
+        }
+        last
+    }
+
+    /// The registers that are a function's own, taken out (storage stays).
+    fn take_locals(&mut self) -> FrameState {
+        let keys = &self.storage_keys;
+        let (storage, locals): (HashMap<_, _>, HashMap<_, _>) =
+            std::mem::take(&mut self.registers).into_iter().partition(|(k, _)| keys.contains(k));
+        self.registers = storage;
+        let (storage_frames, local_frames): (HashMap<_, _>, HashMap<_, _>) =
+            std::mem::take(&mut self.vsa_frames).into_iter().partition(|(k, _)| keys.contains(k));
+        self.vsa_frames = storage_frames;
+        FrameState { registers: locals, vsa_frames: local_frames }
+    }
+
+    /// Put a function's own registers back in place of the current ones
+    /// (storage stays as it is now).
+    fn put_locals(&mut self, state: FrameState) {
+        let keys = &self.storage_keys;
+        self.registers.retain(|k, _| keys.contains(k));
+        self.vsa_frames.retain(|k, _| keys.contains(k));
+        for (k, v) in state.registers {
+            if !keys.contains(&k) {
+                self.registers.insert(k, v);
+            }
+        }
+        for (k, v) in state.vsa_frames {
+            if !keys.contains(&k) {
+                self.vsa_frames.insert(k, v);
+            }
+        }
     }
 
     /// Load from a .cubebin file.
@@ -710,6 +922,9 @@ impl VM {
             Some(f) => f.clone(),
             None => return ExecResult::Error(format!("function not found: {}.{}", program, function)),
         };
+        // 2026-10-24: the program's own registers (its storage, and what its
+        // last run left), not another program's.
+        self.activate(program);
 
         // Bind host arguments to registers.
         //
@@ -750,7 +965,10 @@ impl VM {
         // Plan-2: remember which program owns the running function so an
         // intra-program CALL can look up siblings by name.
         let prev = self.current_program.replace(program.to_string());
+        // 2026-10-24: a run entering a container runs under its safety limits.
+        let saved = self.enter_safety(program);
         let result = self.exec_function(&func);
+        self.leave_safety(saved);
         self.current_program = prev;
         self.check_return(program, &func, result)
     }
@@ -777,12 +995,21 @@ impl VM {
     /// spend the window). A function the program does not have falls through
     /// to `call`, which says so.
     pub fn admit_entry(&mut self, program: &str, function: &str, now: std::time::Instant) -> Result<(), String> {
+        let caller = self.caller.clone();
+        self.admit_as(program, function, caller.as_deref(), now)
+    }
+
+    /// The same rules for a named `caller` (2026-10-24): the host's
+    /// `VM::caller` at the entry, or the calling program when one program
+    /// calls another (`Program.function`).
+    pub fn admit_as(&mut self, program: &str, function: &str, caller: Option<&str>,
+                    now: std::time::Instant) -> Result<(), String> {
         let Some((access, cron, restricted, ratelimit)) = self.programs.get(program)
             .and_then(|p| p.functions.iter().find(|f| f.name == function))
             .map(|f| (f.access, f.cron, f.restricted.clone(), f.ratelimit))
         else { return Ok(()) };
         let key = format!("{}.{}", program, function);
-        let granted = self.caller.as_ref()
+        let granted = caller
             .is_some_and(|c| self.grants.get(&key).is_some_and(|g| g.contains(c)));
         match access {
             Access::System => return Err(format!("{} is @system: only the VM runtime may call it", key)),
@@ -795,10 +1022,10 @@ impl VM {
             return Err(format!("{} is @cron: the VM's scheduler runs it (tick), nothing calls it", key));
         }
         if let Some(allowed) = &restricted {
-            let admitted = self.caller.as_ref()
+            let admitted = caller
                 .is_some_and(|c| allowed.iter().any(|a| a == c)) || granted;
             if !admitted {
-                let who = self.caller.as_deref().unwrap_or("an anonymous caller");
+                let who = caller.unwrap_or("an anonymous caller");
                 let list = if allowed.is_empty() { "the programs a container grants it".to_string() } else { allowed.join(", ") };
                 return Err(format!("{} is @restricted to {}: {} may not call it", key, list, who));
             }
@@ -806,7 +1033,7 @@ impl VM {
         if let Some((n, period_ms)) = ratelimit {
             // Per caller: one busy agent cannot spend everyone's window. Every anonymous caller
             // shares one window (a public front end limits its visitors before they get here).
-            let bucket = format!("{}#{}", key, self.caller.as_deref().unwrap_or("anonymous"));
+            let bucket = format!("{}#{}", key, caller.unwrap_or("anonymous"));
             self.governor.admit(&bucket, n, std::time::Duration::from_millis(period_ms), now)?;
         }
         Ok(())
@@ -851,6 +1078,70 @@ impl VM {
     pub fn revoke(&mut self, program: &str, function: &str, caller: &str) {
         if let Some(g) = self.grants.get_mut(&format!("{}.{}", program, function)) {
             g.remove(caller);
+        }
+    }
+
+    /// If `program` is a container: its safety limits on, and the limits
+    /// they replace (for `leave_safety`).
+    fn enter_safety(&mut self, program: &str) -> Option<SavedLimits> {
+        let safety = self.programs.get(program)?.container.as_ref()?.safety.clone();
+        let saved = SavedLimits {
+            jump_budget: self.jump_budget,
+            op_budget: self.op_budget,
+            query_budget: self.query_budget,
+            deadline: self.deadline,
+            max_call_depth: self.max_call_depth,
+            denied_ops: self.denied_ops.clone(),
+        };
+        self.apply_safety(&safety);
+        Some(saved)
+    }
+
+    fn leave_safety(&mut self, saved: Option<SavedLimits>) {
+        if let Some(s) = saved {
+            self.jump_budget = s.jump_budget;
+            self.op_budget = s.op_budget;
+            self.query_budget = s.query_budget;
+            self.deadline = s.deadline;
+            self.max_call_depth = s.max_call_depth;
+            self.denied_ops = s.denied_ops;
+        }
+    }
+
+    /// A container's `safety { }` on this VM (2026-10-24), for one run
+    /// entered through it (each entry, and each resume of a run that asked,
+    /// gets them afresh; they come off when it returns). Each limit tightens
+    /// the VM's own and never loosens it; `max_ops`, `max_queries` and
+    /// `max_wall_ms` count from the moment it is applied; the denied opcodes
+    /// join the set the VM refuses.
+    pub fn apply_safety(&mut self, s: &crate::compiler::SafetyLimits) {
+        fn tighter(current: u64, limit: u64) -> u64 {
+            match (current, limit) {
+                (c, 0) => c,
+                (0, l) => l,
+                (c, l) => c.min(l),
+            }
+        }
+        if s.max_jumps > 0 {
+            self.jump_budget = self.jump_budget.min(s.max_jumps);
+        }
+        if s.max_ops > 0 {
+            self.op_budget = tighter(self.op_budget, self.ops_executed.saturating_add(s.max_ops));
+        }
+        if s.max_queries > 0 {
+            self.query_budget = tighter(self.query_budget, (self.queried.len() as u64).saturating_add(s.max_queries));
+        }
+        if s.max_wall_ms > 0 {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(s.max_wall_ms);
+            self.deadline = Some(self.deadline.map_or(until, |d| d.min(until)));
+        }
+        if s.max_call_depth > 0 {
+            self.max_call_depth = self.max_call_depth.min(s.max_call_depth);
+        }
+        for m in &s.deny {
+            if let Some(o) = crate::compiler::opcode_of(m) {
+                self.denied_ops.insert(o);
+            }
         }
     }
 
@@ -909,6 +1200,12 @@ impl VM {
                 if self.ops_executed & 0x3f == 0 && std::time::Instant::now() > deadline {
                     return ExecResult::Error("wall budget exhausted".into());
                 }
+            }
+
+            // A container's `safety { deny: [...] }` (2026-10-24): refused
+            // before it runs, in every program the container's runs reach.
+            if !self.denied_ops.is_empty() && self.denied_ops.contains(&opcode) {
+                return self.denied(opcode, pc - 1, func);
             }
 
             // SKIP / NOP
@@ -1500,10 +1797,10 @@ impl VM {
                         }
                     };
 
-                    if self.call_depth >= MAX_CALL_DEPTH {
+                    if self.call_depth >= self.max_call_depth {
                         return ExecResult::Error(format!(
                             "call depth exceeded ({}); recursion guard tripped at {}",
-                            MAX_CALL_DEPTH, fn_name));
+                            self.max_call_depth, fn_name));
                     }
 
                     let prog_name = match self.current_program.clone() {
@@ -1523,6 +1820,19 @@ impl VM {
                     let mut arg_values: Vec<Value> = Vec::new();
                     for i in 1..operands.len() {
                         arg_values.push(self.resolve_assign_rhs(Some(&operands[i])));
+                    }
+
+                    // 2026-10-24: `Program.function` is a call into another
+                    // program, admitted with this program as the caller.
+                    // (In a helper: this function's frame is what deep
+                    // recursion multiplies, so it stays as small as it was.)
+                    if fn_name.contains('.') {
+                        match self.call_qualified(&prog_name, &fn_name, arg_values) {
+                            None => {}
+                            Some(ExecResult::Suspend(s)) => return self.caller_waits(s, func, pc, flag, jump_budget),
+                            Some(other) => return other,
+                        }
+                        continue;
                     }
 
                     let own_fn = prog.functions.iter().find(|f| f.name == fn_name).cloned();
@@ -1778,20 +2088,39 @@ impl VM {
     /// was waiting on a deeper call), the caller's registers are restored, and
     /// the CALL arm adds the caller's own resume point (`caller_waits`).
     fn exec_intra_call(&mut self, callee: &CompiledFunction, arg_values: Vec<Value>) -> Option<ExecResult> {
+        self.exec_call_in(None, callee, arg_values)
+    }
+
+    /// `exec_intra_call`, or (with `into`) a call into another program: the
+    /// callee runs as that program, with its registers (2026-10-24).
+    fn exec_call_in(&mut self, into: Option<&str>, callee: &CompiledFunction,
+                    arg_values: Vec<Value>) -> Option<ExecResult> {
         // 2026-10-24: the callee's declared parameter types, checked before
         // anything moves (no reading text as numbers here: inside a program
         // a value already has its type).
-        let program = self.current_program.clone().unwrap_or_default();
+        let program = match into {
+            Some(p) => p.to_string(),
+            None => self.current_program.clone().unwrap_or_default(),
+        };
         if let Err(e) = self.check_args(&program, callee, &arg_values) {
             return Some(ExecResult::Error(e));
         }
-        let caller_regs = std::mem::take(&mut self.registers);
         // WO-1.2: the frame map is register-keyed, so it has to follow the
         // registers exactly. Without this a callee's `bind frame, ...` would
         // leave its fillers in the caller's pool for a register of the same
         // name -- reintroducing cross-frame contamination through the back
         // door, which is the very thing the scoping exists to remove.
-        let caller_frames = std::mem::take(&mut self.vsa_frames);
+        //
+        // 2026-10-24: only the caller's LOCALS are set aside; storage stays in
+        // place, so the callee's `self.x` is the program's `x`. A call into
+        // another program then swaps the caller's storage for the callee's.
+        let caller = self.take_locals();
+        let back = into.map(|p| {
+            let prev = self.current_program.replace(p.to_string());
+            let prev_active = self.active.clone();
+            self.activate(p);
+            (prev, prev_active)
+        });
         for (i, v) in arg_values.into_iter().enumerate() {
             if let Some(param) = callee.params.get(i) {
                 self.register_name(param);
@@ -1803,14 +2132,24 @@ impl VM {
         }
 
         self.call_depth += 1;
-        let r = self.exec_function(callee);
+        let r = if self.call_depth % STACK_HOP == 0 {
+            self.exec_on_fresh_stack(callee)
+        } else {
+            self.exec_function(callee)
+        };
         self.call_depth -= 1;
         let r = self.check_return(&program, callee, r);
 
         // Restore caller-visible registers, and the frame map with them,
         // keeping the callee's in case it suspended.
-        let callee_regs = std::mem::replace(&mut self.registers, caller_regs);
-        let callee_frames = std::mem::replace(&mut self.vsa_frames, caller_frames);
+        let callee_state = self.take_locals();
+        if let Some((prev, prev_active)) = back {
+            if let Some(a) = prev_active {
+                self.activate(&a);
+            }
+            self.current_program = prev;
+        }
+        self.put_locals(caller);
 
         match r {
             ExecResult::Ok(v) | ExecResult::Return(v) => {
@@ -1819,7 +2158,7 @@ impl VM {
             }
             ExecResult::Error(e) => Some(ExecResult::Error(e)),
             ExecResult::Suspend(mut s) => {
-                let state = FrameState { registers: callee_regs, vsa_frames: callee_frames };
+                let state = callee_state;
                 match s.callers.last_mut() {
                     None => s.inner = Some(state),
                     Some(waiting) => waiting.state = Some(state),
@@ -1827,6 +2166,73 @@ impl VM {
                 Some(ExecResult::Suspend(s))
             }
         }
+    }
+
+    /// Run a callee on a fresh thread's stack (2026-10-24). Every
+    /// `STACK_HOP`-th level of a call chain hops, so a chain as deep as
+    /// `max_call_depth` fits on any thread: Windows gives a main thread
+    /// 1 MiB and a test thread 2 MiB, and an unoptimized build's interpreter
+    /// frame is tens of KiB. The VM moves with the borrow and comes back with
+    /// the result; a panic in the callee is re-raised here.
+    #[inline(never)]
+    fn exec_on_fresh_stack(&mut self, callee: &CompiledFunction) -> ExecResult {
+        std::thread::scope(|s| {
+            match std::thread::Builder::new()
+                .name("cubelang-deep-call".into())
+                .stack_size(HOP_STACK_BYTES)
+                .spawn_scoped(s, || self.exec_function(callee))
+            {
+                Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                Err(e) => ExecResult::Error(format!("call depth {}: could not start a stack for the call: {}", STACK_HOP, e)),
+            }
+        })
+    }
+
+    #[inline(never)]
+    fn call_qualified(&mut self, caller: &str, qualified: &str, args: Vec<Value>) -> Option<ExecResult> {
+        let (program, function) = qualified.split_once('.')?;
+        let (program, function) = (program.to_string(), function.to_string());
+        if self.trace_enabled {
+            self.trace.push(format!("CALL {} ({} arg(s), from {})", qualified, args.len(), caller));
+        }
+        self.call_remote(caller, &program, &function, args)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn denied(&self, opcode: u8, pc: usize, func: &CompiledFunction) -> ExecResult {
+        ExecResult::Error(format!(
+            "opcode 0x{:02x} at pc {} in {}.{} is denied by a container's safety block",
+            opcode, pc, self.current_program.clone().unwrap_or_default(), func.name))
+    }
+
+    /// A CALL of `Program.function` from another program (2026-10-24). The
+    /// calling program is the caller the target's rules see (`@internal`,
+    /// `@restricted`, a container's grants, `@ratelimit`, all as at the host's
+    /// entry); the callee runs as its own program, with its own types. A
+    /// program naming itself is an ordinary call of its own function.
+    fn call_remote(&mut self, caller: &str, program: &str, function: &str, args: Vec<Value>) -> Option<ExecResult> {
+        let callee = self.programs.get(program)
+            .and_then(|p| p.functions.iter().find(|f| f.name == function))
+            .cloned();
+        let Some(callee) = callee else {
+            return Some(ExecResult::Error(format!(
+                "CALL: {}.{} is not loaded (called from {})", program, function, caller)));
+        };
+        if program == caller {
+            if callee.access == Access::System {
+                return Some(ExecResult::Error(format!(
+                    "{}.{} is @system: only the VM runtime may call it, not the program's own code", program, function)));
+            }
+            return self.exec_intra_call(&callee, args);
+        }
+        if let Err(e) = self.admit_as(program, function, Some(caller), std::time::Instant::now()) {
+            return Some(ExecResult::Error(format!("{} may not call {}.{}: {}", caller, program, function, e)));
+        }
+        let saved = self.enter_safety(program);
+        let r = self.exec_call_in(Some(program), &callee, args);
+        self.leave_safety(saved);
+        r
     }
 
     /// A callee suspended inside this function's CALL: record where this
@@ -2029,6 +2435,17 @@ impl VM {
         self.accumulator = Value::Null;
         self.trace.clear();
         self.events.clear();
+        // every program's registers, parked or active, back to the storage
+        // starting values a fresh load sets
+        self.parked.clear();
+        self.active = None;
+        self.storage_keys.clear();
+        for (name, p) in &self.programs {
+            let regs = &mut self.parked.entry(name.clone()).or_default().registers;
+            for (field, value) in &p.storage_defaults {
+                regs.insert(Self::register_key(field), json_to_value(value));
+            }
+        }
     }
 
     // ── Genuine VSA role-filler binding ──────────────────────────────────
@@ -2333,6 +2750,24 @@ fn num_binop(a: &Value, b: &Value, op: char) -> Value {
     }
 }
 
+/// A storage field's starting value (constant JSON from the compiler) as a
+/// VM value. `true` / `false` become 1 / 0, as the literals compile in code,
+/// so a default and an assigned value compare alike.
+fn json_to_value(j: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    match j {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Int(i64::from(*b)),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().unwrap_or(0.0)),
+        },
+        J::String(s) => Value::Str(s.clone()),
+        J::Array(xs) => Value::Array(xs.iter().map(json_to_value).collect()),
+        J::Object(m) => Value::Map(m.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect()),
+    }
+}
+
 /// A host argument read as its declared scalar type (2026-10-24): hosts that
 /// speak text (run-proto, the CLI's `--arg`) send "5" for an `i64`. Anything
 /// that does not read cleanly is returned unchanged, for the type check to
@@ -2389,6 +2824,38 @@ fn scan_labels(bc: &[u8]) -> std::collections::HashMap<[u8; 2], usize> {
         }
     }
     map
+}
+
+/// Every instruction of a function's bytecode, in order: its opcode and the
+/// hash its first operand names, when that operand is a name (the function
+/// a CALL calls). For a compile-time look over the code (2026-10-24: a
+/// container's denied opcodes).
+pub(crate) fn instructions(bc: &[u8]) -> Vec<(u8, Option<[u8; 2]>)> {
+    let mut out = Vec::new();
+    let mut pc = 0usize;
+    while pc < bc.len() {
+        let opcode = bc[pc]; pc += 1;
+        if opcode == op::SKIP {
+            out.push((opcode, None));
+            continue;
+        }
+        if pc >= bc.len() { break; }
+        let n_ops = bc[pc] as usize; pc += 1;
+        let mut first = None;
+        for i in 0..n_ops {
+            if pc >= bc.len() { break; }
+            let (operand, consumed) = decode_operand(&bc[pc..]);
+            if i == 0 {
+                first = match operand {
+                    Operand::Global(h) | Operand::Named(h) => Some(h),
+                    _ => None,
+                };
+            }
+            pc += consumed.max(1);
+        }
+        out.push((opcode, first));
+    }
+    out
 }
 
 fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
@@ -3491,6 +3958,8 @@ mod vsa_opcode_wiring_tests {
             ],
             used_modules: Vec::new(),
             types: Default::default(),
+            container: None,
+            storage_defaults: Vec::new(),
         };
 
         let mut vm = VM::new();

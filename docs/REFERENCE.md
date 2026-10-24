@@ -34,6 +34,31 @@ block inside them (`config`, `io`, `storage` at container scope, `programs`,
 produces zero bytecode, unconditionally, in both loose and `--strict` mode.
 See `docs/DRIFT.md` §C for the confirming run.
 
+> **Superseded 2026-10-24.** Top-level `struct`/`enum`/`type` are read (§4), and a
+> `container`/`world`/`modal`/`robot` compiles to a program of its own name:
+> - its functions are the program's; the VM boots it (`VM::boot`): each bound program's
+>   `constructor`, its own `constructor`, then `on_start`;
+> - `config { k: v; }` is an immutable storage field `config`, a map of constants
+>   (`self.config.k`); `storage { }` / `global storage { }` are its storage; `world { }` is a
+>   storage field `world`, a map of the world's fields (`self.world.time`), each `immutable` one
+>   written only by the constructor and `on_start`;
+> - `programs { b: deploy P(); }` binds the programs it runs (`P`, `P.new()` also bind), called as
+>   `self.programs.b.f(x)` or `b.f(x)`. A call into another program, `Other.f(x)` from any
+>   program, is a CALL of `Other.f`: the VM admits it with the calling program as the caller
+>   (`@internal`, `@restricted`, grants, `@ratelimit`) and runs it as `Other`;
+> - `permissions { grant b.f to c; revoke b.f from c; }` is installed on load (`c` is a binding's
+>   program, or any caller name, such as a registered key holder);
+> - `safety { }` takes `max_jumps`, `max_ops`, `max_queries`, `max_wall_ms`, `max_call_depth` and
+>   `deny: ["ask", ...]` (opcode names): each run entered through the container runs under them
+>   (they tighten the VM's own and come off on return); a denied opcode is a compile error in
+>   the code the container can reach and a run-time refusal in any code it reaches. Any other
+>   safety key (a robot's `max_velocity`) is an error in every mode: a safety setting that is not
+>   enforced is worse than none.
+>
+> What the VM cannot run (`io`, `agents`, `modalities`, `sensors`, `actuators`, `fusion`,
+> `extends` another container, top-level `event` and `extend`) is a strict error. A file with a
+> container runs its container (`cubelang run`, `run-proto`). Pinned by `tests/containers.rs`.
+
 ## 2. Engine-provided interfaces (`ISolve`/`ISolver`/`ISolverLearn`/`IAgent`)
 
 Source of truth: `src/vm/interfaces.rs` (185 lines), `InterfaceRegistry`.
@@ -174,7 +199,11 @@ roadmap, not built. `call_depth` is capped (see `ASK inside a CALL` below).
 > (before, only `arg0..argN`, so `helper(x)` read an unbound `x` and returned
 > `Int(0)`), and an `ASK` inside a callee suspends with the waiting callers'
 > frames (docs/ASK_SUSPEND.md). Registers are still copied per call; that
-> performance note stands.
+> performance note stands. Storage fields are no longer set aside with the
+> caller's locals: a callee's `self.x` is the program's `x` (it read a fresh,
+> empty scope). A chain hops to a fresh native stack every 8 levels, so the
+> 64-level limit holds on any thread (a 64-deep chain had outgrown a 2 MiB
+> test thread). `Other.f(x)` calls another program (§1).
 
 ### 3.4 QUERY is real, not trace-only — a documentation-vs-source gap in the repo's own docs
 
@@ -200,9 +229,8 @@ never a human, per the doc) answers via `VM::resume(susp, answer)`, which
 **rejects** any answer not `==` one of the original candidates
 (`same_selection`, Int/Str/Bool/Float only — `Value` has no `PartialEq`
 because it holds `Hvec`, and "equal hypervectors" is a similarity question).
-`ASK` inside a `CALL` is a hard error (not supported): by the time a
-callee's suspension reaches the `CALL` arm, the caller's registers are
-already restored and `call_depth` unwound.
+`ASK` inside a `CALL` works since 2026-10-24: the suspension carries the
+waiting callers' frames (docs/ASK_SUSPEND.md).
 
 ## 4. Types
 
@@ -276,6 +304,18 @@ immutability enforcement exists; see `docs/DRIFT.md` §A.
 before the target function, on both `cubelang run` and `run-proto`. There is
 no once-only guard at the VM level; `@once` (parsed, see §6) does not enforce
 this — calling `constructor` twice re-runs it twice.
+
+> **2026-10-24.** A storage field's default is its starting value: it must be a constant (a
+> literal, or an array, map or struct of literals; anything else is a compile error that says to
+> set it in the constructor), is type-checked against the field, and is set when the VM loads the
+> program, before any constructor. A map or array field with no default starts empty. `.cubebin`
+> carries them. A field declared `immutable` is written only by the constructor (a local of the
+> same name is the same register, so it counts). `@once` is enforced (§6). The host runs a
+> program through `VM::boot` (its constructor; a container's sequence, §1), and a constructor
+> that fails now stops the run instead of being dropped. Each program's registers are its own:
+> the VM parks a program's storage (and what its last run left in registers) while another
+> program runs, so two programs with a field of the same name never share it, and one cannot read
+> what another left behind (`VM::storage_value(program, field)` reads a parked program's field).
 
 **`use <module>;` / `ModuleRegistry`** [src, `src/vm/registry.rs`, full
 file]: a second, sibling registry to `InterfaceRegistry` — deny-by-default

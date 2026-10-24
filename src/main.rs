@@ -1181,7 +1181,9 @@ fn run_request_on(vm: &mut VM, req: RunRequest, branch_id: &str) -> RunResult {
     // A scheduler tick (2026-10-24): the runtime runs the constructor, then every `@cron` function
     // of the program that is due by the host's clock (the Governor this request borrowed).
     if req.tick {
-        let _ = vm.call(&prog_name, "constructor", Vec::new());
+        if let ExecResult::Error(e) = vm.boot(&prog_name) {
+            return error_result(e, report(vm));
+        }
         let crons = vm.tick(&prog_name, std::time::Instant::now())
             .into_iter()
             .map(|(function, r)| cron_run(function, r))
@@ -1326,7 +1328,10 @@ fn cmd_tick(args: &[String]) {
         eprintln!("error: {} has no @cron function: nothing to tick", prog);
         process::exit(1);
     }
-    let _ = vm.call(&prog, "constructor", Vec::new());
+    if let ExecResult::Error(e) = vm.boot(&prog) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
     let mut n = 0u64;
     loop {
         for (name, r) in vm.tick(&prog, std::time::Instant::now()) {
@@ -1662,27 +1667,34 @@ fn json_to_value(j: &serde_json::Value) -> Result<Value, String> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Load every freshly-compiled program into `vm`, returning the first
-/// program's name -- the "the first compiled program is the default one to
-/// run" convention (see `loader` module doc) that `cmd_run`'s in-memory
-/// `.cube`-compile branch and `run-proto` both rely on identically. Callers
+/// Load every freshly-compiled program into `vm`, returning the name of the
+/// one to run -- the "the first compiled program is the default one to run"
+/// convention (see `loader` module doc) that `cmd_run`'s in-memory
+/// `.cube`-compile branch and `run-proto` both rely on identically, except
+/// that a file with a container runs its container (2026-10-24: the
+/// container is the deployment unit, its programs what it runs). Callers
 /// check `programs.is_empty()` themselves first (the two call sites report
 /// that case with different, path-specific messages).
 fn load_programs(vm: &mut VM, programs: Vec<CompiledProgram>) -> String {
-    let name = programs[0].name.clone();
+    let name = programs.iter().find(|p| p.container.is_some())
+        .unwrap_or(&programs[0]).name.clone();
     for p in programs { vm.load(p); }
     name
 }
 
-/// Run a program's `constructor` if it has one (sets up storage; best-effort,
-/// like `cmd_run` always treated it), then call `function` -- the exact
-/// two-call sequence `cmd_run` and `run-proto` both need, factored out so it
-/// can't drift between the two transports.
+/// Boot the program as the runtime does (its constructor; for a container,
+/// its bound programs' constructors, its own, then `on_start`), then call
+/// `function` -- the exact sequence `cmd_run` and `run-proto` both need,
+/// factored out so it can't drift between the two transports.
 fn call_with_constructor(vm: &mut VM, program: &str, function: &str, args: Vec<Value>) -> ExecResult {
     // The runtime runs the constructor (`@system @once` is written for it);
     // the target is the HOST's entry, so its access attribute is enforced
-    // (VM step 0: `@internal` / `@system` refused at the door).
-    let _ = vm.call(program, "constructor", Vec::new());
+    // (VM step 0: `@internal` / `@system` refused at the door). 2026-10-24:
+    // a constructor that fails stops the run (its error used to be dropped,
+    // and the entry ran on half-built storage).
+    if let ExecResult::Error(e) = vm.boot(program) {
+        return ExecResult::Error(e);
+    }
     vm.call_entry(program, function, args)
 }
 

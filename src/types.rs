@@ -299,30 +299,52 @@ pub fn describe(v: &Value) -> String {
     }
 }
 
+/// Every struct a source file declares: at the top level and inside containers.
+pub fn all_structs(source: &crate::ast::SourceFile) -> Vec<&crate::ast::StructDecl> {
+    use crate::ast::{ContainerItem, TopLevel};
+    let mut out = Vec::new();
+    for item in &source.items {
+        match item {
+            TopLevel::Struct(s) => out.push(s),
+            TopLevel::Container(c) => {
+                for ci in &c.body {
+                    if let ContainerItem::Struct(s) = ci {
+                        out.push(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The declarations a source file carries, as a `TypeTable` (aliases resolved against the rest).
 pub fn table_of(source: &crate::ast::SourceFile) -> TypeTable {
     use crate::ast::TopLevel;
     let mut t = TypeTable::default();
+    let structs = all_structs(source);
     // names first, so a struct field can name another struct declared later in the file
+    for s in &structs {
+        t.structs.insert(s.name.clone(), StructDef { name: s.name.clone(), fields: Vec::new() });
+    }
     for item in &source.items {
         match item {
-            TopLevel::Struct(s) => { t.structs.insert(s.name.clone(), StructDef { name: s.name.clone(), fields: Vec::new() }); }
             TopLevel::Enum(e) => { t.enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect()); }
             TopLevel::TypeAlias(a) => { t.aliases.insert(a.name.clone(), TypeSpec::Any); }
             _ => {}
         }
     }
     let names = t.clone();
+    for s in &structs {
+        let fields = s.fields.iter()
+            .map(|f| (f.name.clone(), TypeSpec::from_expr(&f.ty, &names), f.default.is_some()))
+            .collect();
+        t.structs.insert(s.name.clone(), StructDef { name: s.name.clone(), fields });
+    }
     for item in &source.items {
-        match item {
-            TopLevel::Struct(s) => {
-                let fields = s.fields.iter()
-                    .map(|f| (f.name.clone(), TypeSpec::from_expr(&f.ty, &names), f.default.is_some()))
-                    .collect();
-                t.structs.insert(s.name.clone(), StructDef { name: s.name.clone(), fields });
-            }
-            TopLevel::TypeAlias(a) => { t.aliases.insert(a.name.clone(), TypeSpec::from_expr(&a.ty, &names)); }
-            _ => {}
+        if let TopLevel::TypeAlias(a) = item {
+            t.aliases.insert(a.name.clone(), TypeSpec::from_expr(&a.ty, &names));
         }
     }
     t

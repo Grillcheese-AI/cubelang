@@ -200,6 +200,7 @@ fn asm_mnemonic_to_op(mnemonic: &str) -> Option<u8> {
         "MAKE_ARRAY" => op::MAKE_ARRAY,
         "LEN" => op::LEN,
         "INDEX" => op::INDEX,
+        "SET_INDEX" => op::SET_INDEX,
         "SKIP" => op::SKIP,
         "SEQ" => op::SEQ,
         "DIFF" => op::DIFF,
@@ -228,6 +229,12 @@ fn asm_mnemonic_to_op(mnemonic: &str) -> Option<u8> {
         "FORGET" => op::FORGET,
         _ => return None,
     })
+}
+
+/// The opcode an opcode name spells, in any case (`"ask"`, `"QUERY"`):
+/// how a container's `safety { deny: [...] }` names what it refuses.
+pub fn opcode_of(mnemonic: &str) -> Option<u8> {
+    asm_mnemonic_to_op(&mnemonic.to_uppercase())
 }
 
 // ── Compiled output ─────────────────────────────────────────────────────────
@@ -259,6 +266,41 @@ struct ProgramMeta {
     used_modules: Vec<String>,
     types: crate::types::TypeTable,
     functions: Vec<FunctionMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    container: Option<ContainerMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    storage_defaults: Vec<(String, serde_json::Value)>,
+}
+
+/// What a container (or world, modal, robot) declares beyond its functions
+/// (2026-10-24). Its config, global storage and world state become storage
+/// fields with constant starting values (`CompiledProgram::storage_defaults`);
+/// these parts are the VM's to apply: the bindings it boots, the grants it
+/// installs on load, and the limits every run entered through it gets.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ContainerMeta {
+    /// `container`, `world`, `modal` or `robot`.
+    pub kind: String,
+    /// `programs { solver: deploy GSM8K(); }`: binding -> program name.
+    pub programs: Vec<(String, String)>,
+    /// `permissions { grant P.f to Q; revoke P.f from Q; }`, in order:
+    /// (program, function, caller, true for grant).
+    pub permissions: Vec<(String, String, String, bool)>,
+    /// `safety { ... }`: the limits every run entered through it gets.
+    pub safety: SafetyLimits,
+}
+
+/// A container's `safety { }` block. A zero is "no limit of its own".
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SafetyLimits {
+    pub max_jumps: u64,
+    pub max_ops: u64,
+    pub max_queries: u64,
+    pub max_wall_ms: u64,
+    pub max_call_depth: u32,
+    /// Opcode mnemonics no function of the container, or of a program it
+    /// binds, may contain (checked at compile time).
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -357,6 +399,14 @@ pub struct CompiledProgram {
     /// The struct, enum and alias declarations of the source file, for the
     /// run-time type checks and struct values (2026-10-24, `.cubebin` v4).
     pub types: crate::types::TypeTable,
+    /// Set when this program was compiled from a container (2026-10-24).
+    pub container: Option<ContainerMeta>,
+    /// Each storage field's starting value (2026-10-24, DRIFT B11): its
+    /// declared default, which must be a constant, or an empty map / array
+    /// for a field of that type. The VM sets them when it loads the program,
+    /// before any constructor runs. A container's `config` and `world` are
+    /// two of these.
+    pub storage_defaults: Vec<(String, serde_json::Value)>,
 }
 
 impl CompiledProgram {
@@ -420,6 +470,8 @@ impl CompiledProgram {
             used_modules: self.used_modules.clone(),
             types: self.types.clone(),
             functions: self.functions.iter().map(FunctionMeta::of).collect(),
+            container: self.container.clone(),
+            storage_defaults: self.storage_defaults.clone(),
         };
         let json = serde_json::to_vec(&meta).expect("the contract trailer always serializes");
         buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
@@ -539,6 +591,8 @@ impl CompiledProgram {
         // error, not a program with its permissions silently dropped.
         let mut used_modules = Vec::new();
         let mut types = crate::types::TypeTable::default();
+        let mut container = None;
+        let mut storage_defaults = Vec::new();
         if version >= 4 {
             if pos + 4 > data.len() {
                 return Err("invalid .cubebin v4: missing the contract trailer".into());
@@ -560,8 +614,11 @@ impl CompiledProgram {
             }
             used_modules = meta.used_modules;
             types = meta.types;
+            container = meta.container;
+            storage_defaults = meta.storage_defaults;
         }
-        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules, types })
+        Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules, types, container,
+                             storage_defaults })
     }
 
     /// Save to a `.cubebin` file.
@@ -846,6 +903,21 @@ pub struct Compiler {
     signatures: HashMap<String, Vec<crate::types::TypeSpec>>,
     /// The declared return type of the function being compiled.
     current_return: crate::types::TypeSpec,
+    /// Every program and container of the file, by name, with its
+    /// functions' signatures (2026-10-24): what a call into another program
+    /// (`Other.f(x)`, a container's `self.programs.b.f(x)`) is checked
+    /// against at compile time.
+    units: HashMap<String, Vec<FunctionSig>>,
+    /// The current container's `programs { b: deploy P(); }`: binding -> P.
+    bindings: HashMap<String, String>,
+    /// The current program's immutable storage: `(field, None)` for a whole
+    /// field, `(field, Some(sub))` for one field of a container's `world`.
+    /// Only the constructor (and a container's `on_start`) may write them.
+    immutable: Vec<(String, Option<String>)>,
+    /// The current program's storage starting values (`storage_defaults`).
+    storage_defaults: Vec<(String, serde_json::Value)>,
+    /// The program being compiled is a container's.
+    in_container: bool,
 }
 
 impl Compiler {
@@ -871,6 +943,11 @@ impl Compiler {
             struct_decls: HashMap::new(),
             signatures: HashMap::new(),
             current_return: crate::types::TypeSpec::Any,
+            units: HashMap::new(),
+            bindings: HashMap::new(),
+            immutable: Vec::new(),
+            storage_defaults: Vec::new(),
+            in_container: false,
         }
     }
 
@@ -931,34 +1008,77 @@ impl Compiler {
         // any program compiles -- signatures, struct literals and the
         // run-time checks all resolve type names through it.
         self.types = crate::types::table_of(source);
-        self.struct_decls = source.items.iter()
+        self.struct_decls = crate::types::all_structs(source).into_iter()
+            .map(|decl| (decl.name.clone(), decl.clone()))
+            .collect();
+
+        // 2026-10-24: every program and container of the file with its
+        // functions, before any compiles: a call into another program is
+        // checked against it, wherever that program sits in the file.
+        self.units = source.items.iter()
             .filter_map(|item| match item {
-                TopLevel::Struct(decl) => Some((decl.name.clone(), decl.clone())),
+                TopLevel::Program(p) => Some((p.name.clone(), p.body.iter().filter_map(|i| match i {
+                    ProgramItem::Function(f) | ProgramItem::Constructor(f) => Some(f.sig.clone()),
+                    _ => None,
+                }).collect())),
+                TopLevel::Container(c) => Some((c.name.clone(), c.body.iter().filter_map(|i| match i {
+                    ContainerItem::Function(f) => Some(f.sig.clone()),
+                    _ => None,
+                }).collect())),
                 _ => None,
             })
             .collect();
 
         let mut programs = Vec::new();
         for item in &source.items {
-            if let TopLevel::Program(p) = item {
-                programs.push(self.compile_program(p));
+            match item {
+                TopLevel::Program(p) => programs.push(self.compile_program(p)),
+                // 2026-10-24: a container compiles to a program of its own
+                // (DRIFT C10): its functions, its storage, its config and world
+                // as storage, and the meta the VM applies.
+                TopLevel::Container(c) => programs.push(self.compile_container(c)),
+                TopLevel::EventDecl(e) if self.strict => self.strict_errors.push(format!(
+                    "strict: event {} at line {} (events are declared but the VM has no event bus)",
+                    e.name, e.span.line)),
+                TopLevel::ExtendBlock(x) if self.strict => self.strict_errors.push(format!(
+                    "strict: extend {} at line {} (extend blocks are never compiled)",
+                    x.target, x.span.line)),
+                _ => {}
             }
         }
+        self.check_denied(&programs);
         programs
     }
 
     fn compile_program(&mut self, prog: &ProgramDecl) -> CompiledProgram {
+        self.compile_program_as(prog, None)
+    }
+
+    /// Compile one program, or (with `container`) the program a container
+    /// desugars to.
+    fn compile_program_as(&mut self, prog: &ProgramDecl, container: Option<ContainerMeta>) -> CompiledProgram {
         let mut functions = Vec::new();
         let mut storage_fields = Vec::new();
         self.current_program = prog.name.clone();
         // Reset per-program symbol collection so bindings don't leak across
         // programs compiled in the same pass.
         self.symbol_names.clear();
+        let is_container = container.is_some();
+        self.in_container = is_container;
+        if !is_container {
+            self.bindings.clear();
+            self.immutable.clear();
+            self.storage_defaults.clear();
+        }
 
         // Task 4: validate `implements` against the VM interface registry or
         // an in-file inline decl before compiling the body -- see
         // check_implements's doc for the registry-first resolution order.
-        self.check_implements(prog);
+        // A container needs no interface of its own (it is the deployment
+        // unit), but one it names is checked like a program's.
+        if !(is_container && prog.implements.is_empty()) {
+            self.check_implements(prog);
+        }
 
         // A program's own `type Input = number;` aliases join the file's
         // types for this program (and travel with it, for the VM's checks).
@@ -986,20 +1106,33 @@ impl Compiler {
             .collect();
 
         for item in &prog.body {
-            match item {
-                ProgramItem::Storage(s) => {
-                    for f in &s.fields {
-                        storage_fields.push(f.name.clone());
+            if let ProgramItem::Storage(s) = item {
+                for f in &s.fields {
+                    if storage_fields.contains(&f.name) {
+                        self.container_error(format!("storage field `{}` is declared twice in {}", f.name, prog.name), f.span);
                     }
+                    storage_fields.push(f.name.clone());
+                    self.storage_field(f);
                 }
-                ProgramItem::Function(f) | ProgramItem::Constructor(f) => {
-                    functions.push(self.compile_function(f));
-                }
-                _ => {}
+            }
+        }
+        // A container's `config` and `world` are storage the desugaring
+        // already recorded (with their starting values).
+        for (name, _) in &self.storage_defaults {
+            if !storage_fields.contains(name) {
+                storage_fields.push(name.clone());
+            }
+        }
+        for item in &prog.body {
+            if let ProgramItem::Function(f) | ProgramItem::Constructor(f) = item {
+                functions.push(self.compile_function(f));
             }
         }
 
         let types = std::mem::replace(&mut self.types, file_types);
+        self.bindings.clear();
+        self.immutable.clear();
+        self.in_container = false;
         CompiledProgram {
             name: prog.name.clone(),
             implements: prog.implements.clone(),
@@ -1008,6 +1141,428 @@ impl Compiler {
             symbol_names: std::mem::take(&mut self.symbol_names),
             used_modules: self.used_modules.clone(),
             types,
+            container,
+            storage_defaults: std::mem::take(&mut self.storage_defaults),
+        }
+    }
+
+    /// A storage field's starting value and mutability (2026-10-24, DRIFT
+    /// B11). A declared default must be a constant -- a literal, or an array,
+    /// map or struct of literals -- because the VM sets it when it loads the
+    /// program, before anything runs; anything else is set in the constructor.
+    /// A field of a map or array type with no default starts empty.
+    fn storage_field(&mut self, f: &StorageField) {
+        let spec = crate::types::TypeSpec::from_expr(&f.ty, &self.types);
+        if f.immutable {
+            self.immutable.push((f.name.clone(), None));
+        }
+        match &f.default {
+            Some(d) => {
+                self.check_literal(&spec, d, &format!("storage field `{}`", f.name));
+                match self.const_json(d) {
+                    Ok(v) => self.storage_defaults.push((f.name.clone(), v)),
+                    Err(why) => self.container_error(format!(
+                        "storage field `{}`: its default {}; set it in the constructor instead", f.name, why), f.span),
+                }
+            }
+            None => {
+                if let Some(v) = empty_of(&spec, &self.types, 0) {
+                    self.storage_defaults.push((f.name.clone(), v));
+                }
+            }
+        }
+    }
+
+    /// A constant expression as the JSON the VM loads it from.
+    fn const_json(&self, e: &Expr) -> Result<serde_json::Value, String> {
+        use serde_json::Value as J;
+        let finite = |f: f64| serde_json::Number::from_f64(f).map(J::Number)
+            .ok_or_else(|| "is not a finite number".to_string());
+        Ok(match e {
+            Expr::IntLit(n) => J::from(*n),
+            Expr::FloatLit(f) => finite(*f)?,
+            Expr::StringLit(s) => J::String(s.clone()),
+            Expr::BoolLit(b) => J::Bool(*b),
+            Expr::Null => J::Null,
+            Expr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
+                Expr::IntLit(n) => J::from(n.checked_neg().ok_or_else(|| "overflows an i64".to_string())?),
+                Expr::FloatLit(f) => finite(-*f)?,
+                _ => return Err("is not a constant".into()),
+            },
+            Expr::ArrayLit(xs) => J::Array(xs.iter().map(|x| self.const_json(x)).collect::<Result<_, _>>()?),
+            Expr::MapLit(pairs) => {
+                let mut m = serde_json::Map::new();
+                for (k, v) in pairs {
+                    let key = match k {
+                        Expr::Ident(w) | Expr::StringLit(w) => w.clone(),
+                        _ => return Err("has a map key that is not a word or a string".into()),
+                    };
+                    m.insert(key, self.const_json(v)?);
+                }
+                J::Object(m)
+            }
+            Expr::StructLit(name, given) => {
+                let decl = self.struct_decls.get(name)
+                    .ok_or_else(|| format!("names {}, which is not a declared struct", name))?;
+                for (i, (field, _)) in given.iter().enumerate() {
+                    if !decl.fields.iter().any(|f| &f.name == field) {
+                        return Err(format!("gives struct {} a field `{}` it does not declare", name, field));
+                    }
+                    if given[..i].iter().any(|(g, _)| g == field) {
+                        return Err(format!("gives `{}.{}` twice", name, field));
+                    }
+                }
+                let mut m = serde_json::Map::new();
+                for f in &decl.fields {
+                    let v = match given.iter().find(|(n, _)| n == &f.name) {
+                        Some((_, v)) => v,
+                        None => f.default.as_ref()
+                            .ok_or_else(|| format!("leaves out `{}.{}`, which has no default", name, f.name))?,
+                    };
+                    let spec = crate::types::TypeSpec::from_expr(&f.ty, &self.types);
+                    if let Some(lit) = crate::types::TypeSpec::of_literal(v) {
+                        if !spec.accepts_literal(&lit, &self.types) {
+                            return Err(format!("gives `{}.{}` (declared {}) a {}", name, f.name, spec.spell(), lit.spell()));
+                        }
+                    }
+                    m.insert(f.name.clone(), self.const_json(v)?);
+                }
+                J::Object(m)
+            }
+            _ => return Err("is not a constant (a literal, or an array, map or struct of literals)".into()),
+        })
+    }
+
+    /// A container-level error (always checked, like an operand error).
+    fn container_error(&mut self, message: String, span: Span) {
+        self.operand_errors.push(ParseError { message, span });
+    }
+
+    /// A container (or `world`, `modal`, `robot`) compiles to a program of
+    /// the same name (2026-10-24, DRIFT C10):
+    /// - its functions are the program's; the VM boots it by running its
+    ///   bound programs' constructors, its own `constructor`, then `on_start`;
+    /// - `config { k: v; }` is an immutable storage field `config`, a map of
+    ///   constants (`self.config.k`);
+    /// - `storage { }` / `global storage { }` are its storage;
+    /// - `world { }` is a storage field `world`, a map of the world's fields
+    ///   (`self.world.time`); an `immutable` one is written only by the
+    ///   constructor and `on_start`;
+    /// - `programs { b: deploy P(); }` binds the programs it runs, which its
+    ///   code calls as `self.programs.b.f(x)` or `b.f(x)`;
+    /// - `permissions { grant b.f to c; }` is installed when it loads;
+    /// - `safety { }` caps every run entered through it.
+    /// What the VM cannot run -- `io`, `agents`, `modalities`, `sensors`,
+    /// `actuators`, `fusion`, inheriting another container -- is a strict
+    /// error; a safety setting it cannot enforce is an error in every mode.
+    fn compile_container(&mut self, c: &ContainerDecl) -> CompiledProgram {
+        use serde_json::Value as J;
+        self.current_program = c.name.clone();
+        self.current_function.clear();
+        self.current_span = Some(c.span);
+        self.bindings.clear();
+        self.immutable.clear();
+        self.storage_defaults.clear();
+        let kind = match c.kind {
+            ContainerKind::Container => "container",
+            ContainerKind::World => "world",
+            ContainerKind::Modal => "modal",
+            ContainerKind::Robot => "robot",
+        };
+        let mut meta = ContainerMeta { kind: kind.to_string(), ..Default::default() };
+        let strict = self.strict;
+        let not_run = |errors: &mut Vec<String>, what: &str, line: u32| {
+            if strict {
+                errors.push(format!("strict: {} in {} at line {} (non-executing in safe-subset VM)", what, c.name, line));
+            }
+        };
+        if let Some(base) = &c.extends {
+            if base != "Container" {
+                not_run(&mut self.strict_errors, &format!("`extends {}` (a container cannot inherit another; only the base `Container` exists)", base), c.span.line);
+            }
+        }
+
+        // The bindings first: permissions and calls refer to them.
+        for item in &c.body {
+            let ContainerItem::Programs(bindings) = item else { continue };
+            for b in bindings {
+                let named = match &b.expr {
+                    Expr::Deploy(p, args) if args.is_empty() => Some(p.clone()),
+                    Expr::Deploy(p, _) => {
+                        self.container_error(format!(
+                            "{}: `{}: deploy {}(...)` passes arguments, but a program's constructor takes none \
+                             (set them through its functions after boot)", c.name, b.name, p), b.span);
+                        None
+                    }
+                    Expr::Ident(p) => Some(p.clone()),
+                    Expr::MethodCall(obj, m, args) if m == "new" && args.is_empty() => match obj.as_ref() {
+                        Expr::Ident(p) => Some(p.clone()),
+                        _ => None,
+                    },
+                    Expr::Proxy(p, _) => {
+                        self.container_error(format!(
+                            "{}: `{}: proxy {}(...)`: proxies are not implemented; bind the program itself",
+                            c.name, b.name, p), b.span);
+                        continue;
+                    }
+                    _ => None,
+                };
+                let Some(p) = named else {
+                    if !matches!(b.expr, Expr::Deploy(..)) {
+                        self.container_error(format!(
+                            "{}: the binding `{}` must name a program (`{}: deploy P();`)", c.name, b.name, b.name), b.span);
+                    }
+                    continue;
+                };
+                if p == c.name {
+                    self.container_error(format!("{} binds itself as `{}`", c.name, b.name), b.span);
+                } else if !self.units.contains_key(&p) {
+                    self.container_error(format!(
+                        "{} binds `{}` to {}, which is no program of this file (import the file that declares it)",
+                        c.name, b.name, p), b.span);
+                } else if self.bindings.insert(b.name.clone(), p.clone()).is_some() {
+                    self.container_error(format!("{} binds `{}` twice", c.name, b.name), b.span);
+                } else {
+                    meta.programs.push((b.name.clone(), p));
+                }
+            }
+        }
+
+        let mut body: Vec<ProgramItem> = Vec::new();
+        let mut safety: Vec<ConfigField> = Vec::new();
+        for item in &c.body {
+            match item {
+                ContainerItem::Config(fields) => {
+                    if self.storage_defaults.iter().any(|(n, _)| n == "config") {
+                        self.container_error(format!("{} declares `config` twice", c.name), c.span);
+                        continue;
+                    }
+                    let mut m = serde_json::Map::new();
+                    for f in fields {
+                        if m.contains_key(&f.name) {
+                            self.container_error(format!("{}: config `{}` is set twice", c.name, f.name), f.span);
+                            continue;
+                        }
+                        match self.const_json(&f.value) {
+                            Ok(v) => { m.insert(f.name.clone(), v); }
+                            Err(why) => self.container_error(format!("{}: config `{}`: its value {}", c.name, f.name, why), f.span),
+                        }
+                    }
+                    self.storage_defaults.push(("config".into(), J::Object(m)));
+                    self.immutable.push(("config".into(), None));
+                }
+                ContainerItem::Storage(s) => body.push(ProgramItem::Storage(s.clone())),
+                ContainerItem::World(fields) => {
+                    if self.storage_defaults.iter().any(|(n, _)| n == "world") {
+                        self.container_error(format!("{} declares `world` twice", c.name), c.span);
+                        continue;
+                    }
+                    let mut m = serde_json::Map::new();
+                    for f in fields {
+                        if m.contains_key(&f.name) {
+                            self.container_error(format!("{}: world field `{}` is declared twice", c.name, f.name), f.span);
+                            continue;
+                        }
+                        let spec = crate::types::TypeSpec::from_expr(&f.ty, &self.types);
+                        let v = match &f.default {
+                            Some(d) => {
+                                self.check_literal(&spec, d, &format!("world field `{}`", f.name));
+                                match self.const_json(d) {
+                                    Ok(v) => v,
+                                    Err(why) => {
+                                        self.container_error(format!(
+                                            "{}: world field `{}`: its default {}; set it in on_start instead",
+                                            c.name, f.name, why), f.span);
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => empty_of(&spec, &self.types, 0).unwrap_or(J::Null),
+                        };
+                        m.insert(f.name.clone(), v);
+                        if f.immutable {
+                            self.immutable.push(("world".into(), Some(f.name.clone())));
+                        }
+                    }
+                    self.storage_defaults.push(("world".into(), J::Object(m)));
+                }
+                ContainerItem::Permissions(stmts) => {
+                    for p in stmts {
+                        self.container_permission(&c.name, p, &mut meta);
+                    }
+                }
+                ContainerItem::Safety(fields) => safety.extend(fields.iter().cloned()),
+                ContainerItem::Function(f) => body.push(if f.sig.name == "constructor" {
+                    ProgramItem::Constructor(f.clone())
+                } else {
+                    ProgramItem::Function(f.clone())
+                }),
+                ContainerItem::Programs(_) | ContainerItem::Struct(_) => {}
+                ContainerItem::Io(io) => not_run(&mut self.strict_errors,
+                    "an `io` block (its inputs and outputs are declared; nothing routes them)", io.span.line),
+                ContainerItem::Agents(a) => not_run(&mut self.strict_errors,
+                    "an `agents` block (the VM has no agent runtime)", a.first().map_or(c.span.line, |b| b.span.line)),
+                ContainerItem::Modalities(_) => not_run(&mut self.strict_errors,
+                    "a `modalities` block (the VM has no encoders)", c.span.line),
+                ContainerItem::Sensors(_) => not_run(&mut self.strict_errors,
+                    "a `sensors` block (the VM has no hardware)", c.span.line),
+                ContainerItem::Actuators(_) => not_run(&mut self.strict_errors,
+                    "an `actuators` block (the VM has no hardware)", c.span.line),
+                ContainerItem::Fusion(_) => not_run(&mut self.strict_errors,
+                    "a `fusion` block (the VM has no encoders)", c.span.line),
+            }
+        }
+        self.container_safety(&c.name, &safety, &mut meta.safety);
+        for item in &body {
+            if let ProgramItem::Storage(s) = item {
+                for f in &s.fields {
+                    if matches!(f.name.as_str(), "config" | "world" | "programs") {
+                        self.container_error(format!(
+                            "{}: `{}` is the container's own; name the storage field something else", c.name, f.name), f.span);
+                    }
+                }
+            }
+        }
+        let decl = ProgramDecl { name: c.name.clone(), implements: c.implements.clone(), body, span: c.span };
+        self.compile_program_as(&decl, Some(meta))
+    }
+
+    /// `grant b.f to c;` / `revoke b.f from c;`: `b` is a binding (or a
+    /// program of the file) and must have `f`; `c`, when it is a binding,
+    /// is the program it names (the caller the VM sees).
+    fn container_permission(&mut self, container: &str, p: &PermissionStmt, meta: &mut ContainerMeta) {
+        let verb = if matches!(p.action, PermAction::Grant) { "grant" } else { "revoke" };
+        let Some((b, f)) = p.subject.split_once('.') else {
+            self.container_error(format!(
+                "{}: `{} {}` names no function; write `{} binding.function ...`", container, verb, p.subject, verb), p.span);
+            return;
+        };
+        let program = match self.bindings.get(b) {
+            Some(prog) => prog.clone(),
+            None if self.units.contains_key(b) => b.to_string(),
+            None => {
+                self.container_error(format!(
+                    "{}: `{} {}`: `{}` is neither a binding of {} nor a program of this file",
+                    container, verb, p.subject, b, container), p.span);
+                return;
+            }
+        };
+        match self.units.get(&program).and_then(|fs| fs.iter().find(|s| s.name == f)).cloned() {
+            None => {
+                self.container_error(format!("{}: `{} {}`: {} has no function {}", container, verb, p.subject, program, f), p.span);
+                return;
+            }
+            Some(sig) if contract_of(&sig).0.access == Access::System => {
+                self.container_error(format!(
+                    "{}: `{} {}`: {}.{} is @system, which no grant opens", container, verb, p.subject, program, f), p.span);
+                return;
+            }
+            Some(_) => {}
+        }
+        let target = self.bindings.get(&p.target).cloned().unwrap_or_else(|| p.target.clone());
+        meta.permissions.push((program, f.to_string(), target, verb == "grant"));
+    }
+
+    /// A container's `safety { }`: the limits the VM enforces, and nothing it
+    /// cannot (a safety setting that is not enforced is worse than none).
+    fn container_safety(&mut self, container: &str, fields: &[ConfigField], s: &mut SafetyLimits) {
+        let mut seen = std::collections::HashSet::new();
+        for f in fields {
+            if !seen.insert(f.name.clone()) {
+                self.container_error(format!("{}: safety `{}` is set twice", container, f.name), f.span);
+                continue;
+            }
+            match f.name.as_str() {
+                "max_jumps" | "max_ops" | "max_queries" | "max_wall_ms" | "max_call_depth" => {
+                    let n = match &f.value {
+                        Expr::IntLit(n) if *n > 0 => *n as u64,
+                        _ => {
+                            self.container_error(format!(
+                                "{}: safety `{}` must be a positive integer (leave it out for no limit of its own)",
+                                container, f.name), f.span);
+                            continue;
+                        }
+                    };
+                    match f.name.as_str() {
+                        "max_jumps" => s.max_jumps = n,
+                        "max_ops" => s.max_ops = n,
+                        "max_queries" => s.max_queries = n,
+                        "max_wall_ms" => s.max_wall_ms = n,
+                        _ => s.max_call_depth = n.min(u32::MAX as u64) as u32,
+                    }
+                }
+                "deny" => {
+                    let Expr::ArrayLit(names) = &f.value else {
+                        self.container_error(format!(
+                            "{}: safety `deny` takes an array of opcode names (`deny: [\"ask\", \"query\"]`)", container), f.span);
+                        continue;
+                    };
+                    for n in names {
+                        match n {
+                            Expr::StringLit(m) if asm_mnemonic_to_op(&m.to_uppercase()).is_some() => {
+                                let m = m.to_uppercase();
+                                if !s.deny.contains(&m) {
+                                    s.deny.push(m);
+                                }
+                            }
+                            Expr::StringLit(m) => self.container_error(format!(
+                                "{}: safety `deny` names `{}`, which is no opcode", container, m), f.span),
+                            _ => self.container_error(format!(
+                                "{}: safety `deny` takes opcode names as strings", container), f.span),
+                        }
+                    }
+                }
+                other => self.container_error(format!(
+                    "{}: safety `{}` is not a limit this VM can enforce (it enforces max_jumps, max_ops, \
+                     max_queries, max_wall_ms, max_call_depth and deny); a safety setting that is not \
+                     enforced is worse than none", container, other), f.span),
+            }
+        }
+    }
+
+    /// A container's `deny` list against the code its runs can reach: its
+    /// own functions, its bound programs', and every program those call by
+    /// name, transitively. (The VM refuses a denied opcode at run time too:
+    /// this is the early, readable error.)
+    fn check_denied(&mut self, programs: &[CompiledProgram]) {
+        let mut names: HashMap<[u8; 2], String> = HashMap::new();
+        for p in programs {
+            for s in &p.symbol_names {
+                names.insert(name_hash(s), s.clone());
+            }
+        }
+        for c in programs {
+            let Some(meta) = &c.container else { continue };
+            if meta.safety.deny.is_empty() {
+                continue;
+            }
+            let denied: Vec<(u8, &str)> = meta.safety.deny.iter()
+                .filter_map(|m| asm_mnemonic_to_op(m).map(|o| (o, m.as_str())))
+                .collect();
+            let mut todo: Vec<String> = vec![c.name.clone()];
+            todo.extend(meta.programs.iter().map(|(_, p)| p.clone()));
+            let mut done = std::collections::HashSet::new();
+            while let Some(name) = todo.pop() {
+                if !done.insert(name.clone()) {
+                    continue;
+                }
+                let Some(p) = programs.iter().find(|p| p.name == name) else { continue };
+                for f in &p.functions {
+                    for (opcode, first) in crate::vm::engine::instructions(&f.bytecode) {
+                        if let Some((_, m)) = denied.iter().find(|(o, _)| *o == opcode) {
+                            self.container_error(format!(
+                                "{} denies {}, but {}.{} uses it", c.name, m, p.name, f.name),
+                                Span { line: 0, col: 0, offset: 0 });
+                        }
+                        if opcode == op::CALL {
+                            if let Some(target) = first.and_then(|h| names.get(&h))
+                                .and_then(|n| n.split_once('.')).map(|(prog, _)| prog.to_string()) {
+                                todo.push(target);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1455,6 +2010,12 @@ impl Compiler {
         if self.strict {
             self.strict_check_stmt(stmt);
         }
+        // 2026-10-24: immutable storage is written only by the constructor.
+        self.check_writes(stmt);
+        // 2026-10-24: a call into another program becomes a CALL of
+        // `Program.function`.
+        let routed = self.route_calls(stmt);
+        let stmt = routed.as_ref().unwrap_or(stmt);
         // 2026-10-24: struct, map and array literals in operand positions are
         // built into temporaries first (this compiler has no other lowering
         // pass; see C11).
@@ -2562,6 +3123,122 @@ impl Compiler {
         }
     }
 
+    /// Immutable storage (2026-10-24): a field declared `immutable`, one of a
+    /// container's `world` declared so, and a container's `config` are set by
+    /// the constructor (and a container's `on_start`) and by nothing after.
+    /// A local of the same name is the same register, so it counts too.
+    fn check_writes(&mut self, stmt: &Stmt) {
+        if self.immutable.is_empty()
+            || self.current_function == "constructor"
+            || (self.in_container && self.current_function == "on_start") {
+            return;
+        }
+        let mut targets: Vec<(String, Option<String>)> = Vec::new();
+        match stmt {
+            Stmt::Let(l) => targets.push((l.name.clone(), None)),
+            Stmt::Assign(a) => {
+                let target = match &a.target {
+                    Expr::Index(base, _) => base.as_ref(),
+                    other => other,
+                };
+                if let Some((base, path)) = field_path(target) {
+                    targets.push((base, path.first().cloned()));
+                }
+            }
+            Stmt::For(f) => targets.push((f.binding.clone(), None)),
+            Stmt::Opcode(o) => match o {
+                OpcodeStmt::Create { reg, .. } | OpcodeStmt::Assign { reg, .. } | OpcodeStmt::Add { reg, .. }
+                | OpcodeStmt::Sub { reg, .. } | OpcodeStmt::Mul { reg, .. } | OpcodeStmt::Div { reg, .. }
+                | OpcodeStmt::Pop { reg } | OpcodeStmt::Bind { reg, .. } | OpcodeStmt::BindRole { reg, .. }
+                | OpcodeStmt::Recall { reg: Some(reg), .. } => targets.push((reg.clone(), None)),
+                OpcodeStmt::Transfer { src, dst, .. } => {
+                    targets.push((src.clone(), None));
+                    targets.push((dst.clone(), None));
+                }
+                _ => {}
+            },
+            // the escape hatch has no per-opcode schema: any register it names
+            Stmt::Asm(b) => {
+                for i in &b.instrs {
+                    for o in &i.operands {
+                        if let AsmOperand::Named(n) = o {
+                            targets.push((n.clone(), None));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        for (field, sub) in targets {
+            let hit = self.immutable.iter()
+                .any(|(f, s)| f == &field && (s.is_none() || sub.is_none() || s == &sub));
+            if hit {
+                let what = match &sub {
+                    Some(s) if self.immutable.iter().any(|(f, x)| f == &field && x.as_ref() == Some(s)) => format!("{}.{}", field, s),
+                    _ => field.clone(),
+                };
+                let who = if self.in_container { "the constructor and on_start" } else { "the constructor" };
+                self.literal_error(format!("`{}` is immutable: only {} may set it", what, who));
+            }
+        }
+    }
+
+    /// Calls into another program (2026-10-24): `Other.f(x)`, and in a
+    /// container `self.programs.b.f(x)` or `b.f(x)` (a binding wins over a
+    /// local of the same name), become a CALL of `Other.f`, which the VM runs
+    /// as that program and admits with the calling program as the caller.
+    /// Checked here: the program has `f`, it takes that many arguments, and
+    /// `f` is neither `@system` nor `@cron`.
+    fn route_calls(&mut self, stmt: &Stmt) -> Option<Stmt> {
+        match stmt {
+            Stmt::Let(l) => self.route_call(&l.value).map(|value| Stmt::Let(LetStmt { value, ..l.clone() })),
+            Stmt::Return(Some(e)) => self.route_call(e).map(|e| Stmt::Return(Some(e))),
+            Stmt::Expr(e) => self.route_call(e).map(Stmt::Expr),
+            _ => None,
+        }
+    }
+
+    fn route_call(&mut self, e: &Expr) -> Option<Expr> {
+        let Expr::MethodCall(obj, method, args) = e else { return None };
+        let program = match obj.as_ref() {
+            Expr::Field(base, b) if matches!(base.as_ref(), Expr::SelfAccess(p) if p == "programs") => {
+                match self.bindings.get(b) {
+                    Some(p) => p.clone(),
+                    None => {
+                        self.literal_error(format!("`self.programs.{}`: {} binds no program `{}`", b, self.current_program, b));
+                        return None;
+                    }
+                }
+            }
+            Expr::Ident(b) if self.bindings.contains_key(b) => self.bindings[b].clone(),
+            Expr::Ident(p) if self.units.contains_key(p) => p.clone(),
+            _ => return None,
+        };
+        if program == self.current_program {
+            return Some(Expr::Call(Box::new(Expr::Ident(method.clone())), args.clone()));
+        }
+        let sig = self.units.get(&program).and_then(|fs| fs.iter().find(|s| &s.name == method)).cloned();
+        let Some(sig) = sig else {
+            self.literal_error(format!("{} has no function {} (called as {}.{})", program, method, program, method));
+            return None;
+        };
+        if sig.params.len() != args.len() {
+            self.literal_error(format!("{}.{} takes {} argument(s), but is given {}",
+                program, method, sig.params.len(), args.len()));
+        }
+        let (contract, _) = contract_of(&sig);
+        if contract.access == Access::System {
+            self.literal_error(format!("{}.{} is @system: only the VM runtime may call it", program, method));
+        } else if contract.cron.is_some() {
+            self.literal_error(format!("{}.{} is @cron: the VM's scheduler runs it, nothing calls it", program, method));
+        }
+        for (i, (p, a)) in sig.params.iter().zip(args.iter()).enumerate() {
+            let spec = crate::types::TypeSpec::from_expr(&p.ty, &self.types);
+            self.check_literal(&spec, a, &format!("argument {} of {}.{}()", i + 1, program, method));
+        }
+        Some(Expr::Call(Box::new(Expr::Ident(format!("{}.{}", program, method))), args.clone()))
+    }
+
     /// The statement with the literals in its operand positions materialized
     /// (`return Point { x: 1 };`, `f({ k: v })`, `x = [a, b];`), or `None`
     /// when it holds none. A `let` builds a top-level struct or map literal
@@ -2772,6 +3449,18 @@ fn stmt_span(stmt: &Stmt) -> Option<Span> {
         Stmt::Asm(b) => Some(b.span),
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Opcode(_) | Stmt::Expr(_)
         | Stmt::Commit | Stmt::Rollback => None,
+    }
+}
+
+/// The value a storage field of a map or array type starts as when it
+/// declares none: an empty one (as `create m : map<..>` makes).
+fn empty_of(spec: &crate::types::TypeSpec, types: &crate::types::TypeTable, depth: u32) -> Option<serde_json::Value> {
+    use crate::types::TypeSpec;
+    match spec {
+        TypeSpec::Map(..) => Some(serde_json::Value::Object(serde_json::Map::new())),
+        TypeSpec::Array(_) => Some(serde_json::Value::Array(Vec::new())),
+        TypeSpec::Named(n) if depth < 16 => types.aliases.get(n).and_then(|t| empty_of(t, types, depth + 1)),
+        _ => None,
     }
 }
 
