@@ -36,6 +36,7 @@ reload. Versions 1-3 still load.
 | Key derivation | HKDF-SHA-384 | RustCrypto hkdf |
 | Key files at rest | Argon2id (64 MiB, 3 passes, 4 lanes) + AES-256-GCM | RustCrypto argon2, aes-gcm |
 | Sealed content (2026-10-24, `docs/SEAL.md`) | **ML-KEM-1024** (FIPS 203) **and** X25519, both; AES-256-GCM | libcrux-ml-kem (Cryspen, formally verified), x25519-dalek |
+| A remote run-proto (2026-10-24, below) | TLS 1.3 only: **SecP384r1MLKEM1024** (P-384 ECDH **and** ML-KEM-1024), TLS_AES_256_GCM_SHA384, ECDSA P-384 raw keys pinned both ways | rustls on AWS-LC (aws-lc-rs) |
 
 Every identity is **one 32-byte seed**. HKDF-SHA-384 derives FIPS 204's key-generation seed ξ (so the
 seed-to-key mapping is the standard's, not ours) and the Ed25519 seed. A known-answer test pins the
@@ -101,6 +102,41 @@ does not start (fail closed), and a reload that does not verify keeps the previo
   request still runs on a fresh VM). A `tick` request runs the due `@cron` functions and reports them
   in `RunResult.crons`.
 
+## Over a network
+
+*In plain words: when the brain and the VM sit on different machines, the line between them is
+locked so that nobody listening can read it, today or with a quantum computer later, and each end
+only talks to the one other end it was told to trust.*
+
+`run-proto` itself never opens a port unless told to, and then only one way (`src/tls.rs`):
+
+- **TLS 1.3 only**, one cipher suite (TLS_AES_256_GCM_SHA384), one key exchange:
+  **SecP384r1MLKEM1024** (draft-ietf-tls-ecdhe-mlkem, codepoint 0x11ED): P-384 ECDH and ML-KEM-1024
+  together, so reading a recording takes breaking both. ML-KEM-1024 is the CNSA 2.0 level; the
+  hybrids rustls ships pair ML-KEM-768, a level lower, so this one is built from rustls's own P-384
+  and ML-KEM-1024 on AWS-LC. A client that offers anything else finds nothing in common.
+- **Both sides prove who they are**, with raw public keys (RFC 7250): each side's TLS key is ECDSA
+  P-384, derived from its CubeLang identity seed (no TLS key file to keep), and the other side pins its
+  SHA-384 fingerprint (`cubelang tls-pin --key KEY.json`). No certificate authority is involved, so
+  none can be tricked into vouching for an impostor. The handshake signature is classical: it has to
+  be forged during the handshake to matter, and every call inside is signed with ML-DSA-87 + Ed25519
+  anyway.
+- **No resumption, no 0-RTT**: each connection is a full handshake with a fresh key exchange.
+- The host: `run-proto --listen ADDR --tls-key HOST.key.json --client-pin PIN...` (at least one pin;
+  with `--keyring`/`--contracts`/`--history-key` as on a pipe). Connections are read on their own
+  threads (at most 64; 10 s to finish a handshake, 10 min idle); requests run one at a time against the
+  same host state as the pipe. A connection that sends a bad frame is closed; the host serves on.
+- The client: `run-proto --remote ADDR --tls-key KEY.json --server-pin PIN` relays stdin to the host and
+  the answers back, so a program that spawns `run-proto` (CubbyLLM) reaches a remote host by changing
+  its arguments, with no TLS stack of its own (Python's OpenSSL 3.0 cannot offer this group).
+
+Checked against an independent implementation: OpenSSL 3.5's `s_client` negotiates SecP384r1MLKEM1024
+and AES-256-GCM with the host, raw keys both ways, and is admitted when its key is pinned.
+
+Cost (`cargo run --release --example tls_bench`, loopback, the development machine): a full handshake
+takes 8.7 ms; a 1 KiB round trip on an open connection, 36 µs. The relay holds one connection for all
+of a session's requests, so the handshake is paid once.
+
 ## CLI
 
 ```
@@ -117,6 +153,9 @@ cubelang tick FILE [--every 1s] [--ticks N]
 cubelang seal --to NAME --keyring RING [--from KEY.json] [--aad TEXT] IN OUT      # docs/SEAL.md
 cubelang open --key KEY.json [--keyring RING] [--signer NAME] [--aad TEXT] IN OUT|-
 cubelang run-proto ... --history-key KEY.json        # every history it opens is sealed to KEY
+cubelang tls-pin --key KEY.json                      # the pin of this identity's TLS key
+cubelang run-proto --listen ADDR --tls-key HOST.key.json --client-pin PIN [...]
+cubelang run-proto --remote ADDR --tls-key KEY.json --server-pin PIN
 ```
 
 `keygen` never writes over an existing file (owner-only on Unix) and prints only the public entry.
@@ -124,7 +163,8 @@ Key files never go in a repository, a `.cube` file or a request.
 
 ## Not yet
 
-- TLS 1.3 for a remote `run-proto`. Containers (grants declared in source) landed
-  2026-10-24 (`docs/REFERENCE.md`), sealed content too (`docs/SEAL.md`).
+- The browser leg of a public demo is the demo's web server, not `run-proto`: browsers offer
+  X25519MLKEM768, not this profile. Containers (grants declared in source), sealed content and a
+  remote `run-proto` landed 2026-10-24.
 - For certification (FIPS 140-3), the primitives move to a validated module (aws-lc-rs); the scheme
   tags make that a swap, not a format change.

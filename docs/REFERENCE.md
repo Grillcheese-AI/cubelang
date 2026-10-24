@@ -431,6 +431,8 @@ cubelang compile   [--strict] <file.cube> [-o out.cubebin]
 cubelang run       <file.cube|file.cubebin> [--strict] [--fn name] [--trace]
                    [--json] [--arg VALUE]... [--knowledge facts.jsonl]
 cubelang run-proto                    # length-prefixed protobuf, stdin/stdout
+cubelang run-proto --listen ADDR ...  # the same over TLS 1.3, pinned clients (docs/CONTRACTS.md, "Over a network")
+cubelang run-proto --remote ADDR ...  # a stdin/stdout relay to such a host
 cubelang inspect   <file.cubebin>
 cubelang disasm    <file.cubebin>
 cubelang check     <file.cube>        # see note below — NOT parse-only

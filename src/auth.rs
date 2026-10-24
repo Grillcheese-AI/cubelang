@@ -369,6 +369,29 @@ pub fn kem_binding_message(e: &KeyEntry, scheme: &str, ml_kem: &[u8], x25519: &[
     m
 }
 
+/// The order of the P-384 group (FIPS 186-5, SEC 2), big-endian.
+const P384_ORDER: [u8; 48] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc7, 0x63, 0x4d, 0x81, 0xf4, 0x37, 0x2d, 0xdf,
+    0x58, 0x1a, 0x0d, 0xb2, 0x48, 0xb0, 0xa7, 0x7a, 0xec, 0xec, 0x19, 0x6a, 0xcc, 0xc5, 0x29, 0x73,
+];
+
+/// The private scalar of the identity's TLS key (2026-10-24, `crate::tls`): ECDSA P-384, the CNSA
+/// suite's handshake signature. Same HKDF, its own label, with a counter until the value is a valid
+/// scalar (1 <= s < n; a 48-byte value misses with probability about 2^-190).
+fn derive_tls(seed: &[u8; 32]) -> Zeroizing<[u8; 48]> {
+    let hk = hkdf::Hkdf::<Sha384>::new(Some(b"cubelang identity v1"), seed);
+    for i in 0u8..=255 {
+        let mut s = Zeroizing::new([0u8; 48]);
+        hk.expand(&[b"tls ecdsa-p384 scalar ".as_slice(), &[i]].concat(), s.as_mut())
+            .expect("48 bytes is a valid HKDF length");
+        if s.iter().any(|b| *b != 0) && s.as_slice() < P384_ORDER.as_slice() {
+            return s;
+        }
+    }
+    unreachable!("256 HKDF outputs in a row at or above the P-384 order")
+}
+
 /// The fingerprint of a pair of encryption keys (SHA-384): what sealed content names its recipient
 /// by, and what both key derivation and the sender's signature bind.
 pub fn kem_fingerprint(ml_kem: &[u8], x25519: &[u8]) -> [u8; 48] {
@@ -426,6 +449,7 @@ pub struct Identity {
     kem_dz: Zeroizing<[u8; 64]>,
     ml_kem_ek: Vec<u8>,
     x25519: x25519_dalek::StaticSecret,
+    tls_p384: Zeroizing<[u8; 48]>,
 }
 
 /// Redacted: the name and kind, never a key.
@@ -453,8 +477,19 @@ impl Identity {
         };
         Ok(Identity {
             name: name.to_string(), kind, xi, ml_dsa_vk, ed25519: ed25519_dalek::SigningKey::from_bytes(&ed),
-            kem_dz, ml_kem_ek, x25519: x25519_dalek::StaticSecret::from(*x),
+            kem_dz, ml_kem_ek, x25519: x25519_dalek::StaticSecret::from(*x), tls_p384: derive_tls(seed),
         })
+    }
+
+    /// The identity's TLS key as SEC 1 DER (RFC 5915 ECPrivateKey, P-384, no public key: the
+    /// library computes it), for `crate::tls`. Wiped when dropped.
+    pub(crate) fn tls_key_sec1(&self) -> Zeroizing<Vec<u8>> {
+        let mut der = Zeroizing::new(Vec::with_capacity(64));
+        der.extend_from_slice(&[0x30, 0x3e, 0x02, 0x01, 0x01, 0x04, 0x30]);
+        der.extend_from_slice(self.tls_p384.as_ref());
+        // [0] { OID 1.3.132.0.34 secp384r1 }
+        der.extend_from_slice(&[0xa0, 0x07, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]);
+        der
     }
 
     /// Open a KEM encapsulation made to this identity: the two shared secrets (ML-KEM's, X25519's).

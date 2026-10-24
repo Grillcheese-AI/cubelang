@@ -47,6 +47,7 @@ fn main() {
         "sign"           => cmd_sign(&args[2..]),
         "knowledge"      => store_cli::cmd_knowledge(&args[2..]),
         "history"        => store_cli::cmd_history(&args[2..]),
+        "tls-pin"        => cmd_tls_pin(&args[2..]),
         "seal"           => seal_cli::cmd_seal(&args[2..]),
         "open"           => seal_cli::cmd_open(&args[2..]),
         "version"  | "v" | "--version" | "-v" => cmd_version(),
@@ -78,7 +79,12 @@ COMMANDS:
                    Ed25519) and refuse unsigned programs that are not
                    deployed; --pin-root FINGERPRINT: the roots to trust;
                    --contracts DIR: the deployed .cube contracts;
-                   --history-key KEY.json: histories are sealed to it
+                   --history-key KEY.json: histories are sealed to it.
+                   Over a network (TLS 1.3, SecP384r1MLKEM1024, AES-256-GCM,
+                   both sides pinned): --listen ADDR --tls-key KEY.json
+                   --client-pin PIN...; --remote ADDR --tls-key KEY.json
+                   --server-pin PIN relays stdin/stdout to such a host
+    tls-pin        tls-pin --key KEY.json: the pin of the identity's TLS key
     tick           Run the @cron functions of a program as they come due
                    (--every 1s, --ticks N; 0 = until stopped)
     keygen         Make an identity: keygen NAME --kind user|agent|model|
@@ -816,6 +822,9 @@ fn cmd_run_proto(args: &[String]) {
     let mut pins: Vec<String> = Vec::new();
     let mut history_key: Option<String> = None;
     let mut pass_file: Option<String> = None;
+    let (mut listen, mut remote, mut tls_key, mut server_pin): (Option<String>, Option<String>, Option<String>, Option<String>) =
+        (None, None, None, None);
+    let mut client_pins: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -824,10 +833,50 @@ fn cmd_run_proto(args: &[String]) {
             "--pin-root" if i + 1 < args.len() => { pins.push(args[i + 1].trim().to_ascii_lowercase()); i += 1; }
             "--history-key" if i + 1 < args.len() => { history_key = Some(args[i + 1].clone()); i += 1; }
             "--passphrase-file" if i + 1 < args.len() => { pass_file = Some(args[i + 1].clone()); i += 1; }
+            "--listen" if i + 1 < args.len() => { listen = Some(args[i + 1].clone()); i += 1; }
+            "--remote" if i + 1 < args.len() => { remote = Some(args[i + 1].clone()); i += 1; }
+            "--tls-key" if i + 1 < args.len() => { tls_key = Some(args[i + 1].clone()); i += 1; }
+            "--client-pin" if i + 1 < args.len() => { client_pins.push(args[i + 1].clone()); i += 1; }
+            "--server-pin" if i + 1 < args.len() => { server_pin = Some(args[i + 1].clone()); i += 1; }
             other => { eprintln!("error: run-proto: unknown option {}", other); process::exit(1); }
         }
         i += 1;
     }
+    fn die(msg: String) -> ! {
+        eprintln!("error: run-proto: {}", msg);
+        process::exit(1)
+    }
+    fn pin_of(hex: &str) -> [u8; 48] {
+        cubelang::tls::parse_pin(hex).unwrap_or_else(|e| die(e))
+    }
+    // --remote: this process is a relay to a remote run-proto; the checks are the remote host's.
+    if let Some(addr) = &remote {
+        if keyring.is_some() || contracts.is_some() || history_key.is_some() || listen.is_some() || !client_pins.is_empty() {
+            die("--remote relays to a host that has its own options; pass only --tls-key and --server-pin".into());
+        }
+        let (Some(k), Some(p)) = (&tls_key, &server_pin) else {
+            die("--remote needs --tls-key KEY.json (this side's identity) and --server-pin PIN (the host's)".into())
+        };
+        let me = open_identity(k, pass_file.as_deref());
+        let cfg = cubelang::tls::client_config(&me, pin_of(p)).unwrap_or_else(|e| die(e));
+        relay_tls(addr, cfg);
+        return;
+    }
+    if server_pin.is_some() {
+        die("--server-pin goes with --remote".into());
+    }
+    let tls_server = match (&listen, &tls_key) {
+        (Some(_), Some(k)) => {
+            let me = open_identity(k, pass_file.as_deref());
+            let pins: Vec<[u8; 48]> = client_pins.iter().map(|p| pin_of(p)).collect();
+            let my_pin = cubelang::tls::pin(&me).unwrap_or_else(|e| die(e));
+            Some((cubelang::tls::server_config(&me, &pins).unwrap_or_else(|e| die(e)), my_pin))
+        }
+        (Some(_), None) => die("--listen needs --tls-key KEY.json: a network leg is TLS 1.3 or nothing".into()),
+        (None, Some(_)) => die("--tls-key goes with --listen or --remote".into()),
+        (None, None) if !client_pins.is_empty() => die("--client-pin goes with --listen".into()),
+        (None, None) => None,
+    };
     // --history-key: every history this process opens is sealed to this identity (`history seal`),
     // and a plain one is refused.
     if let Some(k) = &history_key {
@@ -844,6 +893,10 @@ fn cmd_run_proto(args: &[String]) {
         Ok(h) => h,
         Err(e) => { eprintln!("error: {}", e); process::exit(1); }
     };
+    if let (Some((cfg, my_pin)), Some(addr)) = (tls_server, &listen) {
+        serve_tls(addr, cfg, &mut host, &my_pin);
+        return;
+    }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let stdout = std::io::stdout();
@@ -898,6 +951,195 @@ fn cmd_run_proto(args: &[String]) {
 
 /// The largest RunRequest frame `run-proto` reads (programs travel as source; facts travel by path).
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+// ── run-proto over the network (2026-10-24): TLS 1.3, `cubelang::tls` ─────────
+
+/// Connections a listening run-proto holds at once; one more is closed at once.
+const MAX_CONNECTIONS: usize = 64;
+/// A handshake (and each write) gets this long; a peer that stalls is dropped.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A connection that sends nothing for this long is closed.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// One frame (4-byte big-endian length, then the bytes), or `None` at a clean end of stream.
+fn read_frame<R: Read>(input: &mut R) -> Result<Option<Vec<u8>>, String> {
+    let mut len_buf = [0u8; 4];
+    match input.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(format!("cannot read a frame length: {}", e)),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(format!("a frame of {} bytes is over the {}-byte limit", len, MAX_FRAME_BYTES));
+    }
+    let mut buf = vec![0u8; len];
+    input.read_exact(&mut buf).map_err(|e| format!("cannot read a frame body: {}", e))?;
+    Ok(Some(buf))
+}
+
+fn write_frame<W: Write>(out: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+/// A request handed from a connection's thread to the one thread that runs requests (it owns the
+/// Host, the Governor and the caches), with where its result goes.
+type Job = (RunRequest, std::sync::mpsc::Sender<Vec<u8>>);
+
+/// `run-proto --listen ADDR --tls-key KEY.json --client-pin PIN...`: serve RunRequests over TLS 1.3
+/// to the pinned clients only. Connections are read on their own threads; requests run one at a time
+/// on this one, against the same Host as the pipe would.
+fn serve_tls(addr: &str, cfg: std::sync::Arc<rustls::ServerConfig>, host: &mut Host, my_pin: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind(addr)
+        .unwrap_or_else(|e| { eprintln!("error: run-proto --listen {}: {}", addr, e); process::exit(1) });
+    let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string());
+    eprintln!("run-proto: listening on {} (TLS 1.3, SecP384r1MLKEM1024, AES-256-GCM, pinned clients only); \
+               this host's pin: {}", local, my_pin);
+    let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                continue; // dropped: closed at once
+            }
+            active.fetch_add(1, Ordering::SeqCst);
+            let (cfg, jobs, active) = (cfg.clone(), jobs.clone(), active.clone());
+            std::thread::spawn(move || {
+                serve_connection(stream, cfg, jobs);
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    for (req, reply) in queue {
+        let result = run_request_result(req, host);
+        let mut buf = Vec::new();
+        result.encode(&mut buf).expect("encoding RunResult into a Vec cannot fail");
+        let _ = reply.send(buf);
+    }
+}
+
+/// One client: the handshake (bounded in time), then frames until it closes, stalls or misbehaves.
+/// A bad frame closes this connection only; the process serves on.
+fn serve_connection(stream: std::net::TcpStream, cfg: std::sync::Arc<rustls::ServerConfig>,
+                    jobs: std::sync::mpsc::Sender<Job>) {
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+    let conn = match rustls::ServerConnection::new(cfg) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("run-proto: {}: {}", peer, e); return; }
+    };
+    let mut tls = rustls::StreamOwned::new(conn, stream);
+    while tls.conn.is_handshaking() {
+        if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+            eprintln!("run-proto: {} refused: {}", peer, e);
+            return;
+        }
+    }
+    let who = cubelang::tls::peer_pin(tls.conn.peer_certificates()).unwrap_or_default();
+    eprintln!("run-proto: {} connected (client {})", peer, &who[..who.len().min(16)]);
+    let _ = tls.sock.set_read_timeout(Some(IDLE_TIMEOUT));
+    let _ = tls.sock.set_write_timeout(Some(IDLE_TIMEOUT));
+    loop {
+        let frame = match read_frame(&mut tls) {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => { eprintln!("run-proto: {}: {}", peer, e); break; }
+        };
+        let req = match RunRequest::decode(&frame[..]) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("run-proto: {}: cannot decode a RunRequest: {}", peer, e); break; }
+        };
+        let (reply, result) = std::sync::mpsc::channel();
+        if jobs.send((req, reply)).is_err() {
+            break;
+        }
+        let Ok(out) = result.recv() else { break };
+        if let Err(e) = write_frame(&mut tls, &out) {
+            eprintln!("run-proto: {}: {}", peer, e);
+            break;
+        }
+    }
+    tls.conn.send_close_notify();
+    let _ = tls.conn.complete_io(&mut tls.sock);
+}
+
+/// `run-proto --remote ADDR --tls-key KEY.json --server-pin PIN`: relay stdin's RunRequests to a
+/// remote run-proto over TLS 1.3 and its RunResults back to stdout, so a client that spawns
+/// `run-proto` (CubbyLLM) reaches a remote host without a TLS stack of its own.
+fn relay_tls(addr: &str, cfg: std::sync::Arc<rustls::ClientConfig>) {
+    fn fail(addr: &str, what: impl std::fmt::Display) -> ! {
+        eprintln!("error: run-proto --remote {}: {}", addr, what);
+        process::exit(1)
+    }
+    // TLS 1.3 sends the client's key after the server's: a host that does not pin it says so
+    // only when this side next reads
+    const NOT_PINNED: &str = "(is this side's key pinned there? `cubelang tls-pin --key` prints it)";
+    let stream = std::net::TcpStream::connect(addr).unwrap_or_else(|e| fail(addr, e));
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let conn = rustls::ClientConnection::new(cfg, cubelang::tls::server_name()).unwrap_or_else(|e| fail(addr, e));
+    let mut tls = rustls::StreamOwned::new(conn, stream);
+    while tls.conn.is_handshaking() {
+        if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+            fail(addr, format!("the TLS handshake failed: {}", e));
+        }
+    }
+    // a request may run for as long as its budget allows
+    let _ = tls.sock.set_read_timeout(None);
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        let frame = match read_frame(&mut input) {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => fail(addr, format!("stdin: {}", e)),
+        };
+        if let Err(e) = write_frame(&mut tls, &frame) {
+            fail(addr, format!("{} {}", e, NOT_PINNED));
+        }
+        match read_frame(&mut tls) {
+            Ok(Some(reply)) => {
+                if write_frame(&mut out, &reply).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => fail(addr, format!("the host closed the connection {}", NOT_PINNED)),
+            Err(e) => fail(addr, format!("{} {}", e, NOT_PINNED)),
+        }
+    }
+    tls.conn.send_close_notify();
+    let _ = tls.conn.complete_io(&mut tls.sock);
+}
+
+/// `cubelang tls-pin --key KEY.json [--passphrase-file P]`: the pin (SHA-384 of the public key) of
+/// the identity's TLS key, what the other side of a remote run-proto passes as `--server-pin` or
+/// `--client-pin`. The key comes from the identity's seed: there is no TLS key file.
+fn cmd_tls_pin(args: &[String]) {
+    let (mut key, mut pass_file) = (None, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => { key = Some(flag_value(args, i, "--key")); i += 1; }
+            "--passphrase-file" => { pass_file = Some(flag_value(args, i, "--passphrase-file")); i += 1; }
+            other => { eprintln!("error: tls-pin: unknown option {}", other); process::exit(1); }
+        }
+        i += 1;
+    }
+    let Some(key) = key else { eprintln!("usage: cubelang tls-pin --key KEY.json [--passphrase-file P]"); process::exit(1) };
+    let me = open_identity(&key, pass_file.as_deref());
+    match cubelang::tls::pin(&me) {
+        Ok(p) => println!("{}", p),
+        Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+    }
+}
 
 /// The budget a locked process imposes on a request that is not signed by a model or an agent: the
 /// request may ask for less, never more, and an unset field (zero, "unlimited") gets the cap.
