@@ -18,7 +18,9 @@ pub mod hypervec;
 pub mod codebook;
 pub mod index;
 pub mod memory;
+pub mod segment;
 pub mod knowledge;
+pub mod history;
 pub mod engine;
 pub mod registry;
 pub mod interfaces;
@@ -28,6 +30,7 @@ pub mod governor;
 // call sites keep working after the flat vm.rs -> vm/ split.
 pub use engine::{VM, ExecResult, Suspension, Value, VmSnapshot, VsaFrame, RecoverReason, RecoverRecord};
 pub use knowledge::{Fact, KnowledgeStore};
+pub use history::{History, SearchMode, Turn};
 pub use registry::{ModuleFn, ModuleRegistry, NativeFn, REGISTRY_VERSION};
 pub use interfaces::{InterfaceFn, InterfaceRegistry};
 

@@ -174,6 +174,15 @@ pub struct VM {
     /// Empty by default: a VM with no knowledge abstains on every query, which
     /// is the correct behaviour for a VM with no knowledge.
     pub knowledge: crate::vm::knowledge::KnowledgeStore,
+    /// The conversation so far (2026-10-24), searchable by word through the
+    /// `history` module (`use history; let hits = search("gutenberg");`).
+    /// Read-only to programs; the host appends and freezes turns. Empty by
+    /// default, and shared (not copied) when a host hands one to many VMs.
+    pub history: crate::vm::history::History,
+    /// A native module function's refusal (2026-10-24): a `NativeFn` returns
+    /// a Value, so one that must fail (a spent budget) sets this, and the
+    /// CALL that ran it returns it as the run's error.
+    pub native_error: Option<String>,
     /// Set by `resume()`; consumed by the next `exec_function` entry to restore
     /// interpreter locals (pc/flag/jump_budget) after an ASK suspension.
     resume_state: Option<Suspension>,
@@ -418,6 +427,8 @@ impl VM {
             call_depth: 0,
             resume_state: None,
             knowledge: crate::vm::knowledge::KnowledgeStore::new(),
+            history: crate::vm::history::History::new(),
+            native_error: None,
             registry: crate::vm::registry::ModuleRegistry::new(),
             last_recover_similarity: None,
             ops_executed: 0,
@@ -1882,6 +1893,9 @@ impl VM {
                         self.trace_op(pc, &format!(
                             "CALL {} (registry impl, {} arg(s))", fn_name, native_args.len()));
                         let result = native(self, &native_args);
+                        if let Some(e) = self.native_error.take() {
+                            return ExecResult::Error(format!("{}: {}", fn_name, e));
+                        }
                         self.stack.push(result);
                     } else if let Some(callee) = own_fn {
                         self.trace_op(pc, &format!("CALL {} ({} arg(s))", fn_name, arg_values.len()));

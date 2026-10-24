@@ -227,6 +227,7 @@ fn signed(id: &Identity, mut req: RunRequest) -> RunRequest {
         caller: &id.name,
         timestamp_ms: ts,
         nonce,
+        history_path: &req.history_path,
     }.message();
     let sig = id.sign(Purpose::Call, &message).unwrap();
     req.caller = Some(Caller { name: id.name.clone(), ml_dsa: sig.ml_dsa, timestamp_ms: ts, nonce, ed25519: sig.ed25519 });
@@ -362,6 +363,26 @@ fn a_locked_process_keeps_knowledge_files_inside_the_contracts_directory() {
     let results = proto(&args, vec![with(&outside), with(&inside)]);
     assert!(error_of(&results[0]).contains("inside the contracts directory"), "{:?}", results[0]);
     assert_eq!(symbol_of(&results[1]), "a");
+}
+
+#[test]
+fn a_locked_process_lets_only_a_signed_model_or_agent_name_a_history() {
+    let f = fixture("history");
+    let history = f.dir.join("contracts").join("history");
+    std::fs::create_dir_all(&history).unwrap();
+    let args = locked_args(&f);
+    let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let with = |r: RunRequest| RunRequest { history_path: path_str(&history), ..r };
+    let results = proto(&args, vec![
+        with(request(CONTRACT, "solve")),                               // anonymous
+        signed(&f.visitor, with(request(CONTRACT, "solve"))),           // a user
+        signed(&f.model, with(request(CONTRACT, "solve"))),             // the model: allowed
+        RunRequest { history_path: path_str(&f.dir), ..signed(&f.model, with(request(CONTRACT, "solve"))) },
+    ]);
+    assert!(error_of(&results[0]).contains("may not name a history"), "{:?}", results[0]);
+    assert!(error_of(&results[1]).contains("may not name a history"), "{:?}", results[1]);
+    assert_eq!(symbol_of(&results[2]), "a");
+    assert!(error_of(&results[3]).contains("signature"), "the signature covers the history path: {:?}", results[3]);
 }
 
 #[test]

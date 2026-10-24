@@ -22,6 +22,10 @@ message RunRequest {
   // pays for one parse, and the wire stays small. Empty => no knowledge,
   // every QUERY abstains (an empty chunk array) -- correct, not useful.
   string knowledge_path = 5;
+  // (2026-10-24: a `.cubeseg` file -- `cubelang knowledge build` -- is opened
+  // as a frozen segment, no parse at all; a `.jsonl` is parsed once and frozen.
+  // Either way every request shares the one copy: a branch forks it for the
+  // cost of a pointer, not a copy of the store.)
   // The branch (2026-09-28, the counterfactual fork at the wire): applied to
   // this request's CLONE of the knowledge store before the call, so "X did
   // not happen" lives in one branch's VM and nowhere else. The host
@@ -43,6 +47,11 @@ message RunRequest {
   // the process loaded at startup (`run-proto --keyring`); anything else is an
   // anonymous caller, which no restricted function admits.
   Caller caller = 9;
+  // The conversation so far (2026-10-24): a history directory (its
+  // MANIFEST.json and segment files, `cubelang history`), searched by the
+  // program through `use history;`. Opened once per process and shared by
+  // every request (re-opened when the manifest changes). Empty => no history.
+  string history_path = 10;
 }
 
 message Caller {

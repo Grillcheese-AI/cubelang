@@ -26,6 +26,10 @@ hkdf = "0.13"
 argon2 = "0.6"
 aes-gcm = "0.11"
 zeroize = "1"
+# The layered store (2026-10-24, src/vm/segment.rs): immutable sorted segments as finite-state
+# transducers (BurntSushi's fst, MIT/Unlicense), with its Levenshtein automata for typo-tolerant
+# history search.
+fst = { version = "0.4", features = ["levenshtein"] }
 
 [dev-dependencies]
 

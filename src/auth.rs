@@ -474,7 +474,7 @@ fn field(m: &mut Vec<u8>, b: &[u8]) {
 pub const TICK: &str = "\0tick";
 
 /// One call, as its signature covers it: what runs (the program's SHA-384, the function, the
-/// arguments), what it is told (the ASK answers, the knowledge file), who asks, and when. A request's
+/// arguments), what it is told (the ASK answers, the knowledge file, the history), who asks, and when. A request's
 /// `branch` and `budget` are the host's settings, not the caller's words, and are not covered (TLS
 /// protects them on a network leg).
 #[derive(Debug, Clone, Copy)]
@@ -487,6 +487,8 @@ pub struct CallClaim<'a> {
     pub caller: &'a str,
     pub timestamp_ms: u64,
     pub nonce: u64,
+    /// The history directory the call is told (2026-10-24); empty for none.
+    pub history_path: &'a str,
 }
 
 impl CallClaim<'_> {
@@ -506,6 +508,13 @@ impl CallClaim<'_> {
         field(&mut m, self.caller.as_bytes());
         m.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         m.extend_from_slice(&self.nonce.to_le_bytes());
+        // 2026-10-24: a tagged trailer, present only when set, so a call that names no history
+        // signs exactly the bytes it always did (every field above is fixed-size or
+        // length-prefixed, so the trailer cannot be confused with them).
+        if !self.history_path.is_empty() {
+            m.extend_from_slice(b"\0history");
+            field(&mut m, self.history_path.as_bytes());
+        }
         m
     }
 }
@@ -853,7 +862,7 @@ mod tests {
 
     fn call_message(program: &str, function: &str, args: &[String], caller: &str, ts: u64, nonce: u64) -> Vec<u8> {
         CallClaim { program_source: program, function, args, answers: &[], knowledge_path: "", caller,
-                    timestamp_ms: ts, nonce }.message()
+                    timestamp_ms: ts, nonce, history_path: "" }.message()
     }
 
     /// root → registrar R → the given entries, all registered.
@@ -970,10 +979,12 @@ mod tests {
     #[test]
     fn every_field_of_a_call_is_covered() {
         let base = CallClaim { program_source: "p", function: "f", args: &[], answers: &["1".into()],
-                               knowledge_path: "k.jsonl", caller: "A", timestamp_ms: 1, nonce: 1 };
+                               knowledge_path: "k.jsonl", caller: "A", timestamp_ms: 1, nonce: 1,
+                               history_path: "" };
         for other in [
             CallClaim { answers: &["2".into()], ..base },
             CallClaim { knowledge_path: "evil.jsonl", ..base },
+            CallClaim { history_path: "h", ..base },
             CallClaim { function: TICK, ..base },
             CallClaim { program_source: "p ", ..base },
             CallClaim { caller: "B", ..base },
@@ -988,6 +999,9 @@ mod tests {
         let c = CallClaim { args: &["ab".into(), "c".into()], ..base };
         let d = CallClaim { args: &["a".into(), "bc".into()], ..base };
         assert_ne!(c.message(), d.message(), "arguments cannot be re-split");
+        // a call naming no history signs what it signed before the field existed: no trailer
+        assert!(!base.message().windows(8).any(|w| w == b"\0history"));
+        assert!(CallClaim { history_path: "h", ..base }.message().starts_with(&base.message()));
     }
 
     #[test]

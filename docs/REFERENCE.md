@@ -218,6 +218,14 @@ error and never a nearest-neighbour guess. `docs/ASK_SUSPEND.md`'s own table
 (current on disk) still lists QUERY as "trace-only — no retrieval"; that line
 is now stale relative to the source it lives beside. See `docs/DRIFT.md` §A.
 
+> **2026-10-24.** The store is layered: immutable segments shared by every
+> request and branch, under a small top layer (`docs/STORE.md`). Lookups answer
+> as the map did; a fork costs a pointer instead of a copy (1.2 s → 0.05 µs at
+> a million facts). `knowledge_path` also takes a prebuilt `.cubeseg`
+> (`cubelang knowledge build`). The conversation history is searchable from a
+> program with `use history;` (exact, prefix or typo-tolerant), and over
+> run-proto with `history_path`.
+
 ### 3.5 ASK / Suspend — the third `ExecResult`
 
 [src, `src/vm/engine.rs:88-124` (`ExecResult`, `Suspension`), `981-1020`
@@ -474,6 +482,8 @@ cubelang version
   similarity)`, QUERY gives an array of provenance-carrying maps).
 - `src/vm/knowledge.rs` (217 lines): exact-key `KnowledgeStore` (`.jsonl`
   facts with `key`/`text`/`source`, plus alias records) backing `QUERY`.
+  2026-10-24: layered over `src/vm/segment.rs` (FST segments); the history
+  store is `src/vm/history.rs`; both in `docs/STORE.md`.
 
 ## 11. Two ways to express the same thing (flagged per the task brief)
 

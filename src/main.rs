@@ -22,6 +22,8 @@ use cubelang::reasoning::{RunRequest, RunResult, run_result};
 use cubelang::vm::{VM, ExecResult, Value};
 use prost::Message;
 
+mod store_cli;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -42,6 +44,8 @@ fn main() {
         "keygen"         => cmd_keygen(&args[2..]),
         "keyring"        => cmd_keyring(&args[2..]),
         "sign"           => cmd_sign(&args[2..]),
+        "knowledge"      => store_cli::cmd_knowledge(&args[2..]),
+        "history"        => store_cli::cmd_history(&args[2..]),
         "version"  | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
@@ -83,7 +87,14 @@ COMMANDS:
                    RING --by KEY.json NAME [--reason TEXT]
     sign           Sign one call for run-proto: sign --key key.json
                    --program FILE --fn NAME [--arg V]... [--answer J]...
-                   [--knowledge PATH] [--tick]; prints the Caller as JSON
+                   [--knowledge PATH] [--history DIR] [--tick]; prints the
+                   Caller as JSON
+    knowledge      build FACTS.jsonl -o OUT.cubeseg (freeze facts into a
+                   shared, memory-light segment) | info FILE | lookup FILE
+                   KEY | keys FILE PREFIX
+    history        append DIR [--speaker S] TEXT | search DIR WORDS
+                   [--prefix|--fuzzy] [--limit N] | recent DIR [N] | forget
+                   DIR ID | merge DIR | gc DIR | info DIR
     inspect,  i    Show .cubebin program info
     disasm,   d    Disassemble .cubebin to readable opcodes
     check,    k    Fully compile .cube in strict mode (NOT parse-only --
@@ -518,6 +529,7 @@ fn cmd_run(args: &[String]) {
     // opts out.
     let mut strict = true;
     let mut knowledge_path: Option<String> = None;
+    let mut history_path: Option<String> = None;
     let mut call_args: Vec<Value> = Vec::new();
     let mut caller: Option<String> = None;
     let mut i = 1;
@@ -537,6 +549,10 @@ fn cmd_run(args: &[String]) {
             "--knowledge" | "-k" => {
                 if i + 1 < args.len() { knowledge_path = Some(args[i + 1].clone()); i += 1; }
             }
+            // The conversation so far, for `use history;` (2026-10-24).
+            "--history" => {
+                if i + 1 < args.len() { history_path = Some(args[i + 1].clone()); i += 1; }
+            }
             // Arguments bound to the function's DECLARED parameter names.
             "--arg" | "-a" => {
                 if i + 1 < args.len() { call_args.push(Value::Str(args[i + 1].clone())); i += 1; }
@@ -551,7 +567,28 @@ fn cmd_run(args: &[String]) {
     vm.trace_enabled = trace;
     vm.caller = caller;
 
-    if let Some(kp) = &knowledge_path {
+    if let Some(hp) = &history_path {
+        match cubelang::vm::history::History::open_dir(Path::new(hp)) {
+            Ok(h) => {
+                if !json_out {
+                    println!("  history: {} turns from {}", h.len(), hp);
+                }
+                vm.history = h;
+            }
+            Err(e) => { eprintln!("error: {}", e); process::exit(1); }
+        }
+    }
+    if let Some(kp) = knowledge_path.as_ref().filter(|k| k.ends_with(".cubeseg")) {
+        match store_cli::open_knowledge(kp) {
+            Ok(store) => {
+                if !json_out {
+                    println!("  knowledge: {} keys from {} (a frozen segment)", store.len(), kp);
+                }
+                vm.knowledge = store;
+            }
+            Err(e) => { eprintln!("error: knowledge {}", e); process::exit(1); }
+        }
+    } else if let Some(kp) = &knowledge_path {
         match std::fs::read_to_string(kp) {
             Ok(data) => match vm.knowledge.load_jsonl(&data) {
                 Ok((facts, aliases)) => {
@@ -952,6 +989,7 @@ impl Host {
                     caller: &c.name,
                     timestamp_ms: c.timestamp_ms,
                     nonce: c.nonce,
+                    history_path: &req.history_path,
                 };
                 let sig = HybridSignature { ml_dsa: c.ml_dsa.clone(), ed25519: c.ed25519.clone() };
                 Some(v.check(&c.name, &sig, c.timestamp_ms, c.nonce, &claim.message(), cubelang::auth::now_ms())?)
@@ -980,19 +1018,30 @@ impl Host {
                 return Err(format!("{} may name a knowledge file only inside the contracts directory", who));
             }
         }
+        // A history is someone's conversation: no unsigned or user request reads one by naming it.
+        if !req.history_path.is_empty() {
+            return Err(format!("{} may not name a history; only a signed model or agent may", who));
+        }
         Ok((caller, false))
     }
 }
 
-/// The resident process's knowledge cache: path -> (mtime, parsed store).
-/// A request naming a `knowledge_path` gets a CLONE of the parsed store on
-/// its fresh VM; the file is re-read only when its mtime moves. Keyed by
-/// the path string as sent, so two spellings of one file parse twice --
-/// harmless, and simpler than canonicalizing on a platform where that can
-/// fail.
+/// The resident process's knowledge cache: path -> (mtime, store).
+/// A request naming a `knowledge_path` gets a CLONE of the store on its fresh
+/// VM; the file is re-read only when its mtime moves. Keyed by the path
+/// string as sent, so two spellings of one file parse twice -- harmless, and
+/// simpler than canonicalizing on a platform where that can fail.
+///
+/// 2026-10-24: the cached store is frozen into one shared segment (a
+/// `.cubeseg` file already is one), so the per-request clone -- and every
+/// branch's -- copies a pointer, not the store.
 thread_local! {
     static KNOWLEDGE_CACHE: std::cell::RefCell<
         std::collections::HashMap<String, (Option<std::time::SystemTime>, cubelang::vm::knowledge::KnowledgeStore)>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The same for history directories, keyed by the manifest's mtime.
+    static HISTORY_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, (Option<std::time::SystemTime>, cubelang::vm::history::History)>
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -1008,15 +1057,36 @@ fn load_knowledge_cached(vm: &mut VM, path: &str) -> Result<(), String> {
     let store = match hit {
         Some(s) => s,
         None => {
-            let data = std::fs::read_to_string(path)
-                .map_err(|e| format!("knowledge_path {}: cannot read: {}", path, e))?;
-            let mut fresh = cubelang::vm::knowledge::KnowledgeStore::new();
-            fresh.load_jsonl(&data).map_err(|e| format!("knowledge_path {}: {}", path, e))?;
+            let fresh = store_cli::open_knowledge(path).map_err(|e| format!("knowledge_path {}", e))?;
             KNOWLEDGE_CACHE.with(|c| { c.borrow_mut().insert(path.to_string(), (mtime, fresh.clone())); });
             fresh
         }
     };
     vm.knowledge = store;
+    Ok(())
+}
+
+/// Load the history directory `path` into `vm.history` (through the cache; re-opened when its
+/// manifest changes). A directory that cannot be opened is an error, not an empty history.
+fn load_history_cached(vm: &mut VM, path: &str) -> Result<(), String> {
+    let manifest = Path::new(path).join("MANIFEST.json");
+    if !Path::new(path).is_dir() {
+        return Err(format!("history_path {}: not a directory", path));
+    }
+    let mtime = std::fs::metadata(&manifest).ok().and_then(|m| m.modified().ok());
+    let hit = HISTORY_CACHE.with(|c| {
+        c.borrow().get(path).and_then(|(m, h)| if *m == mtime { Some(h.clone()) } else { None })
+    });
+    let history = match hit {
+        Some(h) => h,
+        None => {
+            let fresh = cubelang::vm::history::History::open_dir(Path::new(path))
+                .map_err(|e| format!("history_path {}: {}", path, e))?;
+            HISTORY_CACHE.with(|c| { c.borrow_mut().insert(path.to_string(), (mtime, fresh.clone())); });
+            fresh
+        }
+    };
+    vm.history = history;
     Ok(())
 }
 
@@ -1163,6 +1233,11 @@ fn run_request_on(vm: &mut VM, req: RunRequest, branch_id: &str) -> RunResult {
 
     if !req.knowledge_path.is_empty() {
         if let Err(e) = load_knowledge_cached(vm, &req.knowledge_path) {
+            return error_result(e, Some(branch_report(vm, &branch_id, &[], 0, 0)));
+        }
+    }
+    if !req.history_path.is_empty() {
+        if let Err(e) = load_history_cached(vm, &req.history_path) {
             return error_result(e, Some(branch_report(vm, &branch_id, &[], 0, 0)));
         }
     }
@@ -1554,6 +1629,7 @@ fn cmd_sign(args: &[String]) {
     use cubelang::auth::{CallClaim, Purpose, TICK};
     use rand::RngCore;
     let (mut key, mut program, mut function, mut knowledge, mut tick) = (None, None, None, String::new(), false);
+    let mut history = String::new();
     let mut pass_file: Option<String> = None;
     let (mut call_args, mut answers) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -1565,6 +1641,7 @@ fn cmd_sign(args: &[String]) {
             "--arg" => { call_args.push(flag_value(args, i, "--arg")); i += 1; }
             "--answer" => { answers.push(flag_value(args, i, "--answer")); i += 1; }
             "--knowledge" => { knowledge = flag_value(args, i, "--knowledge"); i += 1; }
+            "--history" => { history = flag_value(args, i, "--history"); i += 1; }
             "--passphrase-file" => { pass_file = Some(flag_value(args, i, "--passphrase-file")); i += 1; }
             "--tick" => tick = true,
             other => { eprintln!("error: sign: unknown option {}", other); process::exit(1); }
@@ -1591,6 +1668,7 @@ fn cmd_sign(args: &[String]) {
         caller: &identity.name,
         timestamp_ms,
         nonce,
+        history_path: &history,
     };
     let sig = identity.sign(Purpose::Call, &claim.message()).unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
     println!("{}", serde_json::json!({
