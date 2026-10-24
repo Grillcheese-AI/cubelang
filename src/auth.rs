@@ -885,6 +885,25 @@ impl Keyring {
         Ok(e)
     }
 
+    /// Give `me`'s entry its encryption keys (2026-10-24): for an entry made before entries carried
+    /// them. Only the key's owner can: the keys are bound by the entry's own signature, and the
+    /// registration (which covers the signing keys only) stays as it is.
+    pub fn enable_sealing(&mut self, me: &Identity) -> Result<(), String> {
+        let mine = me.public_entry(None);
+        let e = self.roots.iter_mut().chain(self.keys.iter_mut()).find(|k| k.name == me.name)
+            .ok_or_else(|| format!("{} is not in the keyring", me.name))?;
+        if fingerprint(e) != fingerprint(&mine) {
+            return Err(format!("the keyring's {} holds other signing keys than this key file's", me.name));
+        }
+        let before = e.kem.replace(mine.kem.expect("a public entry carries encryption keys"));
+        if let Err(err) = self.validate() {
+            let e = self.roots.iter_mut().chain(self.keys.iter_mut()).find(|k| k.name == me.name).unwrap();
+            e.kem = before;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Append a registered entry, checked exactly as a load would check it.
     pub fn add(&mut self, entry: KeyEntry) -> Result<(), String> {
         self.keys.push(entry);
@@ -1365,5 +1384,22 @@ mod tests {
         revoked.add_revocation(revoke(&r, ring.get("A").unwrap(), 5, "lost").unwrap()).unwrap();
         assert!(revoked.recipient("A", now_ms()).unwrap_err().contains("not admitted"));
         assert!(revoked.recipient("B", now_ms()).is_ok());
+    }
+
+    #[test]
+    fn only_its_owner_gives_an_old_entry_encryption_keys() {
+        let (a, a_pk) = ident("A", Kind::User);
+        let (ring, _root, _r) = chain(&[KeyEntry { kem: None, ..a_pk }]);
+        assert!(ring.recipient("A", now_ms()).unwrap_err().contains("no encryption keys"));
+
+        let (impostor, _) = ident("A", Kind::User);
+        let mut tried = ring.clone();
+        assert!(tried.enable_sealing(&impostor).unwrap_err().contains("other signing keys"));
+        assert_eq!(tried, ring, "a refused change leaves the keyring as it was");
+
+        let mut ring = ring;
+        ring.enable_sealing(&a).unwrap();
+        let reloaded = Keyring::from_json(&ring.to_json()).unwrap();
+        assert!(reloaded.recipient("A", now_ms()).is_ok(), "the registration still verifies");
     }
 }

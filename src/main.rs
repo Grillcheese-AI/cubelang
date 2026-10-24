@@ -1590,13 +1590,16 @@ fn cmd_keyring(args: &[String]) {
     use cubelang::auth::{fingerprint, register, revoke, KeyEntry};
     let usage = "usage: cubelang keyring check RING | keyring add-root RING ENTRY.json | \
                  keyring register RING --by REGISTRAR.key.json [--days N] ENTRY.json | \
-                 keyring revoke RING --by KEY.json NAME [--reason TEXT]   (sealed keys: --passphrase-file P)";
+                 keyring revoke RING --by KEY.json NAME [--reason TEXT] | \
+                 keyring enable-sealing RING --key KEY.json   (sealed keys: --passphrase-file P)";
     let (Some(sub), Some(ring_path)) = (args.first(), args.get(1)) else { eprintln!("{}", usage); process::exit(1) };
     let (mut by, mut days, mut reason, mut pass_file, mut positional) = (None, None, String::new(), None, None);
+    let mut key: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--by" => { by = Some(flag_value(args, i, "--by")); i += 1; }
+            "--key" => { key = Some(flag_value(args, i, "--key")); i += 1; }
             "--days" => {
                 let d: u64 = flag_value(args, i, "--days").parse().unwrap_or_else(|_| { eprintln!("error: --days takes a whole number"); process::exit(1) });
                 days = Some(d);
@@ -1623,7 +1626,8 @@ fn cmd_keyring(args: &[String]) {
                     for e in ring.roots.iter().chain(ring.keys.iter()) {
                         let by = e.registration.as_ref().map(|r| format!(" (registered by {})", r.by)).unwrap_or_else(|| " (root)".into());
                         let state = if admitted.iter().any(|(n, _)| n == &e.name) { "" } else { "  REVOKED" };
-                        println!("    {} -- {}{}{}\n      fingerprint {}", e.name, e.kind.as_str(), by, state, fingerprint(e));
+                        let sealing = if e.kem.is_some() { "" } else { "\n      no encryption keys: `keyring enable-sealing` with its key" };
+                        println!("    {} -- {}{}{}\n      fingerprint {}{}", e.name, e.kind.as_str(), by, state, fingerprint(e), sealing);
                     }
                 }
                 Err(e) => { eprintln!("error: {}", e); process::exit(1); }
@@ -1663,6 +1667,15 @@ fn cmd_keyring(args: &[String]) {
             save(&ring);
             println!("  {}: {} registered by {}{}", ring_path, name, registrar.name,
                      days.map(|d| format!(" for {} day(s)", d)).unwrap_or_default());
+        }
+        // An entry made before 2026-10-24 has no encryption keys; its owner adds them.
+        "enable-sealing" => {
+            let Some(key) = key else { eprintln!("{}", usage); process::exit(1) };
+            let mut ring = read_keyring_or_empty(ring_path);
+            let me = open_identity(&key, pass_file.as_deref());
+            if let Err(e) = ring.enable_sealing(&me) { eprintln!("error: {}", e); process::exit(1); }
+            save(&ring);
+            println!("  {}: {} can now be sealed to (encryption keys signed by its own keys)", ring_path, me.name);
         }
         _ => { eprintln!("{}", usage); process::exit(1); }
     }

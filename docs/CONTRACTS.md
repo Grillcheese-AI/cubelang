@@ -83,7 +83,7 @@ A JSON file the host loads (never one a request supplies):
 The whole chain is verified at load, encryption keys included: an entry's `kem` must carry the
 entry's own signature, so whoever can write the file cannot give one entry another's encryption keys
 (a registration covers the signing keys only). An entry made before 2026-10-24 has no `kem`: it still
-signs and verifies, and refuses to be sealed to. A keyring that does not verify is refused whole: `run-proto`
+signs and verifies, and refuses to be sealed to until its owner runs `keyring enable-sealing`. A keyring that does not verify is refused whole: `run-proto`
 does not start (fail closed), and a reload that does not verify keeps the previous keyring.
 `run-proto` reloads the file when its modification time changes, keeping the nonces it has seen.
 
@@ -109,6 +109,7 @@ cubelang keyring add-root RING ENTRY.json            # prints the fingerprint to
 cubelang keyring register RING --by REGISTRAR.key.json [--days N] ENTRY.json
 cubelang keyring revoke RING --by KEY.json NAME [--reason TEXT]
 cubelang keyring check RING                          # the chain, fingerprints, REVOKED marks
+cubelang keyring enable-sealing RING --key KEY.json  # give an entry made before 2026-10-24 its encryption keys
 cubelang sign --key key.json --program FILE (--fn NAME | --tick) [--arg V]... [--answer J]... [--knowledge PATH]
 cubelang run-proto --keyring RING --pin-root FINGERPRINT --contracts DIR
 cubelang run FILE --as NAME                          # a host-asserted caller for local testing (no signature)

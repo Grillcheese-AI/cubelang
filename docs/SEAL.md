@@ -25,7 +25,9 @@ and a fresh X25519 key, so two sealings of the same text share nothing.
 `x25519 secret`), so the printed seed restores them too; the signing keys a seed gives are unchanged.
 A keyring entry carries them under `kem`, signed by the entry's own signing keys
 (`Purpose::Kem`, deterministic ML-DSA, so an entry is a function of its seed). A keyring in which
-one entry's encryption keys were swapped is refused whole. A known-answer test pins the derivation; it
+one entry's encryption keys were swapped is refused whole. An entry made before 2026-10-24 has none;
+its owner adds them with `cubelang keyring enable-sealing RING --key KEY.json` (the registration
+stays as it is: it covers the signing keys only). A known-answer test pins the derivation; it
 was cross-checked once against independent code (kyber-py's FIPS 203 key generation, pyca's X25519,
 HKDF written out by hand).
 
