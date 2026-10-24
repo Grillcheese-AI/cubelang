@@ -72,6 +72,26 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
+/// Every value of a flag that may repeat (`--tag a --tag b`).
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect()
+}
+
+/// A turn as one JSON line: tags and meta only when it has them.
+fn turn_json(t: &cubelang::vm::history::Turn, matched: Option<&[String]>) -> serde_json::Value {
+    let mut v = serde_json::json!({ "turn": t.id, "at": t.at_ms, "speaker": t.speaker, "text": t.text });
+    if let Some(m) = matched {
+        v["matched"] = serde_json::json!(m);
+    }
+    if !t.tags.is_empty() {
+        v["tags"] = serde_json::json!(t.tags);
+    }
+    if !t.meta.is_empty() {
+        v["meta"] = serde_json::json!(t.meta);
+    }
+    v
+}
+
 /// The arguments that are not flags (or flag values).
 fn words(args: &[String], with_values: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
@@ -94,9 +114,9 @@ fn words(args: &[String], with_values: &[&str]) -> Vec<String> {
 const KEY_FLAGS: [&str; 2] = ["--key", "--passphrase-file"];
 
 pub fn cmd_history(args: &[String]) {
-    let usage = "usage: cubelang history append DIR [--speaker S] [--at MS] TEXT... | search DIR WORDS... \
-                 [--prefix|--fuzzy] [--limit N] | recent DIR [N] | forget DIR ID | merge DIR | gc DIR | info DIR \
-                 | seal DIR --key KEY.json\n\
+    let usage = "usage: cubelang history append DIR [--speaker S] [--at MS] [--tag T]... [--meta JSON] TEXT... \
+                 | search DIR [WORDS...] [--tag T]... [--prefix|--fuzzy] [--limit N] | recent DIR [N] | tags DIR [PREFIX] \
+                 | forget DIR ID | merge DIR | gc DIR | info DIR | seal DIR --key KEY.json\n\
                  a sealed directory takes --key KEY.json on every command (sealed key files: --passphrase-file P \
                  or CUBELANG_KEY_PASSPHRASE)";
     let (Some(cmd), Some(dir)) = (args.first(), args.get(1)) else { die(usage) };
@@ -108,6 +128,9 @@ pub fn cmd_history(args: &[String]) {
     });
     let v: Option<&dyn Vault> = vault.as_ref().map(|x| x as &dyn Vault);
     let open = || History::open_dir_in(dir, v).unwrap_or_else(|e| die(e));
+    // the commands that write hold the directory's lock: one writer at a time
+    let _lock = matches!(cmd.as_str(), "seal" | "append" | "forget" | "merge" | "gc")
+        .then(|| History::lock_dir(dir).unwrap_or_else(|e| die(e)));
     let save = |h: &mut History| h.save_dir_in(dir, v).unwrap_or_else(|e| die(e));
     match cmd.as_str() {
         "seal" => {
@@ -124,12 +147,13 @@ pub fn cmd_history(args: &[String]) {
                 Some(t) => t.parse().unwrap_or_else(|_| die("--at takes Unix milliseconds")),
                 None => cubelang::auth::now_ms(),
             };
-            let text = words(rest, &["--speaker", "--at", KEY_FLAGS[0], KEY_FLAGS[1]]).join(" ");
+            let text = words(rest, &["--speaker", "--at", "--tag", "--meta", KEY_FLAGS[0], KEY_FLAGS[1]]).join(" ");
             if text.trim().is_empty() {
                 die(usage);
             }
+            let meta = flag(rest, "--meta").unwrap_or_default();
             let mut h = open();
-            let id = h.append(&speaker, &text, at);
+            let id = h.append_tagged(&speaker, &text, at, &flags(rest, "--tag"), &meta).unwrap_or_else(|e| die(e));
             // freeze on the turn, keep the segment count bounded, and persist
             h.freeze().unwrap_or_else(|e| die(e));
             h.maybe_merge(32).unwrap_or_else(|e| die(e));
@@ -145,23 +169,30 @@ pub fn cmd_history(args: &[String]) {
                 SearchMode::Exact
             };
             let limit = flag(rest, "--limit").map(|n| n.parse().unwrap_or_else(|_| die("--limit takes a number"))).unwrap_or(20);
-            let query = words(rest, &["--limit", KEY_FLAGS[0], KEY_FLAGS[1]]).join(" ");
+            let query = words(rest, &["--limit", "--tag", KEY_FLAGS[0], KEY_FLAGS[1]]).join(" ");
+            let tags = flags(rest, "--tag");
+            if query.trim().is_empty() && tags.is_empty() {
+                die(usage);
+            }
             let h = open();
             let started = std::time::Instant::now();
-            let hits = h.search(&query, mode, limit);
+            let hits = h.search_in(&query, mode, &tags, limit);
             let us = started.elapsed().as_micros();
             for hit in &hits {
-                println!("{}", serde_json::json!({
-                    "turn": hit.turn.id, "at": hit.turn.at_ms, "speaker": hit.turn.speaker,
-                    "text": hit.turn.text, "matched": hit.matched,
-                }));
+                println!("{}", turn_json(&hit.turn, Some(&hit.matched)));
             }
             eprintln!("{} hit(s) in {} us", hits.len(), us);
         }
         "recent" => {
             let n = words(rest, &KEY_FLAGS).first().map(|n| n.parse().unwrap_or_else(|_| die("recent takes a number"))).unwrap_or(10);
             for t in open().recent(n) {
-                println!("{}", serde_json::json!({ "turn": t.id, "at": t.at_ms, "speaker": t.speaker, "text": t.text }));
+                println!("{}", turn_json(&t, None));
+            }
+        }
+        "tags" => {
+            let prefix = words(rest, &KEY_FLAGS).first().cloned().unwrap_or_default();
+            for (tag, n) in open().tags(&prefix) {
+                println!("{}", serde_json::json!({ "tag": tag, "turns": n }));
             }
         }
         "forget" => {

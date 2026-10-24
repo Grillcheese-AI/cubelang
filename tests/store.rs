@@ -291,3 +291,40 @@ fn search_modes_on_a_frozen_history() {
     assert_eq!(ids("johanes", SearchMode::Fuzzy), vec![2]);
     assert!(ids("", SearchMode::Exact).is_empty());
 }
+
+const TAGGED: &str = r#"
+use history;
+program Sessions implements ISolve {
+    public function solve(input: str): str { return input; }
+    @external
+    public function within(tag: str, words: str): number {
+        let hits = search_tagged(tag, words);
+        return hits;
+    }
+}
+"#;
+
+#[test]
+fn a_program_searches_one_session_of_a_store() {
+    let mut h = History::new();
+    let t = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    h.append_tagged("model-a", "A ring of keys is enough", 1, &t(&["session:s1"]), r#"{"cost":0.01}"#).unwrap();
+    h.append_tagged("model-b", "Keys need a registry", 2, &t(&["session:s2"]), "").unwrap();
+    h.freeze().unwrap();
+    h.append("user", "keys again", 3);
+    let mut vm = VM::new();
+    vm.history = h;
+    vm.load(compiler::compile_strict(TAGGED).unwrap_or_else(|e| panic!("{e}")).remove(0));
+    let hits = array(vm.call_entry("Sessions", "within", vec![Value::Str("session:s1".into()), Value::Str("keys".into())]));
+    assert_eq!(turn_ids(&hits), vec![1]);
+    assert!(matches!(field(&hits[0], "meta"), Value::Str(m) if m == r#"{"cost":0.01}"#));
+    assert!(matches!(field(&hits[0], "tags"), Value::Array(v) if v.len() == 1 && matches!(&v[0], Value::Str(t) if t == "session:s1")));
+    let all = array(vm.call_entry("Sessions", "within", vec![Value::Str("session:s2".into()), Value::Str("".into())]));
+    assert_eq!(turn_ids(&all), vec![2], "an empty query: every turn under the tag");
+    // a plain turn's map is as it was: no tags, no meta
+    let mut plain = VM::new();
+    plain.history = talk();
+    plain.load(compiler::compile_strict(RECALL).unwrap_or_else(|e| panic!("{e}")).remove(0));
+    let hits = array(plain.call_entry("Recall", "find", vec![Value::Str("Gutenberg".into())]));
+    assert!(matches!(&hits[0], Value::Map(m) if !m.contains_key("tags") && !m.contains_key("meta")));
+}

@@ -227,6 +227,12 @@ is now stale relative to the source it lives beside. See `docs/DRIFT.md` §A.
 > run-proto with `history_path`. A history directory can be sealed to one
 > identity and signed by it (`cubelang history seal`, `run-proto --history-key`;
 > ML-KEM-1024 + X25519, AES-256-GCM): `docs/SEAL.md`.
+>
+> **2026-10-25.** A history's turns can carry tags and meta, so a store built on
+> a history (a person's model transcripts, filed by session) is searchable per
+> session from the index: `search_tagged(tag, words)` in a program,
+> `history search --tag` and `history tags` on the command line. A directory has
+> one writer at a time (its `LOCK` file). `docs/STORE.md`, "Tags and meta".
 
 ### 3.5 ASK / Suspend — the third `ExecResult`
 

@@ -13,7 +13,7 @@
 //! ```text
 //! [8]  magic "CUBESEG\0"
 //! [1]  version (1)
-//! [1]  kind (1 = knowledge, 2 = history)
+//! [1]  kind (1 = knowledge, 2 = history, 3 = history whose turns carry tags and meta)
 //! [6]  reserved, zero
 //! [8]  fst length, u64 LE
 //! [8]  blob length, u64 LE
@@ -32,6 +32,9 @@ pub const MAGIC: &[u8; 8] = b"CUBESEG\0";
 pub const VERSION: u8 = 1;
 pub const KIND_KNOWLEDGE: u8 = 1;
 pub const KIND_HISTORY: u8 = 2;
+/// A history segment whose records also carry tags and meta (2026-10-25). Written only when a turn
+/// in it has some, so a plain conversation's files are byte for byte what they were.
+pub const KIND_HISTORY_TAGGED: u8 = 3;
 const HEADER: usize = 32;
 const CHECKSUM: usize = 32;
 
@@ -100,6 +103,11 @@ pub fn encode(kind: u8, fst: &[u8], blob: &[u8]) -> Vec<u8> {
 
 /// Check and split a segment file's bytes (no copy: the parts are windows onto `buf`).
 pub fn decode(buf: Arc<[u8]>, want_kind: u8) -> Result<SegmentFile, String> {
+    decode_any(buf, &[want_kind])
+}
+
+/// `decode`, accepting any of `kinds` (the file's own is in the result).
+pub fn decode_any(buf: Arc<[u8]>, kinds: &[u8]) -> Result<SegmentFile, String> {
     let n = buf.len();
     if n < HEADER + CHECKSUM || &buf[..8] != MAGIC {
         return Err("not a CubeLang segment (bad magic or too short)".into());
@@ -107,8 +115,10 @@ pub fn decode(buf: Arc<[u8]>, want_kind: u8) -> Result<SegmentFile, String> {
     if buf[8] != VERSION {
         return Err(format!("segment version {} (this build reads {})", buf[8], VERSION));
     }
-    if buf[9] != want_kind {
-        return Err(format!("segment kind {} where kind {} was expected", buf[9], want_kind));
+    let kind = buf[9];
+    if !kinds.contains(&kind) {
+        return Err(format!("segment kind {} where kind {} was expected", kind,
+                           kinds.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(" or ")));
     }
     let sum = blake3::hash(&buf[..n - CHECKSUM]);
     if sum.as_bytes()[..] != buf[n - CHECKSUM..] {
@@ -121,7 +131,7 @@ pub fn decode(buf: Arc<[u8]>, want_kind: u8) -> Result<SegmentFile, String> {
     }
     let all = Bytes::new(buf);
     Ok(SegmentFile {
-        kind: want_kind,
+        kind,
         fst: all.window(HEADER, HEADER + fst_len),
         blob: all.window(HEADER + fst_len, HEADER + fst_len + blob_len),
     })
@@ -129,8 +139,13 @@ pub fn decode(buf: Arc<[u8]>, want_kind: u8) -> Result<SegmentFile, String> {
 
 /// Read and check a segment file. Read once per process: the store shares the bytes.
 pub fn read_file(path: &std::path::Path, want_kind: u8) -> Result<SegmentFile, String> {
+    read_file_any(path, &[want_kind])
+}
+
+/// `read_file`, accepting any of `kinds`.
+pub fn read_file_any(path: &std::path::Path, kinds: &[u8]) -> Result<SegmentFile, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    decode(Arc::from(data.into_boxed_slice()), want_kind).map_err(|e| format!("{}: {}", path.display(), e))
+    decode_any(Arc::from(data.into_boxed_slice()), kinds).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
 /// Write a file whole or not at all: to a temporary beside it, then renamed over it.

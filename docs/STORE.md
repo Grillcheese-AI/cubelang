@@ -16,7 +16,7 @@ millisecond, and a turn the user asks to forget is gone at once.*
 | knowledge per request | a full copy of the store (a hash map) | a pointer to the shared segment, plus the request's own changes |
 | a branch ("X did not happen") | the copy, then a scan of every key for the excluded key's aliases | a mask in the branch's top layer; the aliases come from the key's record |
 | knowledge file | `.jsonl`, parsed by every process | `.jsonl`, or a prebuilt `.cubeseg` opened without parsing |
-| history | none in the VM | `use history;`: `search`, `search_prefix`, `search_fuzzy`, `turn`, `recent` |
+| history | none in the VM | `use history;`: `search`, `search_prefix`, `search_fuzzy`, `search_tagged`, `turn`, `recent` |
 
 ## Segments
 
@@ -72,7 +72,7 @@ still on disk: forgetting is complete after `history merge` and `history gc`.
 
 **On disk.** A history directory holds `MANIFEST.json` (the segment list and the next id) and the
 segment files. The manifest is replaced atomically, so a reader sees the old history or the new one.
-One writer at a time.
+One writer at a time (the `LOCK` file, below).
 
 - `cubelang history append DIR [--speaker S] [--at MS] TEXT` (append, freeze, merge, save: one call
   per turn), `search DIR WORDS [--prefix|--fuzzy] [--limit N]`, `recent DIR [N]`, `forget DIR ID`,
@@ -94,6 +94,29 @@ One writer at a time.
   A signed call covers it (`CallClaim.history_path`; a call naming no history signs the same bytes as
   before). In locked mode an unsigned or user request may not name a history at all: a history is
   someone's conversation.
+
+**Tags and meta** (2026-10-25). A turn can also carry *tags* (labels it is filed under, such as
+`session:2026-10-24-ring-of-keys` or `doc:result.md`) and *meta* (the caller's own data, JSON by
+convention). *In plain words: a store built on a history can file each record under a session or a
+document name and find "these words, in this session" straight from the index, without reading the
+other sessions.*
+
+- Tags are indexed beside the words, under a mark (`\u{1}`) no indexed word can hold: indexed words
+  are letters and digits only, so no word query, prefix or typo reaches a tag. A tag is 1 to 200
+  bytes, no control characters, no space at either end; at most 32 per turn, each kept once.
+- `append_tagged(speaker, text, at, tags, meta)`; `search_in(words, mode, tags, limit)`: every tag
+  and every word must match, and either list may be empty (tags alone list a session's turns,
+  newest first); `tags(prefix)`: the live tags starting with it and how many turns carry each
+  (`"session:"` lists the sessions). Forgetting a turn takes its tags with it.
+- On disk: a segment whose turns carry no tags or meta is written exactly as before (kind 2); one
+  that does is kind 3, whose records add the meta and the tags after the text. Both open together,
+  so an old conversation keeps working when tagged turns are added to it.
+- CLI: `history append DIR --tag T --tag U --meta JSON TEXT`, `history search DIR [WORDS] --tag T`,
+  `history tags DIR [PREFIX]`; results show `tags` and `meta` when a turn has them.
+- **One writer.** `History::lock_dir(dir)` holds the directory's `LOCK` file (an operating-system
+  lock, released when the process ends, so a crash leaves nothing stale). The CLI's writing commands
+  (`append`, `forget`, `merge`, `gc`, `seal`) take it; a second writer is refused with "another
+  process is writing this history".
 
 **In a program.**
 
@@ -145,4 +168,5 @@ search finds exactly what the full scan finds.
 - Knowledge segments are checksummed, not sealed (they are published facts; a history is sealed, above).
 - Program storage stays per-program registers (small, compile-time constants, immutability enforced
   at compile time); it is not stored in segments.
-- A history directory has one writer; there is no lock file.
+- A history directory has one writer, held by its `LOCK` file (2026-10-25); readers take no lock and
+  see the old manifest or the new one.

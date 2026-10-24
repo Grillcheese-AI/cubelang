@@ -224,6 +224,9 @@ fn vsa_recover(vm: &mut VM, args: &[Value]) -> Value {
 ///   (exactly; as a word start; within an edit or two), newest first, as maps `{turn, at, speaker,
 ///   text, matched}`. An optional second argument caps how many (default 20, at most 200).
 /// - `turn(id)`: one turn, or null. `recent(n)`: the newest `n` (at most 200).
+/// - `search_tagged(tag, words)` (2026-10-25): the turns filed under `tag` that hold every word
+///   (`""`: all of them), for a store's histories (a session's model calls, say). Turns that carry
+///   tags or meta also have `tags` and `meta` in their maps.
 ///
 /// `words` is a string, or a variable holding one. Each search counts as a query against the run's
 /// query budget (and shows in the branch report as `history:<words>`). Sealed: the hits come from
@@ -234,6 +237,7 @@ fn history_module() -> Module {
     functions.insert("search".to_string(), sealed(|vm, args| history_search(vm, args, SearchMode::Exact)));
     functions.insert("search_prefix".to_string(), sealed(|vm, args| history_search(vm, args, SearchMode::Prefix)));
     functions.insert("search_fuzzy".to_string(), sealed(|vm, args| history_search(vm, args, SearchMode::Fuzzy)));
+    functions.insert("search_tagged".to_string(), sealed(history_search_tagged));
     functions.insert("turn".to_string(), sealed(history_turn));
     functions.insert("recent".to_string(), sealed(history_recent));
     Module { functions }
@@ -250,6 +254,13 @@ fn turn_value(t: Turn) -> Value {
     m.insert("at".to_string(), Value::Int(t.at_ms as i64));
     m.insert("speaker".to_string(), Value::Str(t.speaker));
     m.insert("text".to_string(), Value::Str(t.text));
+    // a store's records carry these; a plain conversation's turns look exactly as before
+    if !t.tags.is_empty() {
+        m.insert("tags".to_string(), Value::Array(t.tags.into_iter().map(Value::Str).collect()));
+    }
+    if !t.meta.is_empty() {
+        m.insert("meta".to_string(), Value::Str(t.meta));
+    }
     Value::Map(m)
 }
 
@@ -281,7 +292,21 @@ fn history_search(vm: &mut VM, args: &[Value], mode: SearchMode) -> Value {
         vm.native_error = Some("takes the words to find: a string, or a variable holding one".into());
         return Value::Null;
     };
-    let limit = match count_arg(vm, args.get(1)) {
+    history_find(vm, &words, &[], args.get(1), mode)
+}
+
+/// `search_tagged(tag, words, limit)`: the turns filed under `tag` (a store's session, say) holding
+/// every word ("" for all of them), newest first.
+fn history_search_tagged(vm: &mut VM, args: &[Value]) -> Value {
+    let (Some(tag), Some(words)) = (text_arg(vm, args.first()), text_arg(vm, args.get(1))) else {
+        vm.native_error = Some("takes a tag and the words to find (\"\" for every turn under the tag)".into());
+        return Value::Null;
+    };
+    history_find(vm, &words, &[tag], args.get(2), SearchMode::Exact)
+}
+
+fn history_find(vm: &mut VM, words: &str, tags: &[String], limit_arg: Option<&Value>, mode: SearchMode) -> Value {
+    let limit = match count_arg(vm, limit_arg) {
         Some(n) if n > 0 => (n as usize).min(HISTORY_MAX),
         Some(_) => {
             vm.native_error = Some("a result cap must be at least 1".into());
@@ -293,8 +318,12 @@ fn history_search(vm: &mut VM, args: &[Value], mode: SearchMode) -> Value {
         vm.native_error = Some(format!("query budget exhausted ({} queries)", vm.query_budget));
         return Value::Null;
     }
-    let hits = vm.history.search(&words, mode, limit);
-    vm.queried.push((format!("history:{}", words), hits.len()));
+    let hits = vm.history.search_in(words, mode, tags, limit);
+    let shown = match tags.first() {
+        Some(t) => format!("history[{}]:{}", t, words),
+        None => format!("history:{}", words),
+    };
+    vm.queried.push((shown, hits.len()));
     Value::Array(hits.into_iter().map(|h| {
         let matched = Value::Array(h.matched.into_iter().map(Value::Str).collect());
         match turn_value(h.turn) {

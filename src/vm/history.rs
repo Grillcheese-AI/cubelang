@@ -16,6 +16,16 @@
 //! A history directory can be sealed (2026-10-24, `*_in` with a `Vault`): every segment and the
 //! manifest are sealed to one identity and signed by it (`cubelang::seal`), so the files say
 //! nothing to whoever copies them, and nobody without the key can slip a forged turn in.
+//!
+//! Tags and meta (2026-10-25): a turn can also carry tags ("session:2026-10-24-ring-of-keys",
+//! "doc:result.md") and meta (the caller's own data, JSON by convention). Tags are indexed beside
+//! the words, under a mark no word can hold, so `search_in` finds "these words, in this session"
+//! from the index; meta is stored and returned, never searched. A store built on a history (a
+//! conversation per person, a model's transcripts) files its records this way. A segment holding no
+//! tags or meta is written exactly as before (kind 2), so plain conversations are unchanged on disk.
+//!
+//! One writer at a time: `lock_dir` holds the directory's `LOCK` file for as long as a process may
+//! write it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -27,12 +37,39 @@ use crate::vm::knowledge::normalize;
 use crate::vm::segment::{self, Bytes, Vault};
 
 /// One utterance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Turn {
     pub id: u64,
     pub at_ms: u64,
     pub speaker: String,
     pub text: String,
+    /// The labels the turn is filed under, each once; found exactly (`search_in`), never by a word.
+    pub tags: Vec<String>,
+    /// The caller's own data about the turn (JSON by convention): kept and returned, not searched.
+    pub meta: String,
+}
+
+/// The most tags one turn may carry, and the longest tag.
+pub const MAX_TAGS: usize = 32;
+pub const MAX_TAG_BYTES: usize = 200;
+
+/// The mark a tag's index entry starts with. Indexed words are letters and digits only
+/// (`normalize`), so no word query can reach a tag, and no tag can pass for a word.
+const TAG_MARK: char = '\u{1}';
+
+fn tag_term(tag: &str) -> String {
+    format!("{}{}", TAG_MARK, tag)
+}
+
+/// A tag a turn may carry: 1 to `MAX_TAG_BYTES` bytes, no control characters, no space at either end.
+pub fn check_tag(tag: &str) -> Result<(), String> {
+    if tag.is_empty() || tag.len() > MAX_TAG_BYTES {
+        return Err(format!("a tag is 1 to {} bytes", MAX_TAG_BYTES));
+    }
+    if tag.chars().any(char::is_control) || tag.trim() != tag {
+        return Err(format!("tag {:?}: no control characters, no space at either end", tag));
+    }
+    Ok(())
 }
 
 /// How a query word matches an indexed word.
@@ -118,6 +155,7 @@ impl Matcher {
 }
 
 const META: usize = 40;
+const KINDS: [u8; 2] = [segment::KIND_HISTORY, segment::KIND_HISTORY_TAGGED];
 const NO_TURN: u64 = u64::MAX;
 
 /// One frozen layer of turns.
@@ -125,6 +163,8 @@ const NO_TURN: u64 = u64::MAX;
 pub struct HistorySegment {
     terms: fst::Map<Bytes>,
     blob: Bytes,
+    /// Its records carry tags and meta (file kind 3).
+    tagged: bool,
     first_id: u64,
     last_id: u64,
     n_turns: u64,
@@ -159,22 +199,24 @@ impl HistorySegment {
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
-        let f = segment::read_file(path, segment::KIND_HISTORY)?;
-        let mut s = Self::from_parts(f.fst, f.blob).map_err(|e| format!("{}: {}", path.display(), e))?;
+        let f = segment::read_file_any(path, &KINDS)?;
+        let mut s = Self::from_parts(f.fst, f.blob, f.kind == segment::KIND_HISTORY_TAGGED)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
         s.file = path.file_name().and_then(|n| n.to_str()).map(str::to_string);
         Ok(s)
     }
 
     pub fn from_file_bytes(buf: Arc<[u8]>) -> Result<Self, String> {
-        let f = segment::decode(buf, segment::KIND_HISTORY)?;
-        Self::from_parts(f.fst, f.blob)
+        let f = segment::decode_any(buf, &KINDS)?;
+        Self::from_parts(f.fst, f.blob, f.kind == segment::KIND_HISTORY_TAGGED)
     }
 
     pub fn to_file_bytes(&self) -> Vec<u8> {
-        segment::encode(segment::KIND_HISTORY, self.terms.as_fst().as_bytes(), self.blob.as_ref())
+        let kind = if self.tagged { segment::KIND_HISTORY_TAGGED } else { segment::KIND_HISTORY };
+        segment::encode(kind, self.terms.as_fst().as_bytes(), self.blob.as_ref())
     }
 
-    fn from_parts(fst: Bytes, blob: Bytes) -> Result<Self, String> {
+    fn from_parts(fst: Bytes, blob: Bytes, tagged: bool) -> Result<Self, String> {
         let terms = fst::Map::new(fst).map_err(|e| format!("history index: {}", e))?;
         let b = blob.as_ref();
         if b.len() < META {
@@ -193,7 +235,7 @@ impl HistorySegment {
         for _ in 0..n {
             forgets.push(segment::get_uvarint(b, &mut at).ok_or("history segment forgets")?);
         }
-        Ok(HistorySegment { terms, blob, first_id, last_id, n_turns, table_at, forgets, file: None, sum: None })
+        Ok(HistorySegment { terms, blob, tagged, first_id, last_id, n_turns, table_at, forgets, file: None, sum: None })
     }
 
     fn holds(&self, id: u64) -> bool {
@@ -215,7 +257,18 @@ impl HistorySegment {
         let at_ms = segment::get_uvarint(b, &mut at)?;
         let speaker = segment::get_str(b, &mut at)?.to_string();
         let text = segment::get_str(b, &mut at)?.to_string();
-        (tid == id).then_some(Turn { id, at_ms, speaker, text })
+        let (mut meta, mut tags) = (String::new(), Vec::new());
+        if self.tagged {
+            meta = segment::get_str(b, &mut at)?.to_string();
+            let n = segment::get_uvarint(b, &mut at)?;
+            if n > MAX_TAGS as u64 {
+                return None;
+            }
+            for _ in 0..n {
+                tags.push(segment::get_str(b, &mut at)?.to_string());
+            }
+        }
+        (tid == id).then_some(Turn { id, at_ms, speaker, text, tags, meta })
     }
 
     fn all_turns(&self) -> Vec<Turn> {
@@ -243,10 +296,31 @@ impl HistorySegment {
         out
     }
 
+    /// The turns here carrying `tag`.
+    fn tag_ids(&self, tag: &str) -> Vec<u64> {
+        self.terms.get(tag_term(tag)).map(|v| self.postings(v)).unwrap_or_default()
+    }
+
+    /// Every tag here starting with `prefix`, with the turns carrying it.
+    fn tags_with_prefix(&self, prefix: &str) -> Vec<(String, Vec<u64>)> {
+        let start = tag_term(prefix);
+        let aut = fst::Automaton::starts_with(fst::automaton::Str::new(&start));
+        let mut st = self.terms.search(aut).into_stream();
+        let mut out = Vec::new();
+        while let Some((k, v)) = st.next() {
+            out.push((String::from_utf8_lossy(&k[TAG_MARK.len_utf8()..]).into_owned(), self.postings(v)));
+        }
+        out
+    }
+
     /// For one query word: every indexed word it matches here, with the turns holding it.
     fn matches(&self, m: &Matcher) -> Vec<(String, Vec<u64>)> {
         let mut out = Vec::new();
         let collect = |k: &[u8], v: u64, out: &mut Vec<(String, Vec<u64>)>| {
+            // a tag's entry is never a word's match (a typo of a word could otherwise reach one)
+            if k.first() == Some(&(TAG_MARK as u8)) {
+                return;
+            }
             out.push((String::from_utf8_lossy(k).into_owned(), self.postings(v)));
         };
         match m {
@@ -281,6 +355,7 @@ impl HistorySegment {
         if turns.windows(2).any(|w| w[0].id >= w[1].id) {
             return Err("history turns must have ascending ids".into());
         }
+        let tagged = turns.iter().any(|t| !t.tags.is_empty() || !t.meta.is_empty());
         let mut blob = vec![0u8; META];
         let mut offsets: Vec<u64> = Vec::with_capacity(turns.len());
         let mut postings: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -290,8 +365,18 @@ impl HistorySegment {
             segment::put_uvarint(&mut blob, t.at_ms);
             segment::put_bytes(&mut blob, t.speaker.as_bytes());
             segment::put_bytes(&mut blob, t.text.as_bytes());
+            if tagged {
+                segment::put_bytes(&mut blob, t.meta.as_bytes());
+                segment::put_uvarint(&mut blob, t.tags.len() as u64);
+                for tag in &t.tags {
+                    segment::put_bytes(&mut blob, tag.as_bytes());
+                }
+            }
             for w in terms_of(&t.text) {
                 postings.entry(w).or_default().push(t.id);
+            }
+            for tag in &t.tags {
+                postings.entry(tag_term(tag)).or_default().push(t.id);
             }
         }
         let table_at = blob.len();
@@ -324,7 +409,7 @@ impl HistorySegment {
         }
         let fst_bytes = b.into_inner().map_err(|e| format!("history index: {}", e))?;
         Self::from_parts(Bytes::new(Arc::from(fst_bytes.into_boxed_slice())),
-                         Bytes::new(Arc::from(blob.into_boxed_slice())))
+                         Bytes::new(Arc::from(blob.into_boxed_slice())), tagged)
     }
 }
 
@@ -342,6 +427,13 @@ pub struct History {
 
 const MANIFEST: &str = "MANIFEST.json";
 const MANIFEST_SEALED: &str = "MANIFEST.cubeseal";
+const LOCK: &str = "LOCK";
+
+/// The one writer's hold on a history directory (`History::lock_dir`); released when dropped.
+#[derive(Debug)]
+pub struct DirLock {
+    _file: std::fs::File,
+}
 
 /// A file name a manifest may name: one plain name inside the directory.
 fn check_segment_name(mpath: &Path, name: &str, sealed: bool) -> Result<(), String> {
@@ -386,6 +478,22 @@ impl History {
 
     /// Add a turn; its id.
     pub fn append(&mut self, speaker: &str, text: &str, at_ms: u64) -> u64 {
+        self.append_tagged(speaker, text, at_ms, &[], "").expect("a turn without tags is always valid")
+    }
+
+    /// Add a turn filed under `tags` (each once; see `check_tag`) with the caller's `meta`; its id.
+    pub fn append_tagged(&mut self, speaker: &str, text: &str, at_ms: u64, tags: &[String], meta: &str)
+                         -> Result<u64, String> {
+        let mut own: Vec<String> = Vec::with_capacity(tags.len());
+        for t in tags {
+            check_tag(t)?;
+            if !own.contains(t) {
+                own.push(t.clone());
+            }
+        }
+        if own.len() > MAX_TAGS {
+            return Err(format!("at most {} tags on a turn", MAX_TAGS));
+        }
         let floor = self.segments.iter()
             .filter(|s| s.last_id >= s.first_id)
             .map(|s| s.last_id)
@@ -394,8 +502,8 @@ impl History {
             .unwrap_or(0);
         let id = self.next_id.max(floor + 1).max(1);
         self.next_id = id + 1;
-        self.top.push(Turn { id, at_ms, speaker: speaker.to_string(), text: text.to_string() });
-        id
+        self.top.push(Turn { id, at_ms, speaker: speaker.to_string(), text: text.to_string(), tags: own, meta: meta.to_string() });
+        Ok(id)
     }
 
     /// Forget a turn: no search or read returns it from now on, and the next merge drops it from
@@ -449,12 +557,45 @@ impl History {
     /// Turns holding every word of `query` (each matched per `mode`), newest first, at most
     /// `limit`.
     pub fn search(&self, query: &str, mode: SearchMode, limit: usize) -> Vec<Hit> {
+        self.search_in(query, mode, &[], limit)
+    }
+
+    /// Turns carrying every one of `tags` and holding every word of `query` (either may be empty,
+    /// not both), newest first, at most `limit`.
+    pub fn search_in(&self, query: &str, mode: SearchMode, tags: &[String], limit: usize) -> Vec<Hit> {
         let words = terms_of(query);
-        if words.is_empty() || limit == 0 {
+        if (words.is_empty() && tags.is_empty()) || limit == 0 {
             return Vec::new();
         }
         let forgotten = self.forgotten();
         let mut found: Option<HashMap<u64, BTreeSet<String>>> = None;
+        let and = |found: Option<HashMap<u64, BTreeSet<String>>>, ids: HashMap<u64, BTreeSet<String>>| match found {
+            None => ids,
+            Some(prev) => prev.into_iter()
+                .filter_map(|(id, mut terms)| ids.get(&id).map(|more| {
+                    terms.extend(more.iter().cloned());
+                    (id, terms)
+                }))
+                .collect(),
+        };
+        // the tags first: a session's tag is usually the narrowest part of the question
+        for tag in tags {
+            let mut ids: HashMap<u64, BTreeSet<String>> = HashMap::new();
+            for s in &self.segments {
+                for id in s.tag_ids(tag) {
+                    ids.entry(id).or_default();
+                }
+            }
+            for t in &self.top {
+                if t.tags.iter().any(|x| x == tag) {
+                    ids.entry(t.id).or_default();
+                }
+            }
+            found = Some(and(found, ids));
+            if found.as_ref().is_some_and(|f| f.is_empty()) {
+                return Vec::new();
+            }
+        }
         for w in &words {
             let matcher = Matcher::new(w, mode);
             let mut ids: HashMap<u64, BTreeSet<String>> = HashMap::new();
@@ -472,15 +613,7 @@ impl History {
                     }
                 }
             }
-            found = Some(match found {
-                None => ids,
-                Some(prev) => prev.into_iter()
-                    .filter_map(|(id, mut terms)| ids.get(&id).map(|more| {
-                        terms.extend(more.iter().cloned());
-                        (id, terms)
-                    }))
-                    .collect(),
-            });
+            found = Some(and(found, ids));
             if found.as_ref().is_some_and(|f| f.is_empty()) {
                 return Vec::new();
             }
@@ -493,6 +626,39 @@ impl History {
             .filter_map(|(id, terms)| self.get_unless(id, &forgotten).map(|turn| Hit { turn, matched: terms.into_iter().collect() }))
             .take(limit)
             .collect()
+    }
+
+    /// Every tag starting with `prefix` that a live turn carries, with how many do, in tag order
+    /// ("session:" lists a store's sessions).
+    pub fn tags(&self, prefix: &str) -> Vec<(String, usize)> {
+        let forgotten = self.forgotten();
+        let mut by: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        for s in &self.segments {
+            for (tag, ids) in s.tags_with_prefix(prefix) {
+                by.entry(tag).or_default().extend(ids.into_iter().filter(|id| !forgotten.contains(id)));
+            }
+        }
+        for t in &self.top {
+            for tag in t.tags.iter().filter(|x| x.starts_with(prefix)) {
+                by.entry(tag.clone()).or_default().insert(t.id);
+            }
+        }
+        by.into_iter().filter(|(_, ids)| !ids.is_empty()).map(|(tag, ids)| (tag, ids.len())).collect()
+    }
+
+    /// Hold `dir`'s `LOCK` file: while the lock lives, no other process can take it, so one process
+    /// writes the directory at a time. The operating system lets go when the process ends, so a
+    /// crash leaves no stale lock behind.
+    pub fn lock_dir(dir: &Path) -> Result<DirLock, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        let path = dir.join(LOCK);
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        match file.try_lock() {
+            Ok(()) => Ok(DirLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!("{}: another process is writing this history", dir.display())),
+            Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {}", path.display(), e)),
+        }
     }
 
     /// The turns since the last freeze become a segment.
@@ -876,6 +1042,119 @@ mod tests {
             let mut c = self.clone();
             c.append("x", "y", 0)
         }
+    }
+
+    fn tags(t: &[&str]) -> Vec<String> {
+        t.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// A store's records: two sessions' model calls, filed by tag, with meta.
+    fn store() -> History {
+        let mut h = History::new();
+        h.append_tagged("model-a", "The ring of keys is enough for a small house", 1, &tags(&["session:s1", "call"]), r#"{"cost":0.01}"#).unwrap();
+        h.append_tagged("model-b", "A ring of keys gets lost; a key box is safer", 2, &tags(&["session:s1", "call"]), "").unwrap();
+        h.append_tagged("model-a", "Keys for a factory need a registry", 3, &tags(&["session:s2", "call"]), "").unwrap();
+        h.append("user", "what about keys in general", 4);
+        h
+    }
+
+    #[test]
+    fn tags_narrow_a_search_and_meta_comes_back() {
+        for freeze in [false, true] {
+            let mut h = store();
+            if freeze {
+                h.freeze().unwrap();
+            }
+            assert_eq!(ids(&h.search("keys", SearchMode::Exact, 10)), vec![4, 3, 2, 1]);
+            assert_eq!(ids(&h.search_in("keys", SearchMode::Exact, &tags(&["session:s1"]), 10)), vec![2, 1]);
+            assert_eq!(ids(&h.search_in("", SearchMode::Exact, &tags(&["session:s2"]), 10)), vec![3], "tags alone");
+            assert_eq!(ids(&h.search_in("ring", SearchMode::Exact, &tags(&["session:s1", "call"]), 10)), vec![2, 1]);
+            assert!(h.search_in("ring", SearchMode::Exact, &tags(&["session:s2"]), 10).is_empty());
+            assert!(h.search_in("", SearchMode::Exact, &[], 10).is_empty(), "neither words nor tags");
+            let first = h.get(1).unwrap();
+            assert_eq!(first.tags, tags(&["session:s1", "call"]));
+            assert_eq!(first.meta, r#"{"cost":0.01}"#);
+            assert!(h.get(4).unwrap().tags.is_empty());
+            assert_eq!(h.tags("session:"), vec![("session:s1".to_string(), 2), ("session:s2".to_string(), 1)]);
+            assert_eq!(h.tags(""), vec![("call".to_string(), 3), ("session:s1".to_string(), 2), ("session:s2".to_string(), 1)]);
+        }
+    }
+
+    #[test]
+    fn no_word_query_reaches_a_tag() {
+        let mut h = History::new();
+        h.append_tagged("x", "nothing to see", 1, &tags(&["abcd", "session"]), "").unwrap();
+        h.freeze().unwrap();
+        // "abcd" is a tag, never a word: not found exactly, by prefix, or as a typo ("abce")
+        for (q, mode) in [("abcd", SearchMode::Exact), ("abc", SearchMode::Prefix), ("abce", SearchMode::Fuzzy),
+                          ("session", SearchMode::Exact), ("sessio", SearchMode::Fuzzy)] {
+            assert!(h.search(q, mode, 10).is_empty(), "{q} {mode:?}");
+        }
+        assert_eq!(ids(&h.search_in("", SearchMode::Exact, &tags(&["abcd"]), 10)), vec![1]);
+        // nor can a tag be made to look like a word
+        assert!(check_tag("").is_err() && check_tag(" x").is_err() && check_tag("a\u{1}b").is_err()
+                && check_tag(&"t".repeat(MAX_TAG_BYTES + 1)).is_err());
+        assert!(h.append_tagged("x", "y", 2, &tags(&["a\nb"]), "").is_err());
+        let many: Vec<String> = (0..=MAX_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(h.append_tagged("x", "y", 2, &many, "").is_err());
+        assert_eq!(h.append_tagged("x", "y", 2, &tags(&["a", "a"]), "").unwrap(), 2);
+        assert_eq!(h.get(2).unwrap().tags, tags(&["a"]), "each tag once");
+    }
+
+    #[test]
+    fn forgetting_and_merging_keep_tags_right() {
+        let mut h = store();
+        h.freeze().unwrap();
+        assert!(h.forget(2));
+        assert_eq!(h.tags("session:"), vec![("session:s1".to_string(), 1), ("session:s2".to_string(), 1)]);
+        assert_eq!(ids(&h.search_in("", SearchMode::Exact, &tags(&["session:s1"]), 10)), vec![1]);
+        for id in [1, 3] {
+            h.forget(id);
+        }
+        h.merge_all().unwrap();
+        assert!(h.tags("session:").is_empty(), "a forgotten session's tags are gone with it");
+        let hay = String::from_utf8_lossy(&h.segments[0].to_file_bytes()).into_owned();
+        assert!(!hay.contains("session:s1") && !hay.contains("registry"));
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn a_plain_history_keeps_its_old_file_kind_and_tagged_ones_round_trip() {
+        let mut plain = talk();
+        plain.freeze().unwrap();
+        let bytes = plain.segments[0].to_file_bytes();
+        assert_eq!(bytes[9], segment::KIND_HISTORY, "no tags, no meta: written exactly as before");
+        let mut h = store();
+        h.freeze().unwrap();
+        let bytes = h.segments[0].to_file_bytes();
+        assert_eq!(bytes[9], segment::KIND_HISTORY_TAGGED);
+        let back = HistorySegment::from_file_bytes(Arc::from(bytes.into_boxed_slice())).unwrap();
+        assert_eq!(back.turn(1).unwrap().meta, r#"{"cost":0.01}"#);
+        assert_eq!(back.tag_ids("session:s1"), vec![1, 2]);
+        // a directory mixing both kinds (an old conversation that later got tagged turns) opens whole
+        let dir = std::env::temp_dir().join(format!("cubelang-history-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut mixed = talk();
+        mixed.save_dir(&dir).unwrap();
+        mixed.append_tagged("model-a", "ring of keys", 9, &tags(&["session:s9"]), "{}").unwrap();
+        mixed.save_dir(&dir).unwrap();
+        let again = History::open_dir(&dir).unwrap();
+        assert_eq!(again.segment_count(), 2);
+        assert_eq!(ids(&again.search_in("keys", SearchMode::Exact, &tags(&["session:s9"]), 5)), vec![5]);
+        assert_eq!(ids(&again.search("gutenberg", SearchMode::Exact, 5)), vec![4, 3, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_writer_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("cubelang-history-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let held = History::lock_dir(&dir).unwrap();
+        assert!(History::lock_dir(&dir).unwrap_err().contains("another process is writing"));
+        drop(held);
+        let again = History::lock_dir(&dir).unwrap();
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
