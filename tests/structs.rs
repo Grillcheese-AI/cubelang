@@ -49,7 +49,7 @@ program Shapes implements ISolve {
         return p.y;
     }
     @external
-    public function nested(input: str): str {
+    public function nested(input: str): i64 {
         let l = Labeled { name: "home", at: Point { x: 1, y: 2 } };
         return l.at.y;
     }

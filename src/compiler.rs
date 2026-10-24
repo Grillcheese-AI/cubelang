@@ -841,6 +841,11 @@ pub struct Compiler {
     /// The struct declarations themselves (with their default expressions),
     /// for struct literals.
     struct_decls: HashMap<String, StructDecl>,
+    /// The current program's functions' parameter types, for checking the
+    /// literal arguments of a call at compile time.
+    signatures: HashMap<String, Vec<crate::types::TypeSpec>>,
+    /// The declared return type of the function being compiled.
+    current_return: crate::types::TypeSpec,
 }
 
 impl Compiler {
@@ -864,6 +869,18 @@ impl Compiler {
             current_span: None,
             types: crate::types::TypeTable::default(),
             struct_decls: HashMap::new(),
+            signatures: HashMap::new(),
+            current_return: crate::types::TypeSpec::Any,
+        }
+    }
+
+    /// A literal against a declared type, at compile time (2026-10-24): `null`
+    /// and non-literals pass (the VM checks those as they cross a call).
+    fn check_literal(&mut self, spec: &crate::types::TypeSpec, value: &Expr, what: &str) {
+        if let Some(lit) = crate::types::TypeSpec::of_literal(value) {
+            if !spec.accepts_literal(&lit, &self.types) {
+                self.literal_error(format!("{} is declared {} but is given {}", what, spec.spell(), lit.spell()));
+            }
         }
     }
 
@@ -943,6 +960,31 @@ impl Compiler {
         // check_implements's doc for the registry-first resolution order.
         self.check_implements(prog);
 
+        // A program's own `type Input = number;` aliases join the file's
+        // types for this program (and travel with it, for the VM's checks).
+        let file_types = self.types.clone();
+        for item in &prog.body {
+            if let ProgramItem::TypeAlias(a) = item {
+                self.types.aliases.insert(a.name.clone(), crate::types::TypeSpec::Any);
+            }
+        }
+        for item in &prog.body {
+            if let ProgramItem::TypeAlias(a) = item {
+                let spec = crate::types::TypeSpec::from_expr(&a.ty, &self.types);
+                self.types.aliases.insert(a.name.clone(), spec);
+            }
+        }
+
+        self.signatures = prog.body.iter()
+            .filter_map(|item| match item {
+                ProgramItem::Function(f) | ProgramItem::Constructor(f) => Some((
+                    f.sig.name.clone(),
+                    f.sig.params.iter().map(|p| crate::types::TypeSpec::from_expr(&p.ty, &self.types)).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+
         for item in &prog.body {
             match item {
                 ProgramItem::Storage(s) => {
@@ -957,6 +999,7 @@ impl Compiler {
             }
         }
 
+        let types = std::mem::replace(&mut self.types, file_types);
         CompiledProgram {
             name: prog.name.clone(),
             implements: prog.implements.clone(),
@@ -964,7 +1007,7 @@ impl Compiler {
             storage_fields,
             symbol_names: std::mem::take(&mut self.symbol_names),
             used_modules: self.used_modules.clone(),
-            types: self.types.clone(),
+            types,
         }
     }
 
@@ -1002,6 +1045,29 @@ impl Compiler {
             self.check_permissions(&func.sig);
         }
 
+        // 2026-10-24: the declared types, before the body, so a `return` of a
+        // literal is checked against them. Under strict (the default), a type
+        // name nothing declares is an error: it would check nothing at run time.
+        let param_types: Vec<crate::types::TypeSpec> = func.sig.params.iter()
+            .map(|p| crate::types::TypeSpec::from_expr(&p.ty, &self.types))
+            .collect();
+        let return_type = crate::types::TypeSpec::from_expr(&func.sig.return_type, &self.types);
+        if self.strict {
+            let mut unknown = Vec::new();
+            for t in param_types.iter().chain(std::iter::once(&return_type)) {
+                t.opaque_names(&mut unknown);
+            }
+            unknown.sort();
+            unknown.dedup();
+            for name in unknown {
+                self.strict_errors.push(format!(
+                    "strict: unknown type `{}` in {}::{} -- declare a struct, enum or `type` alias, or use a \
+                     built-in type (it would check nothing at run time)",
+                    name, self.current_program, self.current_function));
+            }
+        }
+        self.current_return = return_type.clone();
+
         for stmt in &func.body {
             self.compile_stmt(stmt);
         }
@@ -1013,10 +1079,6 @@ impl Compiler {
         for message in contract_errors {
             self.capability_errors.push(ParseError { message, span: func.sig.span });
         }
-        let param_types = func.sig.params.iter()
-            .map(|p| crate::types::TypeSpec::from_expr(&p.ty, &self.types))
-            .collect();
-        let return_type = crate::types::TypeSpec::from_expr(&func.sig.return_type, &self.types);
         CompiledFunction {
             name: func.sig.name.clone(),
             params: func.sig.params.iter().map(|p| p.name.clone()).collect(),
@@ -1433,6 +1495,9 @@ impl Compiler {
                         self.emit_named("__return_call");
                     }
                     Some(expr) => {
+                        let spec = self.current_return.clone();
+                        let what = format!("the return value of {}::{}", self.current_program, self.current_function);
+                        self.check_literal(&spec, expr, &what);
                         self.emit_debug(op::RETURN, "return value");
                         self.emit_byte(op::RETURN);
                         self.emit_byte(1);
@@ -2108,6 +2173,10 @@ impl Compiler {
             }
             _ => {}
         }
+        if let Some(ty) = &let_stmt.ty {
+            let spec = crate::types::TypeSpec::from_expr(ty, &self.types);
+            self.check_literal(&spec, &let_stmt.value, &format!("`let {}`", let_stmt.name));
+        }
         // let x = expr → CREATE x + ASSIGN x = expr
         self.emit_debug(op::CREATE, &format!("let {}", let_stmt.name));
         self.emit_byte(op::CREATE);
@@ -2195,6 +2264,16 @@ impl Compiler {
     /// at call time. Method calls fall back to `CALL <method>, <receiver>` —
     /// the receiver becomes arg0; full method dispatch is a later refinement.
     fn emit_call(&mut self, callee: &Expr, args: &[Expr]) {
+        // 2026-10-24: a literal argument to one of the program's own functions
+        // is checked against the parameter's declared type here; anything else
+        // is checked by the VM as the call is made.
+        if let Expr::Ident(name) = callee {
+            if let Some(specs) = self.signatures.get(name).cloned() {
+                for (i, (spec, arg)) in specs.iter().zip(args).enumerate() {
+                    self.check_literal(spec, arg, &format!("argument {} of {}()", i + 1, name));
+                }
+            }
+        }
         match callee {
             Expr::Ident(name) => {
                 self.emit_debug(op::CALL, &format!("call {}({})", name, args.len()));

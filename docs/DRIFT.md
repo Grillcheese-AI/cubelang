@@ -198,6 +198,11 @@ Neither doc states that a declared type is unchecked decoration, or that
 built-in types at all — they are indistinguishable, at the lexer level, from
 a typo.
 
+> **Resolved 2026-10-24:** a type-checking pass exists (REFERENCE §4).
+> `number`/`quantity`/`symbol` are now named as deliberately lenient types
+> (`types::LENIENT`), and a name that is neither built in, lenient nor
+> declared is a strict compile error rather than indistinguishable from a typo.
+
 ### B9. `ISolverLearn` is unnamed in either doc
 Used by 2 of 11 examples (`gsm8k.cube`, `conversation_agent.cube`); absent
 from README's interface catalogue and from SPEC.md (grepped, 0 matches for

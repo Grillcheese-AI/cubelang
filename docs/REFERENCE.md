@@ -206,6 +206,19 @@ already restored and `call_depth` unwound.
 
 ## 4. Types
 
+> **2026-10-24: types are checked now** (`src/types.rs` has the rules;
+> `tests/types.rs` pins them). At compile time, a literal where the compiler
+> sees it: a `return`, a typed `let`, a literal argument to one of the
+> program's own functions, a struct literal's fields. At run time, every
+> value crossing a function boundary: the host's arguments (text read as the
+> declared scalar first, so run-proto's "5" is an `i64`), every intra-program
+> call's arguments, every return. `null` is a value of every type; `number`,
+> `quantity`, `symbol`, `void`, `any` and the AI-native names check nothing,
+> on purpose; fixed-width ints carry their range; structs are structural.
+> Under strict (the default), a type name nothing declares (no struct, enum,
+> file-level or program-level `type` alias) is a compile error. The audit
+> text below describes the state before.
+
 Two entirely separate systems, and this split is the single largest
 undocumented gap in the type story:
 

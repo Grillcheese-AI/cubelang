@@ -514,11 +514,46 @@ impl VM {
         // Deliver the answer the same way CALL delivers a result: via the stack.
         self.stack.push(answer);
         // A nested ASK inside the resumed run must report the same program.
-        let prev = self.current_program.replace(prog_name);
+        let prev = self.current_program.replace(prog_name.clone());
         self.resume_state = Some(susp);
         let result = self.exec_function(&func);
         self.current_program = prev;
-        result
+        self.check_return(&prog_name, &func, result)
+    }
+
+    /// A value crossing a function boundary against its declared type
+    /// (2026-10-24; see `crate::types` for the rules: null passes, lenient
+    /// names check nothing, structs are structural).
+    fn type_check(&self, program: &str, spec: &crate::types::TypeSpec, v: &Value) -> Result<(), String> {
+        use crate::types::TypeSpec;
+        if matches!(spec, TypeSpec::Any | TypeSpec::Opaque(_)) {
+            return Ok(());
+        }
+        match self.programs.get(program) {
+            Some(p) => spec.check(v, &p.types),
+            None => spec.check(v, &crate::types::TypeTable::default()),
+        }
+    }
+
+    fn check_args(&self, program: &str, func: &CompiledFunction, args: &[Value]) -> Result<(), String> {
+        for (i, (spec, v)) in func.param_types.iter().zip(args).enumerate() {
+            self.type_check(program, spec, v).map_err(|e| {
+                let name = func.params.get(i).cloned().unwrap_or_else(|| format!("arg{}", i));
+                format!("{}.{}: argument `{}` is declared {}, but {}", program, func.name, name, spec.spell(), e)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn check_return(&self, program: &str, func: &CompiledFunction, r: ExecResult) -> ExecResult {
+        match &r {
+            ExecResult::Ok(v) | ExecResult::Return(v) => match self.type_check(program, &func.return_type, v) {
+                Ok(()) => r,
+                Err(e) => ExecResult::Error(format!(
+                    "{}.{} is declared to return {}, but {}", program, func.name, func.return_type.spell(), e)),
+            },
+            _ => r,
+        }
     }
 
     fn function_named(&self, program: &str, function: &str) -> Result<CompiledFunction, String> {
@@ -588,6 +623,7 @@ impl VM {
                 inner: None,
             });
             let r = self.exec_function(&funcs[i]);
+            let r = self.check_return(&frames[i].program, &funcs[i], r);
             match r {
                 ExecResult::Ok(v) | ExecResult::Return(v) if i + 1 < n => {
                     carry = v;
@@ -686,6 +722,21 @@ impl VM {
         //
         // Now: bind by DECLARED NAME (v3 .cubebin carries them), and keep the
         // `argN` alias so v2 files and existing callers still work.
+        //
+        // 2026-10-24: the arguments are checked against the declared types.
+        // A host's text (run-proto carries every argument as a string) is
+        // first read as the declared scalar: "5" for an `i64`, "2.5" for an
+        // `f64`, "true"/"false" for a `bool`. Text that does not read as the
+        // type stays text, and the check refuses it.
+        let args: Vec<Value> = args.into_iter().enumerate()
+            .map(|(i, a)| match func.param_types.get(i) {
+                Some(spec) => coerce_host_arg(spec, a, &prog.types),
+                None => a,
+            })
+            .collect();
+        if let Err(e) = self.check_args(program, &func, &args) {
+            return ExecResult::Error(e);
+        }
         for (i, arg) in args.into_iter().enumerate() {
             if let Some(param) = func.params.get(i) {
                 self.register_name(param);
@@ -701,7 +752,7 @@ impl VM {
         let prev = self.current_program.replace(program.to_string());
         let result = self.exec_function(&func);
         self.current_program = prev;
-        result
+        self.check_return(program, &func, result)
     }
 
     /// The HOST's entry into a program (VM step 0, 2026-09-29): `call` with
@@ -1727,6 +1778,13 @@ impl VM {
     /// was waiting on a deeper call), the caller's registers are restored, and
     /// the CALL arm adds the caller's own resume point (`caller_waits`).
     fn exec_intra_call(&mut self, callee: &CompiledFunction, arg_values: Vec<Value>) -> Option<ExecResult> {
+        // 2026-10-24: the callee's declared parameter types, checked before
+        // anything moves (no reading text as numbers here: inside a program
+        // a value already has its type).
+        let program = self.current_program.clone().unwrap_or_default();
+        if let Err(e) = self.check_args(&program, callee, &arg_values) {
+            return Some(ExecResult::Error(e));
+        }
         let caller_regs = std::mem::take(&mut self.registers);
         // WO-1.2: the frame map is register-keyed, so it has to follow the
         // registers exactly. Without this a callee's `bind frame, ...` would
@@ -1747,6 +1805,7 @@ impl VM {
         self.call_depth += 1;
         let r = self.exec_function(callee);
         self.call_depth -= 1;
+        let r = self.check_return(&program, callee, r);
 
         // Restore caller-visible registers, and the frame map with them,
         // keeping the callee's in case it suspended.
@@ -2271,6 +2330,31 @@ fn num_binop(a: &Value, b: &Value, op: char) -> Value {
             }
             _ => Value::Int(0),
         }
+    }
+}
+
+/// A host argument read as its declared scalar type (2026-10-24): hosts that
+/// speak text (run-proto, the CLI's `--arg`) send "5" for an `i64`. Anything
+/// that does not read cleanly is returned unchanged, for the type check to
+/// refuse with the value in view.
+fn coerce_host_arg(spec: &crate::types::TypeSpec, v: Value, decls: &crate::types::TypeTable) -> Value {
+    use crate::types::TypeSpec;
+    let Value::Str(s) = &v else { return v };
+    let t = s.trim();
+    match spec {
+        TypeSpec::Nullable(inner) => coerce_host_arg(inner, v, decls),
+        TypeSpec::Named(n) => match decls.aliases.get(n) {
+            Some(alias) => coerce_host_arg(alias, v, decls),
+            None => v,
+        },
+        TypeSpec::Int { .. } => t.parse::<i64>().map(Value::Int).unwrap_or(v),
+        TypeSpec::Float => t.parse::<f64>().map(Value::Float).unwrap_or(v),
+        TypeSpec::Bool => match t {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => v,
+        },
+        _ => v,
     }
 }
 
