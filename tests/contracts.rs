@@ -30,8 +30,8 @@ program Guarded implements ISolve {
     public function limited(x: str): str { return x; }
     @cron("1h")
     public function nightly(): str { return "swept"; }
-    private function helper(): str { return "inner"; }
-    public function uses_helper(x: str): str { return helper(); }
+    private function helper(x: str): str { return x; }
+    public function uses_helper(x: str): str { return helper(x); }
     @system
     function lifecycle(x: str): str { return x; }
     public function calls_system(x: str): str { return lifecycle(x); }
@@ -118,11 +118,9 @@ fn cron_runs_only_from_the_scheduler_and_on_its_interval() {
 #[test]
 fn private_is_inside_only_and_system_is_runtime_only() {
     let (mut vm, p) = load(CONTRACT);
-    assert!(err(vm.call_entry(&p, "helper", vec![])).contains("private"));
-    // (A no-argument helper: CALL v1 passes arguments wrongly -- `return helper(x);` comes back
-    // Int(0) -- which the call-frame work, task 113, fixes. Access is what this test is about.)
+    assert!(err(vm.call_entry(&p, "helper", arg())).contains("private"));
     match vm.call_entry(&p, "uses_helper", arg()) {
-        ExecResult::Return(Value::Str(s)) | ExecResult::Ok(Value::Str(s)) => assert_eq!(s, "inner"),
+        ExecResult::Return(Value::Str(s)) | ExecResult::Ok(Value::Str(s)) => assert_eq!(s, "a"),
         other => panic!("the program itself may call its private function: {other:?}"),
     }
     assert!(err(vm.call_entry(&p, "calls_system", arg())).contains("@system"),

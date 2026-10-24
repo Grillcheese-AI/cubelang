@@ -170,6 +170,12 @@ handles). This is documented as intentionally not scaling to hot inner loops
 (full register-map clone per call) — v2 real call frames are still on the
 roadmap, not built. `call_depth` is capped (see `ASK inside a CALL` below).
 
+> **2026-10-24:** a callee's arguments now bind to its declared parameter names
+> (before, only `arg0..argN`, so `helper(x)` read an unbound `x` and returned
+> `Int(0)`), and an `ASK` inside a callee suspends with the waiting callers'
+> frames (docs/ASK_SUSPEND.md). Registers are still copied per call; that
+> performance note stands.
+
 ### 3.4 QUERY is real, not trace-only — a documentation-vs-source gap in the repo's own docs
 
 [src, `src/vm/engine.rs:575-616`, code comment: *"Was: read a register,

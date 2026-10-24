@@ -126,6 +126,36 @@ pub struct Suspension {
     /// `current_program` on the way out, so the VM has forgotten it by the time
     /// the host sees the Suspend. A suspension must be self-describing.
     pub program: String,
+    /// The callers waiting on the function that asked, innermost first
+    /// (2026-10-24). Empty when the host's entry function asked. `resume`
+    /// finishes the asker, hands its result to each caller in turn, and
+    /// continues each one where its CALL left off -- so a skill can call a
+    /// skill that asks.
+    pub callers: Vec<CallerFrame>,
+    /// The asker's own registers when it is a callee: a callee's registers
+    /// are its own, while the entry function's live in the VM.
+    inner: Option<FrameState>,
+}
+
+/// One caller waiting on a call when the callee suspended: where it resumes
+/// (the instruction after its CALL) and the registers it held.
+#[derive(Debug, Clone)]
+pub struct CallerFrame {
+    pub program: String,
+    pub function: String,
+    pub pc: usize,
+    pub flag: bool,
+    pub jump_budget: u64,
+    /// `None` only for the outermost caller, whose registers are the VM's own.
+    state: Option<FrameState>,
+}
+
+/// A function's private register scope (registers and the VSA frames that
+/// follow them), held aside while it waits.
+#[derive(Debug, Clone, Default)]
+struct FrameState {
+    registers: HashMap<String, Value>,
+    vsa_frames: HashMap<String, VsaFrame>,
 }
 
 /// The CubeLang virtual machine.
@@ -470,19 +500,16 @@ impl VM {
                 susp.candidates.len()
             ));
         }
+        if !susp.callers.is_empty() {
+            return self.resume_chain(susp, answer);
+        }
+        if susp.inner.is_some() {
+            return ExecResult::Error("resume: a suspension with a callee's registers but no caller is malformed".into());
+        }
         let prog_name = susp.program.clone();
-        let prog = match self.programs.get(&prog_name) {
-            Some(p) => p.clone(),
-            None => return ExecResult::Error(format!("resume: program not found: {}", prog_name)),
-        };
-        let func = match prog.functions.iter().find(|f| f.name == susp.function) {
-            Some(f) => f.clone(),
-            None => {
-                return ExecResult::Error(format!(
-                    "resume: function not found: {}.{}",
-                    prog_name, susp.function
-                ))
-            }
+        let func = match self.function_named(&prog_name, &susp.function) {
+            Ok(f) => f,
+            Err(e) => return ExecResult::Error(e),
         };
         // Deliver the answer the same way CALL delivers a result: via the stack.
         self.stack.push(answer);
@@ -492,6 +519,118 @@ impl VM {
         let result = self.exec_function(&func);
         self.current_program = prev;
         result
+    }
+
+    fn function_named(&self, program: &str, function: &str) -> Result<CompiledFunction, String> {
+        let prog = self.programs.get(program)
+            .ok_or_else(|| format!("resume: program not found: {}", program))?;
+        prog.functions.iter().find(|f| f.name == function).cloned()
+            .ok_or_else(|| format!("resume: function not found: {}.{}", program, function))
+    }
+
+    /// Resume an ASK made inside a called function (2026-10-24). The frames
+    /// run innermost first: the asker gets the answer on the stack, as at the
+    /// top level; each caller then gets its callee's result on the stack, as
+    /// CALL delivers it, and continues after its CALL with its own registers.
+    /// The outermost frame (the host's entry) runs with the VM's registers.
+    ///
+    /// A frame that asks again re-suspends with the frames still waiting
+    /// above it attached, exactly as if the ASK had happened on the first run:
+    /// so the next `resume` continues the same chain.
+    fn resume_chain(&mut self, susp: Suspension, answer: Value) -> ExecResult {
+        let mut frames: Vec<CallerFrame> = Vec::with_capacity(susp.callers.len() + 1);
+        frames.push(CallerFrame {
+            program: susp.program.clone(),
+            function: susp.function.clone(),
+            pc: susp.pc,
+            flag: susp.flag,
+            jump_budget: susp.jump_budget,
+            state: susp.inner,
+        });
+        frames.extend(susp.callers);
+        let n = frames.len();
+        // Every waiting frame but the outermost carries its registers; the
+        // outermost's are the VM's own.
+        if frames.iter().enumerate().any(|(i, f)| (i + 1 < n) != f.state.is_some()) {
+            return ExecResult::Error("resume: the suspended call chain is malformed".into());
+        }
+        let mut funcs = Vec::with_capacity(n);
+        for f in &frames {
+            match self.function_named(&f.program, &f.function) {
+                Ok(func) => funcs.push(func),
+                Err(e) => return ExecResult::Error(e),
+            }
+        }
+        frames[n - 1].state = Some(FrameState {
+            registers: std::mem::take(&mut self.registers),
+            vsa_frames: std::mem::take(&mut self.vsa_frames),
+        });
+        let prev_program = self.current_program.clone();
+        let prev_depth = self.call_depth;
+        let mut carry = answer;
+        let mut i = 0;
+        let outcome = loop {
+            let state = frames[i].state.take().expect("checked above");
+            self.registers = state.registers;
+            self.vsa_frames = state.vsa_frames;
+            self.stack.push(carry);
+            self.current_program = Some(frames[i].program.clone());
+            self.call_depth = prev_depth + (n - 1 - i) as u32;
+            self.resume_state = Some(Suspension {
+                question: Value::Null,
+                candidates: Vec::new(),
+                pc: frames[i].pc,
+                flag: frames[i].flag,
+                jump_budget: frames[i].jump_budget,
+                function: frames[i].function.clone(),
+                program: frames[i].program.clone(),
+                callers: Vec::new(),
+                inner: None,
+            });
+            let r = self.exec_function(&funcs[i]);
+            match r {
+                ExecResult::Ok(v) | ExecResult::Return(v) if i + 1 < n => {
+                    carry = v;
+                    i += 1;
+                }
+                ExecResult::Suspend(mut again) if i + 1 < n => {
+                    // As `exec_intra_call` would have: this frame's registers
+                    // go into the suspension, then every frame still waiting
+                    // above it, the outermost's back into the VM.
+                    let state = FrameState {
+                        registers: std::mem::take(&mut self.registers),
+                        vsa_frames: std::mem::take(&mut self.vsa_frames),
+                    };
+                    match again.callers.last_mut() {
+                        None => again.inner = Some(state),
+                        Some(waiting) => waiting.state = Some(state),
+                    }
+                    for (j, mut waiting) in frames.drain(i + 1..).enumerate() {
+                        if i + 1 + j == n - 1 {
+                            let outer = waiting.state.take().expect("the outermost frame's registers");
+                            self.registers = outer.registers;
+                            self.vsa_frames = outer.vsa_frames;
+                        }
+                        again.callers.push(waiting);
+                    }
+                    break ExecResult::Suspend(again);
+                }
+                ExecResult::Error(e) if i + 1 < n => {
+                    // Put the outermost frame's registers back, so the VM is
+                    // left as an erroring top-level run leaves it.
+                    if let Some(outer) = frames[n - 1].state.take() {
+                        self.registers = outer.registers;
+                        self.vsa_frames = outer.vsa_frames;
+                    }
+                    break ExecResult::Error(e);
+                }
+                // the outermost frame finished, asked again or failed: as at the top level
+                other => break other,
+            }
+        };
+        self.current_program = prev_program;
+        self.call_depth = prev_depth;
+        outcome
     }
 
     /// Load a compiled program into the VM.
@@ -1343,8 +1482,10 @@ impl VM {
                         let callee = own_fn.expect("is_valid_override implies own_fn is Some");
                         self.trace_op(pc, &format!(
                             "CALL {} (program override, {} arg(s))", fn_name, arg_values.len()));
-                        if let Some(err) = self.exec_intra_call(&callee, arg_values) {
-                            return err;
+                        match self.exec_intra_call(&callee, arg_values) {
+                            None => {}
+                            Some(ExecResult::Suspend(s)) => return self.caller_waits(s, func, pc, flag, jump_budget),
+                            Some(other) => return other,
                         }
                     } else if let Some((_, native)) = module_hit {
                         // Task 6: a registry (native) function gets its OWN
@@ -1366,8 +1507,10 @@ impl VM {
                         self.stack.push(result);
                     } else if let Some(callee) = own_fn {
                         self.trace_op(pc, &format!("CALL {} ({} arg(s))", fn_name, arg_values.len()));
-                        if let Some(err) = self.exec_intra_call(&callee, arg_values) {
-                            return err;
+                        match self.exec_intra_call(&callee, arg_values) {
+                            None => {}
+                            Some(ExecResult::Suspend(s)) => return self.caller_waits(s, func, pc, flag, jump_budget),
+                            Some(other) => return other,
                         }
                     } else {
                         return ExecResult::Error(format!(
@@ -1525,6 +1668,8 @@ impl VM {
                         jump_budget,
                         function: func.name.clone(),
                         program: self.current_program.clone().unwrap_or_default(),
+                        callers: Vec::new(),
+                        inner: None,
                     });
                 }
                 op::SYNC => self.trace_structural(pc, "SYNC", &operands),
@@ -1551,13 +1696,19 @@ impl VM {
     /// caller delivers it into a binding via POP) -- matching how CALL
     /// always has.
     ///
-    /// Returns `None` on success (result already on the stack). Returns
-    /// `Some(ExecResult::Error(..))` on failure -- the caller should
-    /// `return` it immediately, matching the early-return control flow this
-    /// replaces. A callee that suspends (ASK) is itself an error here, for
-    /// the same reason it always was: by the time it would propagate, the
-    /// caller's registers are already restored and call_depth already
-    /// unwound, so resuming would re-enter the callee with the wrong frame.
+    /// Returns `None` on success (result already on the stack), or the
+    /// callee's `Error` or `Suspend` for the caller to return.
+    ///
+    /// Arguments bind to the callee's DECLARED parameter names, as `call()`
+    /// binds a host's arguments, plus the `argN` alias. (Until 2026-10-24
+    /// only `argN` was bound, so `helper(x)` read an unbound `x` inside
+    /// `helper` and returned Int(0) -- silently.)
+    ///
+    /// A callee that suspends (ASK) is no longer an error (2026-10-24): the
+    /// callee's registers go into the suspension (as its `inner` scope when it
+    /// asked itself, or as the state of the innermost waiting caller when it
+    /// was waiting on a deeper call), the caller's registers are restored, and
+    /// the CALL arm adds the caller's own resume point (`caller_waits`).
     fn exec_intra_call(&mut self, callee: &CompiledFunction, arg_values: Vec<Value>) -> Option<ExecResult> {
         let caller_regs = std::mem::take(&mut self.registers);
         // WO-1.2: the frame map is register-keyed, so it has to follow the
@@ -1567,20 +1718,23 @@ impl VM {
         // door, which is the very thing the scoping exists to remove.
         let caller_frames = std::mem::take(&mut self.vsa_frames);
         for (i, v) in arg_values.into_iter().enumerate() {
-            let arg_name = format!("arg{}", i);
-            self.register_name(&arg_name);
-            let h = blake3::hash(arg_name.as_bytes());
-            let key = format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1]);
-            self.registers.insert(key, v);
+            if let Some(param) = callee.params.get(i) {
+                self.register_name(param);
+                self.registers.insert(Self::register_key(param), v.clone());
+            }
+            let alias = format!("arg{}", i);
+            self.register_name(&alias);
+            self.registers.insert(Self::register_key(&alias), v);
         }
 
         self.call_depth += 1;
         let r = self.exec_function(callee);
         self.call_depth -= 1;
 
-        // Restore caller-visible registers, and the frame map with them.
-        self.registers = caller_regs;
-        self.vsa_frames = caller_frames;
+        // Restore caller-visible registers, and the frame map with them,
+        // keeping the callee's in case it suspended.
+        let callee_regs = std::mem::replace(&mut self.registers, caller_regs);
+        let callee_frames = std::mem::replace(&mut self.vsa_frames, caller_frames);
 
         match r {
             ExecResult::Ok(v) | ExecResult::Return(v) => {
@@ -1588,18 +1742,33 @@ impl VM {
                 None
             }
             ExecResult::Error(e) => Some(ExecResult::Error(e)),
-            // Lifting this needs real call frames (the deferred `v2` in
-            // CUBELANG_OPCODES_PLAN.md) so a Suspension can capture the
-            // whole stack, not one function's locals. ASK at the top level
-            // of `solve` works today.
-            ExecResult::Suspend(s) => Some(ExecResult::Error(format!(
-                "ASK inside a CALL is not supported (in {}): the flat \
-                 global-register model cannot capture a callee frame. \
-                 Move the ASK to the top-level function, or implement \
-                 real call frames.",
-                s.function
-            ))),
+            ExecResult::Suspend(mut s) => {
+                let state = FrameState { registers: callee_regs, vsa_frames: callee_frames };
+                match s.callers.last_mut() {
+                    None => s.inner = Some(state),
+                    Some(waiting) => waiting.state = Some(state),
+                }
+                Some(ExecResult::Suspend(s))
+            }
         }
+    }
+
+    /// A callee suspended inside this function's CALL: record where this
+    /// function resumes (`pc` is already past the CALL) and pass the
+    /// suspension up. Its registers are recorded one level up, by the
+    /// `exec_intra_call` that called it -- or stay in the VM when it is the
+    /// host's entry function.
+    fn caller_waits(&self, mut s: Suspension, func: &CompiledFunction, pc: usize, flag: bool,
+                    jump_budget: u64) -> ExecResult {
+        s.callers.push(CallerFrame {
+            program: self.current_program.clone().unwrap_or_default(),
+            function: func.name.clone(),
+            pc,
+            flag,
+            jump_budget,
+            state: None,
+        });
+        ExecResult::Suspend(s)
     }
 
     /// Trace a reasoning/VSA opcode as a well-formed structural step. The

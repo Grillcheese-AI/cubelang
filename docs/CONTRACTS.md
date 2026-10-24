@@ -113,8 +113,6 @@ Key files never go in a repository, a `.cube` file or a request.
 
 ## Not yet
 
-- ASK inside a called function (call frames), and arguments to intra-program calls: today
-  `return helper(x);` returns `Int(0)`, a silent wrong value the call-frame work fixes.
 - Containers (grants declared in source), sealed content (ML-KEM-1024 + X25519, AES-256-GCM), TLS 1.3
   for a remote `run-proto`.
 - For certification (FIPS 140-3), the primitives move to a validated module (aws-lc-rs); the scheme

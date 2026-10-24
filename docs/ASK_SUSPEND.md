@@ -65,7 +65,8 @@ pub struct Suspension {
 ```
 
 `VM::resume(susp, answer)` restores those, pushes the answer onto the stack, and
-re-enters. No call frames, no continuation capture.
+re-enters. When the asker was a called function, the suspension also carries the
+waiting callers (see "ASK inside a CALL" below).
 
 ### The answer arrives on the stack, not the accumulator
 
@@ -129,17 +130,20 @@ question, not an equality one.
 
 ## Honest limitations
 
-**`ASK` inside a `CALL` is rejected.** By the time a callee's suspension reaches
-the `CALL` arm, the caller's registers have been restored and `call_depth`
-unwound; resuming would re-enter the callee with the wrong frame. It fails loudly
-rather than corrupting state:
+**`ASK` inside a `CALL` works (2026-10-24).** It used to be rejected (the
+caller's registers were restored before the suspension reached the host, so a
+resume would have re-entered the callee with the wrong frame). Now the
+suspension carries `callers`: each waiting caller's resume point (the
+instruction after its `CALL`) and its registers, innermost first; the asker's
+own registers ride along when it is a callee. `resume` finishes the asker with
+the answer on the stack, hands each caller its callee's result on the stack (as
+`CALL` does), and continues it. A frame that asks again re-suspends with the
+same chain attached, and the entry function may ask after its callee did.
+`Suspension.function` names the function that asked. Pinned by
+`tests/ask_in_call.rs`, through run-proto's answer replay too.
 
-> `ASK inside a CALL is not supported (in {fn}): the flat global-register model
-> cannot capture a callee frame.`
-
-Lifting this needs the real call frames that `CUBELANG_OPCODES_PLAN.md` already
-defers to v2. `ASK` at the top level of `solve` works — which is where a
-disambiguation belongs anyway.
+So a skill can call a skill that asks: the question reaches the person, and
+the answer comes back to the exact place that needed it.
 
 **The question text does survive compilation.** String literals compile to a
 2-byte hash (`Operand::Global`), but `emit_global` records the real spelling
