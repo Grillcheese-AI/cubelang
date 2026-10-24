@@ -20,7 +20,7 @@ use rand::SeedableRng;
 ///
 /// Built on top of a 64-bit seed. Any string key is hashed to a reproducible
 /// per-symbol seed using a simple FNV-1a mix.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Codebook {
     /// Global seed mixed into per-symbol seeds.
     pub(crate) seed: u64,

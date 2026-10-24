@@ -25,7 +25,7 @@ pub mod interfaces;
 
 // Re-export the engine's public surface so existing `use cubelang::vm::{VM, ...}`
 // call sites keep working after the flat vm.rs -> vm/ split.
-pub use engine::{VM, ExecResult, Suspension, Value};
+pub use engine::{VM, ExecResult, Suspension, Value, VmSnapshot, VsaFrame, RecoverReason, RecoverRecord};
 pub use knowledge::{Fact, KnowledgeStore};
 pub use registry::{ModuleFn, ModuleRegistry, NativeFn, REGISTRY_VERSION};
 pub use interfaces::{InterfaceFn, InterfaceRegistry};

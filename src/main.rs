@@ -583,6 +583,13 @@ fn cmd_run(args: &[String]) {
                     "function": target_fn,
                     "result": value_to_json(&val),
                     "similarity": vm.last_recover_similarity,
+                    "runner_up": vm.last_recover_runner_up,
+                    "recover_reason": vm.last_recover_reason.map(|r| r.as_str()),
+                    "recovers": vm.recovers.iter().map(|r| serde_json::json!({
+                        "reg": r.reg, "role": r.role, "winner": r.winner,
+                        "similarity": r.similarity, "runner_up": r.runner_up,
+                        "margin": r.margin, "pool": r.pool, "reason": r.reason.as_str(),
+                    })).collect::<Vec<_>>(),
                 }));
             } else {
                 println!("  {}.{}() -> {}", prog_name, target_fn, val);
@@ -795,25 +802,124 @@ fn load_knowledge_cached(vm: &mut VM, path: &str) -> Result<(), String> {
 /// never ran the strict verifier `compile --strict` already had for `.cube`
 /// files compiled to disk -- every protobuf request now gets the same
 /// verify-before-execute guarantee.
+/// The branch report: what the VM did, read off its counters. On every
+/// result, ok or not -- a refused or erroring branch still cost what it cost.
+fn branch_report(vm: &VM, branch_id: &str, excluded: &[String], assumed: u32, wall_ms: u32) -> cubelang::reasoning::BranchReport {
+    cubelang::reasoning::BranchReport {
+        branch_id: branch_id.to_string(),
+        ops: vm.ops_executed,
+        jumps: vm.jumps_taken,
+        queried: vm.queried.iter().map(|(k, n)| cubelang::reasoning::Queried { key: k.clone(), hits: *n as u32 }).collect(),
+        excluded: excluded.len() as u32,
+        assumed,
+        excluded_keys: excluded.to_vec(),
+        max_jumps: vm.jump_budget,
+        budget: Some(cubelang::reasoning::Budget {
+            max_jumps: vm.jump_budget,
+            max_ops: vm.op_budget,
+            max_queries: vm.query_budget as u32,
+            max_wall_ms: vm.wall_budget_ms,
+        }),
+        wall_ms,
+        recovers: vm.recovers.iter().map(|r| cubelang::reasoning::Recover {
+            reg: r.reg.clone(),
+            role: r.role.clone(),
+            winner: r.winner.clone().unwrap_or_default(),
+            similarity: r.similarity,
+            runner_up: r.runner_up,
+            margin: r.margin,
+            pool: r.pool as u32,
+            reason: recover_reason_wire(r.reason) as i32,
+        }).collect(),
+    }
+}
+
+/// The VM's closed reason enum onto the wire's.
+fn recover_reason_wire(r: cubelang::vm::engine::RecoverReason) -> cubelang::reasoning::RecoverReason {
+    use cubelang::reasoning::RecoverReason as W;
+    use cubelang::vm::engine::RecoverReason as R;
+    match r {
+        R::Recovered => W::Recovered,
+        R::AbsentRole => W::AbsentRole,
+        R::NoFrame => W::NoFrame,
+        R::EmptyPool => W::EmptyPool,
+    }
+}
+
+/// Apply `req.budget` to the VM (VM step 0): every field is "unlimited"
+/// when zero. `Budget.max_jumps` supersedes the older `Branch.max_jumps`.
+fn apply_budget(vm: &mut VM, budget: &Option<cubelang::reasoning::Budget>) {
+    let Some(b) = budget else { return };
+    if b.max_jumps > 0 { vm.jump_budget = b.max_jumps; }
+    vm.op_budget = b.max_ops;
+    vm.query_budget = b.max_queries as u64;
+    vm.wall_budget_ms = b.max_wall_ms;
+    if b.max_wall_ms > 0 {
+        vm.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(b.max_wall_ms as u64));
+    }
+}
+
+/// Apply `req.branch` to the VM's (cloned) store: exclusions first, then
+/// assumptions, so an assumed fact under an excluded key survives (the branch
+/// said both, and the later word wins). Returns (excluded keys, assumed facts).
+fn apply_branch(vm: &mut VM, branch: &Option<cubelang::reasoning::Branch>) -> Result<(Vec<String>, u32), String> {
+    let Some(b) = branch else { return Ok((Vec::new(), 0)) };
+    if b.max_jumps > 0 {
+        vm.jump_budget = b.max_jumps;
+    }
+    // echoed back as applied: the normalized key once for itself and once per alias it took with it,
+    // so `excluded.len()` keeps counting aliases and a key that matched nothing is visibly absent
+    let mut excluded: Vec<String> = Vec::new();
+    for key in &b.exclude {
+        let n = vm.knowledge.remove(key);
+        for _ in 0..n {
+            excluded.push(cubelang::vm::knowledge::normalize(key));
+        }
+    }
+    let mut assumed = 0u32;
+    if !b.assume.is_empty() {
+        let data = b.assume.join("\n");
+        let (facts, aliases) = vm.knowledge.load_jsonl(&data)
+            .map_err(|e| format!("branch {}: assume: {}", b.id, e))?;
+        assumed = (facts + aliases) as u32;
+    }
+    Ok((excluded, assumed))
+}
+
+/// A non-ok `RunResult`: the error, the report, and every side-channel
+/// unset (`similarity`, `runner_up`, `recover_reason` -- a number that
+/// described an earlier recover must not sit beside `ok:false`).
+fn error_result(e: String, report: Option<cubelang::reasoning::BranchReport>) -> RunResult {
+    RunResult { ok: false, result: Some(run_result::Result::Error(e)), report, ..Default::default() }
+}
+
 fn run_request_result(req: RunRequest) -> RunResult {
+    let branch_id = req.branch.as_ref().map(|b| b.id.clone()).unwrap_or_default();
     let programs = match compiler::compile_strict(&req.program) {
         Ok(p) => p,
-        Err(e) => return RunResult { ok: false, result: Some(run_result::Result::Error(e.to_string())), similarity: None },
+        Err(e) => return error_result(e.to_string(), Some(branch_report(&VM::new(), &branch_id, &[], 0, 0))),
     };
     if programs.is_empty() {
-        return RunResult {
-            ok: false,
-            result: Some(run_result::Result::Error("no programs in request".to_string())),
-            similarity: None,
-        };
+        return error_result("no programs in request".to_string(),
+                            Some(branch_report(&VM::new(), &branch_id, &[], 0, 0)));
     }
 
     let mut vm = VM::new();
     if !req.knowledge_path.is_empty() {
         if let Err(e) = load_knowledge_cached(&mut vm, &req.knowledge_path) {
-            return RunResult { ok: false, result: Some(run_result::Result::Error(e)), similarity: None };
+            return error_result(e, Some(branch_report(&vm, &branch_id, &[], 0, 0)));
         }
     }
+    let (excluded, assumed) = match apply_branch(&mut vm, &req.branch) {
+        Ok(n) => n,
+        Err(e) => return error_result(e, Some(branch_report(&vm, &branch_id, &[], 0, 0))),
+    };
+    // The budget clock starts here: the store is loaded and the branch
+    // applied; what follows is the program's own work.
+    let started = std::time::Instant::now();
+    apply_budget(&mut vm, &req.budget);
+    let report = |vm: &VM| Some(branch_report(vm, &branch_id, &excluded, assumed,
+                                              started.elapsed().as_millis().min(u32::MAX as u128) as u32));
     let prog_name = load_programs(&mut vm, programs);
     let call_args: Vec<Value> = req.args.into_iter().map(Value::Str).collect();
 
@@ -835,24 +941,19 @@ fn run_request_result(req: RunRequest) -> RunResult {
                     program: susp.program.clone(),
                     function: susp.function.clone(),
                 };
-                return RunResult { ok: true, result: Some(run_result::Result::Suspended(suspended)), similarity: None };
+                return RunResult { ok: true, result: Some(run_result::Result::Suspended(suspended)),
+                                   report: report(&vm), ..Default::default() };
             }
             Some(raw) => {
                 let parsed = match serde_json::from_str::<serde_json::Value>(&raw) {
                     Ok(j) => j,
-                    Err(e) => return RunResult {
-                        ok: false,
-                        result: Some(run_result::Result::Error(format!("resume: answer is not JSON ({}): {}", raw, e))),
-                        similarity: None,
-                    },
+                    Err(e) => return error_result(
+                        format!("resume: answer is not JSON ({}): {}", raw, e), report(&vm)),
                 };
                 let answer = match json_to_value(&parsed) {
                     Ok(v) => v,
-                    Err(e) => return RunResult {
-                        ok: false,
-                        result: Some(run_result::Result::Error(format!("resume: bad answer {}: {}", raw, e))),
-                        similarity: None,
-                    },
+                    Err(e) => return error_result(
+                        format!("resume: bad answer {}: {}", raw, e), report(&vm)),
                 };
                 exec_result = vm.resume(susp, answer);
             }
@@ -862,12 +963,16 @@ fn run_request_result(req: RunRequest) -> RunResult {
     // it's VM state the call itself populates. "The last recover in this
     // run" is well-defined here -- this function builds a fresh `VM::new()`
     // per request (above) and the reasoning program does exactly one
-    // `recover` per function.
+    // `recover` per function. VM step 0 adds the runner-up and the reason
+    // beside it; `report.recovers` has every hop.
     let similarity = vm.last_recover_similarity;
+    let runner_up = vm.last_recover_runner_up;
+    let recover_reason = vm.last_recover_reason.map(|r| recover_reason_wire(r) as i32);
 
     match exec_result {
         ExecResult::Ok(val) | ExecResult::Return(val) => {
-            RunResult { ok: true, result: value_to_run_result(&val), similarity }
+            RunResult { ok: true, result: value_to_run_result(&val), similarity, runner_up, recover_reason,
+                        report: report(&vm) }
         }
         // Task 8 (folded-in Minor from Task 7's review): both non-ok arms
         // below now hardcode `similarity: None` instead of threading through
@@ -883,13 +988,9 @@ fn run_request_result(req: RunRequest) -> RunResult {
             // resumes) for every Suspend before this match runs. Kept as an
             // honest arm rather than an `unreachable!()` so a future refactor
             // that bypasses the loop still reports rather than panics.
-            RunResult {
-                ok: false,
-                result: Some(run_result::Result::Error("suspended after the answers loop (internal)".to_string())),
-                similarity: None,
-            }
+            error_result("suspended after the answers loop (internal)".to_string(), report(&vm))
         }
-        ExecResult::Error(e) => RunResult { ok: false, result: Some(run_result::Result::Error(e)), similarity: None },
+        ExecResult::Error(e) => error_result(e, report(&vm)),
     }
 }
 
@@ -975,8 +1076,11 @@ fn load_programs(vm: &mut VM, programs: Vec<CompiledProgram>) -> String {
 /// two-call sequence `cmd_run` and `run-proto` both need, factored out so it
 /// can't drift between the two transports.
 fn call_with_constructor(vm: &mut VM, program: &str, function: &str, args: Vec<Value>) -> ExecResult {
+    // The runtime runs the constructor (`@system @once` is written for it);
+    // the target is the HOST's entry, so its access attribute is enforced
+    // (VM step 0: `@internal` / `@system` refused at the door).
     let _ = vm.call(program, "constructor", Vec::new());
-    vm.call(program, function, args)
+    vm.call_entry(program, function, args)
 }
 
 fn load_cubebin(path: &str) -> CompiledProgram {

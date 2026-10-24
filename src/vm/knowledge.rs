@@ -113,6 +113,32 @@ impl KnowledgeStore {
         }
     }
 
+    /// Branch support (2026-09-28, the counterfactual fork): take a key OUT of
+    /// this store, and every alias that carried the same facts, so a QUERY for
+    /// it abstains (an empty chunk array) exactly as it would for a name the
+    /// store never held. Returns how many keys were removed. Used on the CLONE
+    /// a `run-proto` request gets, never on the cached original: "X did not
+    /// happen" lives in one branch's VM and nowhere else.
+    pub fn remove(&mut self, key: &str) -> usize {
+        let k = normalize(key);
+        let Some(gone) = self.facts.remove(&k) else { return 0 };
+        let same = |v: &Vec<Fact>| {
+            v.len() == gone.len()
+                && v.iter().zip(&gone).all(|(a, b)| a.text == b.text && a.source == b.source)
+        };
+        let aliases: Vec<String> = self.facts.iter()
+            .filter(|(_, v)| same(v)).map(|(k, _)| k.clone()).collect();
+        for a in &aliases {
+            self.facts.remove(a);
+        }
+        1 + aliases.len()
+    }
+
+    /// Every normalized key the store holds (for the branch report and tests).
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.facts.keys().map(String::as_str)
+    }
+
     /// Exact lookup. An empty slice means "no fact carries this name" — the
     /// honest gap. Never a nearest neighbour.
     pub fn lookup(&self, mention: &str) -> &[Fact] {

@@ -26,6 +26,7 @@ pub struct MemoryTrace {
 /// - `traces`    : id -> (key, payload). `None` for forgotten slots.
 /// - `by_key`    : exact-key -> id, so STORE under an existing key overwrites
 ///                 rather than appending a duplicate.
+#[derive(Clone)]
 pub struct HippocampalMemory {
     codebook: Codebook,
     index: HammingIndex,

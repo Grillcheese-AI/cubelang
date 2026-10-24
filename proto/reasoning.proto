@@ -22,6 +22,74 @@ message RunRequest {
   // pays for one parse, and the wire stays small. Empty => no knowledge,
   // every QUERY abstains (an empty chunk array) -- correct, not useful.
   string knowledge_path = 5;
+  // The branch (2026-09-28, the counterfactual fork at the wire): applied to
+  // this request's CLONE of the knowledge store before the call, so "X did
+  // not happen" lives in one branch's VM and nowhere else. The host
+  // enumerates branches (one request each, each a fresh VM), the VM runs
+  // each in isolation and reports what it did (`RunResult.report`).
+  Branch branch = 6;
+  // Budgets on the request (2026-09-29, VM step 0): what this run may spend,
+  // set by the harness from the frame. A zero field is "unlimited" (jumps:
+  // the VM default of 1,000,000, which is not a budget for a live turn).
+  // Exceeding one is an error naming it, never a truncated answer.
+  Budget budget = 7;
+}
+
+message Branch {
+  string id = 1;                 // the host's name for the branch; echoed in the report
+  repeated string exclude = 2;   // keys to take out of the store (with their aliases)
+  repeated string assume = 3;    // facts to add, one knowledge .jsonl line each ({key, text, source} or {alias, of})
+  uint64 max_jumps = 4;          // this run's jump budget; 0 = the VM default (1,000,000). Superseded by Budget.max_jumps when that is set
+}
+
+message Budget {
+  uint64 max_jumps = 1;          // per function entry (the loop guard); 0 = the VM default
+  uint64 max_ops = 2;            // opcodes for the whole run, constructor included; 0 = unlimited
+  uint32 max_queries = 3;        // QUERYs for the whole run; 0 = unlimited
+  uint32 max_wall_ms = 4;        // wall clock for the whole run; 0 = unlimited
+}
+
+// What a branch did, beside what it returned: the report the host compares
+// branches by. Present on every result, ok or not.
+message BranchReport {
+  string branch_id = 1;
+  uint64 ops = 2;                // opcodes executed
+  uint64 jumps = 3;              // jumps taken (of the 1,000,000 budget)
+  repeated Queried queried = 4;  // every QUERY, in order: the facts the run touched
+  uint32 excluded = 5;           // keys removed by the branch (aliases counted)
+  uint32 assumed = 6;            // facts added by the branch
+  repeated string excluded_keys = 7; // the exclusions that matched a key, echoed back: a silently dropped one is visible
+  uint64 max_jumps = 8;          // the budget this run had
+  // VM step 0 (2026-09-29):
+  Budget budget = 9;             // the budgets this run had, as applied
+  uint32 wall_ms = 10;           // wall clock the run took, compile excluded
+  repeated Recover recovers = 11; // every UNBIND / recover(), in order, with its runner-up and reason
+}
+
+message Queried {
+  string key = 1;
+  uint32 hits = 2;               // 0 = the store abstained
+}
+
+// Why a recover returned what it did. Closed: the host switches on it.
+enum RecoverReason {
+  RECOVERED = 0;                 // a candidate won; read similarity and margin
+  ABSENT_ROLE = 1;               // the role was never bound in that frame: Null, structurally, no similarity computed
+  NO_FRAME = 2;                  // the register holds no hypervector
+  EMPTY_POOL = 3;                // nothing to clean up against
+}
+
+// One UNBIND / recover() hop. `margin` = similarity - runner_up: near zero
+// is a near-tie the host must not speak as a recovery, whatever tau says.
+message Recover {
+  string reg = 1;                // the frame register: its declared name where the VM's name table knows it (a parameter, a bind symbol), else its hashed key (r_xxxx)
+  string role = 2;
+  string winner = 3;             // empty unless RECOVERED
+  optional double similarity = 4;
+  optional double runner_up = 5; // unset when the pool had one candidate
+  optional double margin = 6;
+  uint32 pool = 7;               // candidates considered
+  RecoverReason reason = 8;
 }
 
 // The third outcome. Neither a result nor an error: the program grounded
@@ -51,4 +119,11 @@ message RunResult {
   // "no winning match" (unset) is distinguishable from "matched with
   // similarity 0.0".
   optional double similarity = 4;
+  BranchReport report = 6;
+  // VM step 0 (2026-09-29): the runner-up behind `similarity` and the reason
+  // of the last recover, beside it -- the one-recover-per-function case
+  // without walking `report.recovers`. Both unset when nothing recovered,
+  // and both `None` on a non-ok result, like `similarity`.
+  optional double runner_up = 7;
+  optional RecoverReason recover_reason = 8;
 }

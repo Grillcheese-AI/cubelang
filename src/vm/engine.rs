@@ -3,8 +3,8 @@
 //! The VM maintains registers, a stack, and storage. It decodes
 //! bytecodes instruction-by-instruction and executes them.
 
-use std::collections::HashMap;
-use crate::compiler::{CompiledProgram, CompiledFunction, op};
+use std::collections::{HashMap, HashSet};
+use crate::compiler::{CompiledProgram, CompiledFunction, Access, op};
 use crate::vm::memory::HippocampalMemory;
 use crate::vm::codebook::Codebook;
 use crate::vm::hypervec::Hypervec;
@@ -171,7 +171,12 @@ pub struct VM {
     /// Kept beside `registers` and given the same lifetime: `exec_intra_call`
     /// takes and restores both together, so a callee's bindings cannot leak
     /// into the caller's frames.
-    vsa_frames: HashMap<String, Vec<String>>,
+    ///
+    /// VM step 0 (2026-09-29): the frame also records its ROLES, so an absent
+    /// role is a structural fact (`RecoverReason::AbsentRole`, Null before any
+    /// similarity is computed) rather than a low number the tau thresholds
+    /// have to catch. See `vsa_unbind_cleanup_known`.
+    vsa_frames: HashMap<String, VsaFrame>,
     /// Accumulator (SUM results).
     pub accumulator: Value,
     /// Event log.
@@ -204,6 +209,108 @@ pub struct VM {
     /// a fresh `VM::new()` per request and the reasoning program does
     /// exactly one `recover` per function.
     pub last_recover_similarity: Option<f64>,
+    /// Branch report (2026-09-28): opcodes executed in this VM, over every
+    /// function it ran. What the host reads to compare branches by the work
+    /// they did, not only by what they returned.
+    pub ops_executed: u64,
+    /// Branch report: jumps taken (the part of the 1,000,000 budget spent).
+    pub jumps_taken: u64,
+    /// Branch report: every QUERY this VM made, in order -- the mention as
+    /// asked, and how many facts the store held for it (0 = it abstained).
+    /// Facts touched, by name: the provenance a branch's answer rests on.
+    pub queried: Vec<(String, usize)>,
+    /// The per-run jump budget (2026-09-28): the harness sets it from the
+    /// frame; 1,000,000 by default, which is not a budget for a live turn but
+    /// is what every earlier program ran under.
+    pub jump_budget: u64,
+    /// VM step 0 (2026-09-29), budgets on the request: opcodes this run may
+    /// execute (0 = unlimited), QUERYs it may make (0 = unlimited), and the
+    /// instant after which the next opcode is refused (None = no wall
+    /// budget). The harness sets all three from the frame; exceeding one is
+    /// an `ExecResult::Error` naming it, never a silent truncation.
+    pub op_budget: u64,
+    pub query_budget: u64,
+    pub deadline: Option<std::time::Instant>,
+    /// The wall budget as requested, for the report (the deadline is derived).
+    pub wall_budget_ms: u32,
+    /// Every UNBIND / `recover()` this VM did, in order, with the runner-up
+    /// and the reason -- what the branch report carries per hop.
+    pub recovers: Vec<RecoverRecord>,
+    /// The runner-up similarity behind `last_recover_similarity` (None when
+    /// the pool had one candidate or nothing was recovered).
+    pub last_recover_runner_up: Option<f64>,
+    /// Why the last recover returned what it did; None before any recover.
+    pub last_recover_reason: Option<RecoverReason>,
+    /// `@once` functions that have already run in this VM (`program.fn`).
+    once_called: HashSet<String>,
+}
+
+/// What went into a frame register through BIND_ROLE, in bind order and
+/// deduplicated: the roles, so an absent role is a structural fact, and the
+/// fillers, which are the cleanup pool.
+#[derive(Debug, Clone, Default)]
+pub struct VsaFrame {
+    pub roles: Vec<String>,
+    pub fillers: Vec<String>,
+}
+
+/// Why a recover returned what it returned. Closed: the host switches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverReason {
+    /// A candidate won; `similarity` says how well and `margin` how clearly.
+    Recovered,
+    /// The role is not among the frame's bound roles: Null, structurally,
+    /// before any similarity is computed. The threshold guards only crosstalk
+    /// among roles that ARE present.
+    AbsentRole,
+    /// The register holds no hypervector (nothing was ever bound there).
+    NoFrame,
+    /// There was nothing to clean up against.
+    EmptyPool,
+}
+
+impl RecoverReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoverReason::Recovered => "recovered",
+            RecoverReason::AbsentRole => "absent_role",
+            RecoverReason::NoFrame => "no_frame",
+            RecoverReason::EmptyPool => "empty_pool",
+        }
+    }
+}
+
+/// One UNBIND / `recover()` hop as the branch report carries it: the winner
+/// and its similarity, the runner-up's similarity and the margin between
+/// them, the pool size, and the reason. A margin near zero is a near-tie the
+/// host must not speak as a recovery even when the winner clears tau.
+#[derive(Debug, Clone)]
+pub struct RecoverRecord {
+    pub reg: String,
+    pub role: String,
+    pub winner: Option<String>,
+    pub similarity: Option<f64>,
+    pub runner_up: Option<f64>,
+    pub margin: Option<f64>,
+    pub pool: usize,
+    pub reason: RecoverReason,
+}
+
+/// Everything `VM::snapshot` captures and `VM::restore` puts back: the
+/// program-visible state (registers, stack, storage, the associative memory,
+/// the frames, the accumulator) and the knowledge store. NOT the logs (events,
+/// trace) and not the counters: a restored branch still happened, and the
+/// report says so. The in-language `ctx.snapshot/restore/fork/discard` the
+/// SPEC describes will sit on these two methods; today the host calls them.
+#[derive(Clone)]
+pub struct VmSnapshot {
+    registers: HashMap<String, Value>,
+    stack: Vec<Value>,
+    storage: HashMap<String, Value>,
+    memory: HippocampalMemory,
+    vsa_frames: HashMap<String, VsaFrame>,
+    accumulator: Value,
+    knowledge: crate::vm::knowledge::KnowledgeStore,
 }
 
 /// Conservative recursion cap. exec_function has a sizeable per-frame
@@ -233,6 +340,18 @@ impl VM {
             knowledge: crate::vm::knowledge::KnowledgeStore::new(),
             registry: crate::vm::registry::ModuleRegistry::new(),
             last_recover_similarity: None,
+            ops_executed: 0,
+            jumps_taken: 0,
+            queried: Vec::new(),
+            jump_budget: 1_000_000,
+            op_budget: 0,
+            query_budget: 0,
+            deadline: None,
+            wall_budget_ms: 0,
+            recovers: Vec::new(),
+            last_recover_runner_up: None,
+            last_recover_reason: None,
+            once_called: HashSet::new(),
         };
         // Task 3: pre-register every registry function name into the
         // hash-reversal table, regardless of which modules any given
@@ -247,6 +366,32 @@ impl VM {
             vm.register_name(name);
         }
         vm
+    }
+
+    /// Capture the program-visible state and the knowledge store. Cheap
+    /// enough for a branch per request (a clone of the maps and the memory).
+    pub fn snapshot(&self) -> VmSnapshot {
+        VmSnapshot {
+            registers: self.registers.clone(),
+            stack: self.stack.clone(),
+            storage: self.storage.clone(),
+            memory: self.memory.clone(),
+            vsa_frames: self.vsa_frames.clone(),
+            accumulator: self.accumulator.clone(),
+            knowledge: self.knowledge.clone(),
+        }
+    }
+
+    /// Put a snapshot back. Logs and counters are kept: a discarded branch
+    /// still ran, and the report keeps what it cost.
+    pub fn restore(&mut self, snap: VmSnapshot) {
+        self.registers = snap.registers;
+        self.stack = snap.stack;
+        self.storage = snap.storage;
+        self.memory = snap.memory;
+        self.vsa_frames = snap.vsa_frames;
+        self.accumulator = snap.accumulator;
+        self.knowledge = snap.knowledge;
     }
 
     /// Resume a program suspended by ASK, supplying the caller's answer.
@@ -406,6 +551,27 @@ impl VM {
         result
     }
 
+    /// The HOST's entry into a program (VM step 0, 2026-09-29): `call` with
+    /// the access attributes enforced. `@internal` is "only callable by this
+    /// program" and `@system` is "only callable by the VM runtime", so a
+    /// request naming either as its entry function is refused here, before
+    /// anything runs. The runtime's own constructor call goes through
+    /// `call`/`init`, which is the runtime. A function with no attribute is
+    /// callable, as it always was.
+    pub fn call_entry(&mut self, program: &str, function: &str, args: Vec<Value>) -> ExecResult {
+        let access = self.programs.get(program)
+            .and_then(|p| p.functions.iter().find(|f| f.name == function))
+            .map(|f| f.access);
+        match access {
+            Some(Access::Internal) => return ExecResult::Error(format!(
+                "{}.{} is @internal: not callable from outside the program", program, function)),
+            Some(Access::System) => return ExecResult::Error(format!(
+                "{}.{} is @system: only the VM runtime may call it", program, function)),
+            _ => {}
+        }
+        self.call(program, function, args)
+    }
+
     /// Run the constructor of a program.
     pub fn init(&mut self, program: &str) -> ExecResult {
         self.call(program, "constructor", Vec::new())
@@ -424,20 +590,44 @@ impl VM {
         let mut flag: bool = false;
         // Loop-iteration guard: bound total back-edges to prevent infinite
         // loops from a malformed / non-terminating program reaching the VM.
-        let mut jump_budget: u64 = 1_000_000;
+        let mut jump_budget: u64 = self.jump_budget;
 
         // Resuming a suspended program: restore the interpreter locals that
         // `Suspension` captured. Registers/storage/memory/accumulator are
         // VM-global and were never lost. `pc` already points PAST the ASK
         // instruction, so execution continues with the answer in scope.
+        let resuming = self.resume_state.is_some();
         if let Some(r) = self.resume_state.take() {
             pc = r.pc;
             flag = r.flag;
             jump_budget = r.jump_budget;
         }
 
+        // `@once` (VM step 0): a second entry into a once-function in this VM
+        // is an error, not a re-run. A resume re-enters the SAME run and is
+        // not a second call.
+        if func.once && !resuming {
+            let key = format!("{}.{}", self.current_program.clone().unwrap_or_default(), func.name);
+            if !self.once_called.insert(key.clone()) {
+                return ExecResult::Error(format!("{} is @once and has already run in this VM", key));
+            }
+        }
+
         while pc < bc.len() {
             let opcode = bc[pc]; pc += 1;
+            self.ops_executed += 1;
+
+            // Budgets on the request (VM step 0). Checked before the opcode
+            // runs, so an exhausted budget never half-executes a step.
+            if self.op_budget > 0 && self.ops_executed > self.op_budget {
+                return ExecResult::Error(format!(
+                    "op budget exhausted ({} opcodes)", self.op_budget));
+            }
+            if let Some(deadline) = self.deadline {
+                if self.ops_executed & 0x3f == 0 && std::time::Instant::now() > deadline {
+                    return ExecResult::Error("wall budget exhausted".into());
+                }
+            }
 
             // SKIP / NOP
             if opcode == op::SKIP {
@@ -726,6 +916,12 @@ impl VM {
                         // so `query "printing press";` works as a literal
                         _ => self.resolve_symbol_name(operands.get(0)),
                     };
+                    // Query budget (VM step 0): refused before the lookup, so
+                    // the store is never read past what the frame allowed.
+                    if self.query_budget > 0 && self.queried.len() as u64 >= self.query_budget {
+                        return ExecResult::Error(format!(
+                            "query budget exhausted ({} queries)", self.query_budget));
+                    }
 
                     let chunks: Vec<Value> = self
                         .knowledge
@@ -745,6 +941,7 @@ impl VM {
 
                     self.trace_op(pc, &format!(
                         "QUERY {:?} -> {} chunk(s)", mention, chunks.len()));
+                    self.queried.push((mention.clone(), chunks.len()));
                     self.stack.push(Value::Array(chunks));
                 }
 
@@ -932,6 +1129,7 @@ impl VM {
                                 return ExecResult::Error("jump budget exhausted (possible infinite loop)".into());
                             }
                             jump_budget -= 1;
+                            self.jumps_taken += 1;
                             pc = target;
                         }
                         None => {
@@ -952,6 +1150,7 @@ impl VM {
                                     return ExecResult::Error("jump budget exhausted (possible infinite loop)".into());
                                 }
                                 jump_budget -= 1;
+                                self.jumps_taken += 1;
                                 pc = target;
                             }
                             None => {
@@ -1126,7 +1325,17 @@ impl VM {
                             self.registers.insert(reg, Value::Str(sym));
                         }
                         None => {
-                            self.trace_op(pc, &format!("UNBIND {} {} → (no hvec)", reg, role));
+                            // VM step 0: an absent role leaves Null in the
+                            // register, structurally -- the register no longer
+                            // holds the frame, and a later read sees Null, not
+                            // a hypervector that resolves to 0. A register
+                            // that never held a frame is left untouched.
+                            let reason = self.last_recover_reason
+                                .map(|r| r.as_str()).unwrap_or("no hvec");
+                            self.trace_op(pc, &format!("UNBIND {} {} → Null ({})", reg, role, reason));
+                            if self.last_recover_reason == Some(RecoverReason::AbsentRole) {
+                                self.registers.insert(reg, Value::Null);
+                            }
                         }
                     }
                 }
@@ -1493,10 +1702,56 @@ impl VM {
         // scoped to it. Deduplicated and order-preserving -- the order is the
         // tie-break when two candidates score identically, and bind order is
         // the least surprising one.
-        let seen = self.vsa_frames.entry(reg.to_string()).or_default();
-        if !seen.iter().any(|f| f == filler) {
-            seen.push(filler.to_string());
+        let frame = self.vsa_frames.entry(reg.to_string()).or_default();
+        if !frame.fillers.iter().any(|f| f == filler) {
+            frame.fillers.push(filler.to_string());
         }
+        // VM step 0: the roles too, so "was this role ever bound here" is a
+        // lookup, not a similarity.
+        if !frame.roles.iter().any(|r| r == role) {
+            frame.roles.push(role.to_string());
+        }
+    }
+
+    /// The roles bound into `reg` so far (empty for a register with no
+    /// recorded frame). What `vsa_unbind_cleanup_known` consults before it
+    /// computes anything.
+    pub fn frame_roles(&self, reg: &str) -> Vec<String> {
+        self.vsa_frames.get(reg).map(|f| f.roles.clone()).unwrap_or_default()
+    }
+
+    /// The register's declared name where the name table knows it, else the
+    /// hashed key itself -- for the report, which a person reads.
+    fn readable_reg(&self, reg: &str) -> String {
+        let hex = reg.strip_prefix("r_").or_else(|| reg.strip_prefix("g_"));
+        let Some(hex) = hex else { return reg.to_string() };
+        if hex.len() != 4 { return reg.to_string() }
+        let (Ok(a), Ok(b)) = (u8::from_str_radix(&hex[..2], 16), u8::from_str_radix(&hex[2..], 16)) else {
+            return reg.to_string();
+        };
+        self.name_table.get(&[a, b]).cloned().unwrap_or_else(|| reg.to_string())
+    }
+
+    fn record_recover(&mut self, reg: &str, role: &str, winner: Option<&str>,
+                      similarity: Option<f64>, runner_up: Option<f64>, pool: usize,
+                      reason: RecoverReason) {
+        let margin = match (similarity, runner_up) {
+            (Some(s), Some(r)) => Some(s - r),
+            _ => None,
+        };
+        self.last_recover_similarity = similarity;
+        self.last_recover_runner_up = runner_up;
+        self.last_recover_reason = Some(reason);
+        self.recovers.push(RecoverRecord {
+            reg: self.readable_reg(reg),
+            role: role.to_string(),
+            winner: winner.map(str::to_string),
+            similarity,
+            runner_up,
+            margin,
+            pool,
+            reason,
+        });
     }
 
     /// UNBIND + cleanup: recover the filler bound to `role` in register `reg`.
@@ -1521,22 +1776,36 @@ impl VM {
         let bound = match self.registers.get(reg) {
             Some(Value::Hvec(h)) => h.clone(),
             _ => {
-                self.last_recover_similarity = None;
+                self.record_recover(reg, role, None, None, None, candidates.len(), RecoverReason::NoFrame);
                 return None;
             }
         };
+        if candidates.is_empty() {
+            self.record_recover(reg, role, None, None, None, 0, RecoverReason::EmptyPool);
+            return None;
+        }
         let rv = self.vsa_role_vec(role);
         let recovered = bound.unbind(&rv);
+        // VM step 0: keep the runner-up too. The margin between the two is
+        // what tells a clean recovery from a near-tie the threshold alone
+        // would let through.
         let mut best: Option<(String, f64)> = None;
+        let mut second: Option<f64> = None;
         for &cand in candidates {
             let cv = self.vsa_symbol_vec(cand);
             let sim = recovered.cosine_sim(&cv);
             match &best {
-                Some((_, bs)) if *bs >= sim => {}
-                _ => best = Some((cand.to_string(), sim)),
+                Some((_, bs)) if *bs >= sim => {
+                    if second.map_or(true, |s| sim > s) { second = Some(sim); }
+                }
+                _ => {
+                    if let Some((_, bs)) = &best { second = Some(*bs); }
+                    best = Some((cand.to_string(), sim));
+                }
             }
         }
-        self.last_recover_similarity = best.as_ref().map(|(_, sim)| *sim);
+        let (winner, sim) = best.as_ref().map(|(w, s)| (w.as_str(), *s)).unzip();
+        self.record_recover(reg, role, winner, sim, second, candidates.len(), RecoverReason::Recovered);
         best
     }
 
@@ -1571,12 +1840,25 @@ impl VM {
     /// `vsa_bind_into`, where scoping to an empty pool would silently turn a
     /// working recovery into `None`. Narrowing behaviour is worth having; a
     /// silent regression to Null is not.
+    ///
+    /// **VM step 0 (2026-09-29), the absent role is structural.** A register
+    /// with a recorded frame answers "was `role` ever bound here" by lookup
+    /// BEFORE any unbind: not among the frame's roles => `None`, reason
+    /// `AbsentRole`, no similarity computed. The tau thresholds now guard
+    /// only crosstalk among roles that are present. The global-pool fallback
+    /// above has no role record, so it keeps the old behaviour (a similarity
+    /// the caller must read).
     pub fn vsa_unbind_cleanup_known(&mut self, reg: &str, role: &str) -> Option<(String, f64)> {
-        let scoped = self.vsa_frames.get(reg).cloned().unwrap_or_default();
-        let candidates: Vec<String> = if scoped.is_empty() {
+        let frame = self.vsa_frames.get(reg).cloned().unwrap_or_default();
+        if !frame.roles.is_empty() && !frame.roles.iter().any(|r| r == role) {
+            let pool = frame.fillers.len();
+            self.record_recover(reg, role, None, None, None, pool, RecoverReason::AbsentRole);
+            return None;
+        }
+        let candidates: Vec<String> = if frame.fillers.is_empty() {
             self.name_table.values().cloned().collect()
         } else {
-            scoped
+            frame.fillers
         };
         let cand_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
         self.vsa_unbind_cleanup(reg, role, &cand_refs)
@@ -2772,6 +3054,8 @@ mod vsa_opcode_wiring_tests {
             labels: Vec::new(),
             debug_lines: Vec::new(),
             is_override: false,
+            access: Access::External,
+            once: false,
         };
         let prog = CompiledProgram {
             name: "T".to_string(),

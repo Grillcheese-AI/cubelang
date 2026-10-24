@@ -46,18 +46,21 @@ This is how programs hook into each other's lifecycle safely.
 
 ### Permission Modifiers
 
-| Permission | Meaning |
-|-----------|---------|
-| `@external` | Callable by other programs and outside requests (API, user) |
-| `@internal` | Only callable by this program or programs it explicitly grants |
-| `@system` | Only callable by the VM runtime (lifecycle hooks) |
-| `@hook(ProgramName.event)` | Triggered when another program emits an event |
-| `@before(fn_name)` | Runs before the named function (middleware) |
-| `@after(fn_name)` | Runs after the named function (middleware) |
-| `@cron(interval)` | Triggered on a schedule by the VM |
-| `@once` | Can only be called a single time (constructor-like) |
-| `@restricted(programs)` | Only callable by the listed programs |
-| `@ratelimit(n, period)` | Max n calls per period |
+| Permission | Meaning | Enforced today |
+|-----------|---------|----------------|
+| `@external` | Callable by other programs and outside requests (API, user) | yes (the default for an unmarked function) |
+| `@internal` | Only callable by this program or programs it explicitly grants | yes: refused as the host's entry (`run-proto`, `run`) |
+| `@system` | Only callable by the VM runtime (lifecycle hooks) | yes: refused as the host's entry; the runtime calls the constructor |
+| `@hook(ProgramName.event)` | Triggered when another program emits an event | no -- strict compile error (`--loose` accepts) |
+| `@before(fn_name)` | Runs before the named function (middleware) | no -- strict compile error |
+| `@after(fn_name)` | Runs after the named function (middleware) | no -- strict compile error |
+| `@cron(interval)` | Triggered on a schedule by the VM | no -- strict compile error |
+| `@once` | Can only be called a single time (constructor-like) | yes: a second run in the same VM is an error |
+| `@restricted(programs)` | Only callable by the listed programs | not parsed |
+| `@ratelimit(n, period)` | Max n calls per period | not parsed |
+
+An attribute the VM cannot honour is an error under strict (the serve path), not a decoration:
+advertised-and-unenforced is worse than absent (VM step 0, 2026-09-29, `docs/STEP0.md`).
 
 ### Usage
 
@@ -334,6 +337,10 @@ let batch: array<emb> = embed_batch(sentences, model: "bge-small");
 ```
 
 ### ctx — Execution Context
+
+> **As built (2026-09-28):** `ctx.snapshot/restore/fork/merge/discard` are not implemented in the language; the VM exposes `VM::snapshot()` / `VM::restore()` as methods, and the counterfactual fork is a `Branch` on the `run-proto` RunRequest with a `BranchReport` on every result — see `docs/BRANCH.md`. The rest of this section is the intended design.
+>
+> **VM step 0 (2026-09-29):** an absent role recovers as Null structurally (reason `absent_role`, no similarity computed); the request carries a `Budget` (ops, queries, wall, jumps) the VM refuses to cross; every recover is reported with its runner-up, margin and reason; the attributes the VM does not honour are strict errors — see `docs/STEP0.md`.
 
 The current state of everything the VM knows. `ctx` is the living snapshot of
 registers, stack, storage, conversation history, active programs, user identity,
