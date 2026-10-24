@@ -78,6 +78,18 @@ One writer at a time.
   per turn), `search DIR WORDS [--prefix|--fuzzy] [--limit N]`, `recent DIR [N]`, `forget DIR ID`,
   `merge DIR`, `gc DIR`, `info DIR`.
 - `cubelang run --history DIR`.
+- **Sealed** (2026-10-24, `docs/SEAL.md`): `history seal DIR --key KEY.json` seals a directory in place
+  (the plain files are removed; copies made before are not reached). A sealed directory holds
+  `MANIFEST.cubeseal` and `seg-<random>.cubeseal` files, each sealed to the key's identity and signed
+  by it, each bound to its file name; the manifest names every segment by file and BLAKE3 of its
+  content, and counts saves (`generation`). So the files say nothing to whoever copies them, a file
+  cannot be swapped, renamed or planted (sealing *to* the host is open to anyone; signing as it is not),
+  and a sealed and a plain manifest side by side are refused. Every `history` command then takes
+  `--key KEY.json`; `run --history DIR --history-key KEY.json`; `run-proto --history-key KEY.json`
+  seals every history it opens, refuses a plain one, and refuses an older copy of one it served.
+  Cost (`examples/seal_bench.rs`, release, the development machine): a CLI append (open, append,
+  save) takes 13.2 ms sealed against 8.9 ms plain (file writes dominate either way); opening three
+  sealed segments takes 4.0 ms against 1.2 ms.
 - `run-proto`: `RunRequest.history_path` (field 10), cached like knowledge (by the manifest's mtime).
   A signed call covers it (`CallClaim.history_path`; a call naming no history signs the same bytes as
   before). In locked mode an unsigned or user request may not name a history at all: a history is
@@ -130,7 +142,7 @@ search finds exactly what the full scan finds.
 
 ## Not done
 
-- Segments are checksummed, not sealed: confidentiality and authorship at rest are #118.
+- Knowledge segments are checksummed, not sealed (they are published facts; a history is sealed, above).
 - Program storage stays per-program registers (small, compile-time constants, immutability enforced
   at compile time); it is not stored in segments.
 - A history directory has one writer; there is no lock file.

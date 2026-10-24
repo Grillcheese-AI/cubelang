@@ -24,7 +24,7 @@
 //!
 //! The checksum catches a damaged or truncated file before anything reads it. It is not a
 //! signature: who wrote a segment, and keeping it secret at rest, are the sealed-content layer's
-//! job (task #118).
+//! job (`Vault` below, implemented by `cubelang::seal`).
 
 use std::sync::Arc;
 
@@ -139,6 +139,15 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         "{}.tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Seals and opens the files of a store directory at rest (2026-10-24). `cubelang::seal`
+/// implements it, so the store itself holds no cryptography. `name` is the file's name in its
+/// directory and a vault binds it: a sealed file cannot be renamed into another file's place. Only
+/// sealed bytes reach the disk (the temporary of `write_atomic` included).
+pub trait Vault {
+    fn seal_file(&self, name: &str, plain: &[u8]) -> Result<Vec<u8>, String>;
+    fn open_file(&self, name: &str, sealed: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 // ── Varints (LEB128) ────────────────────────────────────────────────────────

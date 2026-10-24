@@ -12,6 +12,10 @@
 //! search and read skips it at once, and the next merge drops the turn from the files (`gc_dir`
 //! then removes the files that held it). Ids only grow, across segments, so a turn's id also says
 //! when it was said relative to the others.
+//!
+//! A history directory can be sealed (2026-10-24, `*_in` with a `Vault`): every segment and the
+//! manifest are sealed to one identity and signed by it (`cubelang::seal`), so the files say
+//! nothing to whoever copies them, and nobody without the key can slip a forged turn in.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -20,7 +24,7 @@ use std::sync::Arc;
 use fst::{IntoStreamer, Streamer};
 
 use crate::vm::knowledge::normalize;
-use crate::vm::segment::{self, Bytes};
+use crate::vm::segment::{self, Bytes, Vault};
 
 /// One utterance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +133,9 @@ pub struct HistorySegment {
     forgets: Vec<u64>,
     /// The file it lives in, once written.
     file: Option<String>,
+    /// BLAKE3 of its plaintext file bytes, once written to (or read from) a sealed directory: the
+    /// sealed manifest names each segment by file AND content.
+    sum: Option<String>,
 }
 
 impl std::fmt::Debug for HistorySegment {
@@ -186,7 +193,7 @@ impl HistorySegment {
         for _ in 0..n {
             forgets.push(segment::get_uvarint(b, &mut at).ok_or("history segment forgets")?);
         }
-        Ok(HistorySegment { terms, blob, first_id, last_id, n_turns, table_at, forgets, file: None })
+        Ok(HistorySegment { terms, blob, first_id, last_id, n_turns, table_at, forgets, file: None, sum: None })
     }
 
     fn holds(&self, id: u64) -> bool {
@@ -328,9 +335,22 @@ pub struct History {
     top: Vec<Turn>,
     top_forgets: Vec<u64>,
     next_id: u64,
+    /// How many times the directory it came from was saved: a host that remembers the highest
+    /// generation it served can refuse an older copy put back in its place (a rollback).
+    generation: u64,
 }
 
 const MANIFEST: &str = "MANIFEST.json";
+const MANIFEST_SEALED: &str = "MANIFEST.cubeseal";
+
+/// A file name a manifest may name: one plain name inside the directory.
+fn check_segment_name(mpath: &Path, name: &str, sealed: bool) -> Result<(), String> {
+    let ext = if sealed { ".cubeseal" } else { ".cubeseg" };
+    if name.contains(['/', '\\']) || name.contains("..") || !name.starts_with("seg-") || !name.ends_with(ext) {
+        return Err(format!("{}: segment name {:?} is not a segment file of this directory", mpath.display(), name));
+    }
+    Ok(())
+}
 
 impl History {
     pub fn new() -> Self {
@@ -549,24 +569,82 @@ impl History {
 
     // ── A history directory ─────────────────────────────────────────────
 
+    /// How many saves the directory had seen when this history was read from it (see `generation`
+    /// on the struct).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Open a history directory (`MANIFEST.json` and its segment files). A directory without a
-    /// manifest is an empty history.
+    /// manifest is an empty history. A sealed directory opens only with its vault (`open_dir_in`).
     pub fn open_dir(dir: &Path) -> Result<Self, String> {
-        let mpath = dir.join(MANIFEST);
-        let raw = match std::fs::read_to_string(&mpath) {
+        Self::open_dir_in(dir, None)
+    }
+
+    /// Refuse a directory that holds both manifests, or the other kind than `vault` asks for.
+    fn check_dir_kind(dir: &Path, vault: Option<&dyn Vault>) -> Result<(), String> {
+        let plain = dir.join(MANIFEST).exists();
+        let sealed = dir.join(MANIFEST_SEALED).exists();
+        match (plain, sealed, vault.is_some()) {
+            (true, true, _) => Err(format!("{}: holds both a plain and a sealed manifest; refusing to guess which \
+                                            is the history (`cubelang history seal` finishes a sealing)", dir.display())),
+            (true, false, true) => Err(format!("{}: this history is not sealed (open it without a key, or seal it \
+                                                 first: `cubelang history seal`)", dir.display())),
+            (false, true, false) => Err(format!("{}: this history is sealed: it opens only with its key (--key)", dir.display())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Open a history directory: sealed with `vault` (`MANIFEST.cubeseal` and `seg-*.cubeseal`, each
+    /// file sealed to and signed by the vault's identity, the manifest naming every segment by file
+    /// and BLAKE3 of its content), or plain with `None`.
+    pub fn open_dir_in(dir: &Path, vault: Option<&dyn Vault>) -> Result<Self, String> {
+        Self::check_dir_kind(dir, vault)?;
+        Self::read_dir(dir, vault)
+    }
+
+    fn read_dir(dir: &Path, vault: Option<&dyn Vault>) -> Result<Self, String> {
+        let mpath = dir.join(if vault.is_some() { MANIFEST_SEALED } else { MANIFEST });
+        let raw = match std::fs::read(&mpath) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(History::new()),
             Err(e) => return Err(format!("{}: {}", mpath.display(), e)),
         };
-        let m: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("{}: {}", mpath.display(), e))?;
+        let raw = match vault {
+            Some(v) => v.open_file(MANIFEST_SEALED, &raw)?,
+            None => raw,
+        };
+        let m: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| format!("{}: {}", mpath.display(), e))?;
         let next_id = m.get("next_id").and_then(|v| v.as_u64()).unwrap_or(1);
+        let generation = m.get("generation").and_then(|v| v.as_u64()).unwrap_or(0);
         let mut segments = Vec::new();
-        for name in m.get("segments").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-            let name = name.as_str().ok_or_else(|| format!("{}: a segment name is not a string", mpath.display()))?;
-            if name.contains(['/', '\\']) || name.contains("..") {
-                return Err(format!("{}: segment name {:?} leaves the directory", mpath.display(), name));
-            }
-            segments.push(Arc::new(HistorySegment::open(&dir.join(name))?));
+        for entry in m.get("segments").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let seg = match vault {
+                None => {
+                    let name = entry.as_str().ok_or_else(|| format!("{}: a segment name is not a string", mpath.display()))?;
+                    check_segment_name(&mpath, name, false)?;
+                    HistorySegment::open(&dir.join(name))?
+                }
+                Some(v) => {
+                    let (Some(name), Some(sum)) = (entry.get("file").and_then(|x| x.as_str()),
+                                                   entry.get("blake3").and_then(|x| x.as_str())) else {
+                        return Err(format!("{}: a segment entry needs its file and blake3", mpath.display()));
+                    };
+                    check_segment_name(&mpath, name, true)?;
+                    let path = dir.join(name);
+                    let sealed = std::fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+                    let plain = v.open_file(name, &sealed)?;
+                    if blake3::hash(&plain).to_hex().as_str() != sum {
+                        return Err(format!("{}: {} is not the segment the manifest names", mpath.display(), name));
+                    }
+                    let mut s = HistorySegment::from_file_bytes(Arc::from(plain.into_boxed_slice()))
+                        .map_err(|e| format!("{}: {}", path.display(), e))?;
+                    s.file = Some(name.to_string());
+                    s.sum = Some(sum.to_string());
+                    s
+                }
+            };
+            segments.push(Arc::new(seg));
         }
         let spans: Vec<(u64, u64)> = segments.iter()
             .filter(|s| s.last_id >= s.first_id)
@@ -575,47 +653,129 @@ impl History {
         if spans.windows(2).any(|w| w[0].1 >= w[1].0) {
             return Err(format!("{}: segments out of order", mpath.display()));
         }
-        Ok(History { segments, top: Vec::new(), top_forgets: Vec::new(), next_id })
+        Ok(History { segments, top: Vec::new(), top_forgets: Vec::new(), next_id, generation })
     }
 
     /// Freeze the top layer, write every segment not yet on disk, then the manifest (atomically:
     /// a reader sees the old history or the new one, never half of one). Files the manifest no
     /// longer names stay until `gc_dir`.
     pub fn save_dir(&mut self, dir: &Path) -> Result<(), String> {
+        self.save_dir_in(dir, None)
+    }
+
+    /// `save_dir`, sealed with `vault` or plain with `None`. Sealed segment files are named at
+    /// random (`seg-<128 random bits>.cubeseal`), so a name says nothing about the turns in it.
+    pub fn save_dir_in(&mut self, dir: &Path, vault: Option<&dyn Vault>) -> Result<(), String> {
         self.freeze()?;
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        Self::check_dir_kind(dir, vault)?;
+        self.write_dir(dir, vault)
+    }
+
+    fn write_dir(&mut self, dir: &Path, vault: Option<&dyn Vault>) -> Result<(), String> {
+        let ext = if vault.is_some() { ".cubeseal" } else { ".cubeseg" };
         for s in self.segments.iter_mut() {
-            if s.file.is_some() {
+            // on disk already, in this directory's kind (a plain segment being sealed is rewritten)
+            if s.file.as_deref().is_some_and(|f| f.ends_with(ext)) && (vault.is_none() || s.sum.is_some()) {
                 continue;
             }
             let bytes = s.to_file_bytes();
-            let tag = &blake3::hash(&bytes).to_hex()[..12];
-            let name = format!("seg-{:016x}-{:016x}-{}.cubeseg", s.first_id, s.last_id, tag);
-            segment::write_atomic(&dir.join(&name), &bytes).map_err(|e| format!("{}: {}", name, e))?;
-            Arc::make_mut(s).file = Some(name);
+            let sum = blake3::hash(&bytes).to_hex().to_string();
+            let (name, out) = match vault {
+                None => (format!("seg-{:016x}-{:016x}-{}.cubeseg", s.first_id, s.last_id, &sum[..12]), bytes),
+                Some(v) => {
+                    let name = format!("seg-{:016x}{:016x}.cubeseal", rand::random::<u64>(), rand::random::<u64>());
+                    let sealed = v.seal_file(&name, &bytes)?;
+                    (name, sealed)
+                }
+            };
+            segment::write_atomic(&dir.join(&name), &out).map_err(|e| format!("{}: {}", name, e))?;
+            let m = Arc::make_mut(s);
+            m.file = Some(name);
+            m.sum = Some(sum);
         }
+        let generation = self.generation + 1;
+        let segments: Vec<serde_json::Value> = self.segments.iter().map(|s| {
+            let file = s.file.clone().unwrap_or_default();
+            match vault {
+                None => serde_json::Value::String(file),
+                Some(_) => serde_json::json!({ "file": file, "blake3": s.sum.clone().unwrap_or_default() }),
+            }
+        }).collect();
         let manifest = serde_json::json!({
             "version": 1,
             "next_id": self.next_id.max(1),
-            "segments": self.segments.iter().map(|s| s.file.clone().unwrap_or_default()).collect::<Vec<_>>(),
+            "generation": generation,
+            "segments": segments,
         });
-        segment::write_atomic(&dir.join(MANIFEST), serde_json::to_string_pretty(&manifest).unwrap().as_bytes())
-            .map_err(|e| format!("{}: {}", MANIFEST, e))
+        let text = serde_json::to_string_pretty(&manifest).unwrap();
+        match vault {
+            None => segment::write_atomic(&dir.join(MANIFEST), text.as_bytes())
+                .map_err(|e| format!("{}: {}", MANIFEST, e))?,
+            Some(v) => segment::write_atomic(&dir.join(MANIFEST_SEALED), &v.seal_file(MANIFEST_SEALED, text.as_bytes())?)
+                .map_err(|e| format!("{}: {}", MANIFEST_SEALED, e))?,
+        }
+        self.generation = generation;
+        Ok(())
     }
 
     /// Remove the segment files of `dir` its manifest no longer names (merged away, or holding a
     /// forgotten turn). Returns the names removed.
     pub fn gc_dir(dir: &Path) -> Result<Vec<String>, String> {
-        let live: HashSet<String> = Self::open_dir(dir)?.segments.iter().filter_map(|s| s.file.clone()).collect();
+        Self::gc_dir_in(dir, None)
+    }
+
+    /// `gc_dir` for a sealed (`vault`) or plain directory.
+    pub fn gc_dir_in(dir: &Path, vault: Option<&dyn Vault>) -> Result<Vec<String>, String> {
+        let ext = if vault.is_some() { ".cubeseal" } else { ".cubeseg" };
+        let live: HashSet<String> = Self::open_dir_in(dir, vault)?.segments.iter().filter_map(|s| s.file.clone()).collect();
         let mut removed = Vec::new();
         for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))? {
             let e = e.map_err(|e| e.to_string())?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("seg-") && name.ends_with(".cubeseg") && !live.contains(&name) {
+            if name.starts_with("seg-") && name.ends_with(ext) && !live.contains(&name) {
                 std::fs::remove_file(e.path()).map_err(|err| format!("{}: {}", name, err))?;
                 removed.push(name);
             }
         }
+        removed.sort();
+        Ok(removed)
+    }
+
+    /// Seal a plain history directory in place (2026-10-24): every segment is written again sealed,
+    /// the sealed manifest is written, then the plain manifest and segment files are removed (an
+    /// interrupted run is finished by running it again). Returns the plain files removed. Copies
+    /// made before -- backups, a sync folder, the disk's free blocks -- are out of its reach.
+    pub fn seal_dir(dir: &Path, vault: &dyn Vault) -> Result<Vec<String>, String> {
+        let plain = dir.join(MANIFEST).exists();
+        let sealed = dir.join(MANIFEST_SEALED).exists();
+        if !plain {
+            return Err(if sealed {
+                format!("{}: already sealed", dir.display())
+            } else {
+                format!("{}: no history here (no {})", dir.display(), MANIFEST)
+            });
+        }
+        if sealed {
+            // an earlier run wrote the sealed manifest (atomically) and stopped before removing the
+            // plain files: check the sealed history opens whole before removing anything
+            Self::read_dir(dir, Some(vault))?;
+        } else {
+            let mut h = Self::read_dir(dir, None)?;
+            h.write_dir(dir, Some(vault))?;
+            Self::read_dir(dir, Some(vault))?;
+        }
+        let mut removed = Vec::new();
+        for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))? {
+            let e = e.map_err(|e| e.to_string())?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("seg-") && name.ends_with(".cubeseg") {
+                std::fs::remove_file(e.path()).map_err(|err| format!("{}: {}", name, err))?;
+                removed.push(name);
+            }
+        }
+        std::fs::remove_file(dir.join(MANIFEST)).map_err(|e| format!("{}: {}", MANIFEST, e))?;
+        removed.push(MANIFEST.to_string());
         removed.sort();
         Ok(removed)
     }

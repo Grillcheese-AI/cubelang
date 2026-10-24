@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process;
 
 use cubelang::vm::history::{History, SearchMode};
+use cubelang::vm::segment::Vault;
 use cubelang::vm::knowledge::{KnowledgeStore, keys_with_prefix};
 
 /// A knowledge file as a store: a `.cubeseg` is opened as its frozen segment (no parse); anything
@@ -89,21 +90,41 @@ fn words(args: &[String], with_values: &[&str]) -> Vec<String> {
     out
 }
 
+/// The flags every `history` command takes for a sealed directory.
+const KEY_FLAGS: [&str; 2] = ["--key", "--passphrase-file"];
+
 pub fn cmd_history(args: &[String]) {
     let usage = "usage: cubelang history append DIR [--speaker S] [--at MS] TEXT... | search DIR WORDS... \
-                 [--prefix|--fuzzy] [--limit N] | recent DIR [N] | forget DIR ID | merge DIR | gc DIR | info DIR";
+                 [--prefix|--fuzzy] [--limit N] | recent DIR [N] | forget DIR ID | merge DIR | gc DIR | info DIR \
+                 | seal DIR --key KEY.json\n\
+                 a sealed directory takes --key KEY.json on every command (sealed key files: --passphrase-file P \
+                 or CUBELANG_KEY_PASSPHRASE)";
     let (Some(cmd), Some(dir)) = (args.first(), args.get(1)) else { die(usage) };
     let dir = Path::new(dir);
     let rest = &args[2..];
-    let open = || History::open_dir(dir).unwrap_or_else(|e| die(e));
+    // --key: the directory is sealed to (and signed by) this identity
+    let vault = flag(rest, "--key").map(|k| {
+        cubelang::seal::SealedVault::own(crate::open_identity(&k, flag(rest, "--passphrase-file").as_deref()))
+    });
+    let v: Option<&dyn Vault> = vault.as_ref().map(|x| x as &dyn Vault);
+    let open = || History::open_dir_in(dir, v).unwrap_or_else(|e| die(e));
+    let save = |h: &mut History| h.save_dir_in(dir, v).unwrap_or_else(|e| die(e));
     match cmd.as_str() {
+        "seal" => {
+            let Some(v) = v else { die("history seal needs --key KEY.json (the identity to seal the history to)") };
+            let removed = History::seal_dir(dir, v).unwrap_or_else(|e| die(e));
+            let h = History::open_dir_in(dir, Some(v)).unwrap_or_else(|e| die(e));
+            println!("{}: sealed to {} ({} turns, {} segment(s)); removed {} plain file(s). Copies made before \
+                      (backups, sync folders) are not reached: remove them yourself.",
+                     dir.display(), vault.as_ref().map(|x| x.name()).unwrap_or(""), h.len(), h.segment_count(), removed.len());
+        }
         "append" => {
             let speaker = flag(rest, "--speaker").unwrap_or_else(|| "user".to_string());
             let at = match flag(rest, "--at") {
                 Some(t) => t.parse().unwrap_or_else(|_| die("--at takes Unix milliseconds")),
                 None => cubelang::auth::now_ms(),
             };
-            let text = words(rest, &["--speaker", "--at"]).join(" ");
+            let text = words(rest, &["--speaker", "--at", KEY_FLAGS[0], KEY_FLAGS[1]]).join(" ");
             if text.trim().is_empty() {
                 die(usage);
             }
@@ -112,7 +133,7 @@ pub fn cmd_history(args: &[String]) {
             // freeze on the turn, keep the segment count bounded, and persist
             h.freeze().unwrap_or_else(|e| die(e));
             h.maybe_merge(32).unwrap_or_else(|e| die(e));
-            h.save_dir(dir).unwrap_or_else(|e| die(e));
+            save(&mut h);
             println!("{}", id);
         }
         "search" => {
@@ -124,7 +145,7 @@ pub fn cmd_history(args: &[String]) {
                 SearchMode::Exact
             };
             let limit = flag(rest, "--limit").map(|n| n.parse().unwrap_or_else(|_| die("--limit takes a number"))).unwrap_or(20);
-            let query = words(rest, &["--limit"]).join(" ");
+            let query = words(rest, &["--limit", KEY_FLAGS[0], KEY_FLAGS[1]]).join(" ");
             let h = open();
             let started = std::time::Instant::now();
             let hits = h.search(&query, mode, limit);
@@ -138,28 +159,28 @@ pub fn cmd_history(args: &[String]) {
             eprintln!("{} hit(s) in {} us", hits.len(), us);
         }
         "recent" => {
-            let n = rest.first().map(|n| n.parse().unwrap_or_else(|_| die("recent takes a number"))).unwrap_or(10);
+            let n = words(rest, &KEY_FLAGS).first().map(|n| n.parse().unwrap_or_else(|_| die("recent takes a number"))).unwrap_or(10);
             for t in open().recent(n) {
                 println!("{}", serde_json::json!({ "turn": t.id, "at": t.at_ms, "speaker": t.speaker, "text": t.text }));
             }
         }
         "forget" => {
-            let id: u64 = rest.first().and_then(|n| n.parse().ok()).unwrap_or_else(|| die(usage));
+            let id: u64 = words(rest, &KEY_FLAGS).first().and_then(|n| n.parse().ok()).unwrap_or_else(|| die(usage));
             let mut h = open();
             if !h.forget(id) {
                 die(format!("no live turn {}", id));
             }
-            h.save_dir(dir).unwrap_or_else(|e| die(e));
+            save(&mut h);
             println!("turn {} forgotten (run `history merge` then `history gc` to take it out of the files)", id);
         }
         "merge" => {
             let mut h = open();
             h.merge_all().unwrap_or_else(|e| die(e));
-            h.save_dir(dir).unwrap_or_else(|e| die(e));
+            save(&mut h);
             println!("{} turns in {} segment(s)", h.len(), h.segment_count());
         }
         "gc" => {
-            for name in History::gc_dir(dir).unwrap_or_else(|e| die(e)) {
+            for name in History::gc_dir_in(dir, v).unwrap_or_else(|e| die(e)) {
                 println!("removed {}", name);
             }
         }

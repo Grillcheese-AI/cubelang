@@ -35,13 +35,17 @@ reload. Versions 1-3 still load.
 | Digests in signed messages | SHA-384 | RustCrypto sha2 |
 | Key derivation | HKDF-SHA-384 | RustCrypto hkdf |
 | Key files at rest | Argon2id (64 MiB, 3 passes, 4 lanes) + AES-256-GCM | RustCrypto argon2, aes-gcm |
+| Sealed content (2026-10-24, `docs/SEAL.md`) | **ML-KEM-1024** (FIPS 203) **and** X25519, both; AES-256-GCM | libcrux-ml-kem (Cryspen, formally verified), x25519-dalek |
 
 Every identity is **one 32-byte seed**. HKDF-SHA-384 derives FIPS 204's key-generation seed ξ (so the
 seed-to-key mapping is the standard's, not ours) and the Ed25519 seed. A known-answer test pins the
 derivation, and it was cross-checked once against RustCrypto's independent `ml-dsa`: the same ξ gives
 the same public key. The seed fits a small QR code, so a root key can be printed and kept offline.
+The same seed also gives the identity's encryption keys (ML-KEM-1024 and X25519; `docs/SEAL.md`),
+which its entry carries under `kem`, signed by its own signing keys.
 
-Each signature names its purpose (call, registration, revocation): ML-DSA takes it as its context
+Each signature names its purpose (call, registration, revocation, the binding of encryption keys,
+sealed content): ML-DSA takes it as its context
 string, Ed25519 sees it as the message's leading tag, so a signature for one purpose never passes as
 another. Every entry and key file names its scheme (`ml-dsa-87+ed25519`): a later scheme is a new
 entry, never a silent reinterpretation.
@@ -76,7 +80,10 @@ A JSON file the host loads (never one a request supplies):
 - `revocations`: signed by a root or by the entry's own registrar, naming the entry and the
   fingerprint of its keys. A revoked registrar takes everything it registered with it.
 
-The whole chain is verified at load. A keyring that does not verify is refused whole: `run-proto`
+The whole chain is verified at load, encryption keys included: an entry's `kem` must carry the
+entry's own signature, so whoever can write the file cannot give one entry another's encryption keys
+(a registration covers the signing keys only). An entry made before 2026-10-24 has no `kem`: it still
+signs and verifies, and refuses to be sealed to. A keyring that does not verify is refused whole: `run-proto`
 does not start (fail closed), and a reload that does not verify keeps the previous keyring.
 `run-proto` reloads the file when its modification time changes, keeping the nonces it has seen.
 
@@ -106,6 +113,9 @@ cubelang sign --key key.json --program FILE (--fn NAME | --tick) [--arg V]... [-
 cubelang run-proto --keyring RING --pin-root FINGERPRINT --contracts DIR
 cubelang run FILE --as NAME                          # a host-asserted caller for local testing (no signature)
 cubelang tick FILE [--every 1s] [--ticks N]
+cubelang seal --to NAME --keyring RING [--from KEY.json] [--aad TEXT] IN OUT      # docs/SEAL.md
+cubelang open --key KEY.json [--keyring RING] [--signer NAME] [--aad TEXT] IN OUT|-
+cubelang run-proto ... --history-key KEY.json        # every history it opens is sealed to KEY
 ```
 
 `keygen` never writes over an existing file (owner-only on Unix) and prints only the public entry.
@@ -113,7 +123,7 @@ Key files never go in a repository, a `.cube` file or a request.
 
 ## Not yet
 
-- Containers (grants declared in source), sealed content (ML-KEM-1024 + X25519, AES-256-GCM), TLS 1.3
-  for a remote `run-proto`.
+- TLS 1.3 for a remote `run-proto`. Containers (grants declared in source) landed
+  2026-10-24 (`docs/REFERENCE.md`), sealed content too (`docs/SEAL.md`).
 - For certification (FIPS 140-3), the primitives move to a validated module (aws-lc-rs); the scheme
   tags make that a swap, not a format change.

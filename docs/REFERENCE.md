@@ -224,7 +224,9 @@ is now stale relative to the source it lives beside. See `docs/DRIFT.md` §A.
 > a million facts). `knowledge_path` also takes a prebuilt `.cubeseg`
 > (`cubelang knowledge build`). The conversation history is searchable from a
 > program with `use history;` (exact, prefix or typo-tolerant), and over
-> run-proto with `history_path`.
+> run-proto with `history_path`. A history directory can be sealed to one
+> identity and signed by it (`cubelang history seal`, `run-proto --history-key`;
+> ML-KEM-1024 + X25519, AES-256-GCM): `docs/SEAL.md`.
 
 ### 3.5 ASK / Suspend — the third `ExecResult`
 

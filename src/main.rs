@@ -23,6 +23,7 @@ use cubelang::vm::{VM, ExecResult, Value};
 use prost::Message;
 
 mod store_cli;
+mod seal_cli;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -46,6 +47,8 @@ fn main() {
         "sign"           => cmd_sign(&args[2..]),
         "knowledge"      => store_cli::cmd_knowledge(&args[2..]),
         "history"        => store_cli::cmd_history(&args[2..]),
+        "seal"           => seal_cli::cmd_seal(&args[2..]),
+        "open"           => seal_cli::cmd_open(&args[2..]),
         "version"  | "v" | "--version" | "-v" => cmd_version(),
         "help" | "--help" | "-h" => print_usage(),
         _ => {
@@ -74,7 +77,8 @@ COMMANDS:
                    --keyring ring.json: verify signed callers (ML-DSA-87 +
                    Ed25519) and refuse unsigned programs that are not
                    deployed; --pin-root FINGERPRINT: the roots to trust;
-                   --contracts DIR: the deployed .cube contracts
+                   --contracts DIR: the deployed .cube contracts;
+                   --history-key KEY.json: histories are sealed to it
     tick           Run the @cron functions of a program as they come due
                    (--every 1s, --ticks N; 0 = until stopped)
     keygen         Make an identity: keygen NAME --kind user|agent|model|
@@ -94,7 +98,13 @@ COMMANDS:
                    KEY | keys FILE PREFIX
     history        append DIR [--speaker S] TEXT | search DIR WORDS
                    [--prefix|--fuzzy] [--limit N] | recent DIR [N] | forget
-                   DIR ID | merge DIR | gc DIR | info DIR
+                   DIR ID | merge DIR | gc DIR | info DIR | seal DIR (a
+                   sealed history takes --key KEY.json on every command)
+    seal           Seal a file to one identity: seal --to NAME --keyring
+                   RING.json (or --to ENTRY.json) [--from KEY.json] [--aad T]
+                   IN OUT (ML-KEM-1024 + X25519, AES-256-GCM; --from signs)
+    open           Open a sealed file: open --key KEY.json [--keyring
+                   RING.json] [--signer NAME] [--aad T] IN OUT|-
     inspect,  i    Show .cubebin program info
     disasm,   d    Disassemble .cubebin to readable opcodes
     check,    k    Fully compile .cube in strict mode (NOT parse-only --
@@ -530,6 +540,7 @@ fn cmd_run(args: &[String]) {
     let mut strict = true;
     let mut knowledge_path: Option<String> = None;
     let mut history_path: Option<String> = None;
+    let mut history_key: Option<String> = None;
     let mut call_args: Vec<Value> = Vec::new();
     let mut caller: Option<String> = None;
     let mut i = 1;
@@ -553,6 +564,10 @@ fn cmd_run(args: &[String]) {
             "--history" => {
                 if i + 1 < args.len() { history_path = Some(args[i + 1].clone()); i += 1; }
             }
+            // The key a sealed history opens with (`history seal`); its passphrase as for keygen.
+            "--history-key" => {
+                if i + 1 < args.len() { history_key = Some(args[i + 1].clone()); i += 1; }
+            }
             // Arguments bound to the function's DECLARED parameter names.
             "--arg" | "-a" => {
                 if i + 1 < args.len() { call_args.push(Value::Str(args[i + 1].clone())); i += 1; }
@@ -567,8 +582,11 @@ fn cmd_run(args: &[String]) {
     vm.trace_enabled = trace;
     vm.caller = caller;
 
+    let history_vault = history_key.as_deref()
+        .map(|k| cubelang::seal::SealedVault::own(open_identity(k, None)));
     if let Some(hp) = &history_path {
-        match cubelang::vm::history::History::open_dir(Path::new(hp)) {
+        let vault = history_vault.as_ref().map(|v| v as &dyn cubelang::vm::segment::Vault);
+        match cubelang::vm::history::History::open_dir_in(Path::new(hp), vault) {
             Ok(h) => {
                 if !json_out {
                     println!("  history: {} turns from {}", h.len(), hp);
@@ -796,15 +814,25 @@ fn cmd_run_proto(args: &[String]) {
     let mut keyring: Option<String> = None;
     let mut contracts: Option<String> = None;
     let mut pins: Vec<String> = Vec::new();
+    let mut history_key: Option<String> = None;
+    let mut pass_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--keyring" if i + 1 < args.len() => { keyring = Some(args[i + 1].clone()); i += 1; }
             "--contracts" if i + 1 < args.len() => { contracts = Some(args[i + 1].clone()); i += 1; }
             "--pin-root" if i + 1 < args.len() => { pins.push(args[i + 1].trim().to_ascii_lowercase()); i += 1; }
+            "--history-key" if i + 1 < args.len() => { history_key = Some(args[i + 1].clone()); i += 1; }
+            "--passphrase-file" if i + 1 < args.len() => { pass_file = Some(args[i + 1].clone()); i += 1; }
             other => { eprintln!("error: run-proto: unknown option {}", other); process::exit(1); }
         }
         i += 1;
+    }
+    // --history-key: every history this process opens is sealed to this identity (`history seal`),
+    // and a plain one is refused.
+    if let Some(k) = &history_key {
+        let vault = cubelang::seal::SealedVault::own(open_identity(k, pass_file.as_deref()));
+        HISTORY_VAULT.with(|v| *v.borrow_mut() = Some(std::rc::Rc::new(vault)));
     }
     if keyring.is_some() && pins.is_empty() {
         eprintln!("warning: the keyring's roots are not pinned (--pin-root FINGERPRINT): whoever can write \
@@ -1026,15 +1054,15 @@ impl Host {
     }
 }
 
-/// The resident process's knowledge cache: path -> (mtime, store).
-/// A request naming a `knowledge_path` gets a CLONE of the store on its fresh
-/// VM; the file is re-read only when its mtime moves. Keyed by the path
-/// string as sent, so two spellings of one file parse twice -- harmless, and
-/// simpler than canonicalizing on a platform where that can fail.
-///
-/// 2026-10-24: the cached store is frozen into one shared segment (a
-/// `.cubeseg` file already is one), so the per-request clone -- and every
-/// branch's -- copies a pointer, not the store.
+// The resident process's knowledge cache: path -> (mtime, store).
+// A request naming a `knowledge_path` gets a CLONE of the store on its fresh
+// VM; the file is re-read only when its mtime moves. Keyed by the path
+// string as sent, so two spellings of one file parse twice -- harmless, and
+// simpler than canonicalizing on a platform where that can fail.
+//
+// 2026-10-24: the cached store is frozen into one shared segment (a
+// `.cubeseg` file already is one), so the per-request clone -- and every
+// branch's -- copies a pointer, not the store.
 thread_local! {
     static KNOWLEDGE_CACHE: std::cell::RefCell<
         std::collections::HashMap<String, (Option<std::time::SystemTime>, cubelang::vm::knowledge::KnowledgeStore)>
@@ -1043,6 +1071,13 @@ thread_local! {
     static HISTORY_CACHE: std::cell::RefCell<
         std::collections::HashMap<String, (Option<std::time::SystemTime>, cubelang::vm::history::History)>
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// `run-proto --history-key`: the identity every history is sealed to.
+    static HISTORY_VAULT: std::cell::RefCell<Option<std::rc::Rc<cubelang::seal::SealedVault>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The highest generation each sealed history directory has been served at: an older one put
+    /// back in its place is refused for the life of the process.
+    static HISTORY_GENERATION: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Load `path` into `vm.knowledge` (through the cache). A missing or
@@ -1069,10 +1104,11 @@ fn load_knowledge_cached(vm: &mut VM, path: &str) -> Result<(), String> {
 /// Load the history directory `path` into `vm.history` (through the cache; re-opened when its
 /// manifest changes). A directory that cannot be opened is an error, not an empty history.
 fn load_history_cached(vm: &mut VM, path: &str) -> Result<(), String> {
-    let manifest = Path::new(path).join("MANIFEST.json");
     if !Path::new(path).is_dir() {
         return Err(format!("history_path {}: not a directory", path));
     }
+    let vault = HISTORY_VAULT.with(|v| v.borrow().clone());
+    let manifest = Path::new(path).join(if vault.is_some() { "MANIFEST.cubeseal" } else { "MANIFEST.json" });
     let mtime = std::fs::metadata(&manifest).ok().and_then(|m| m.modified().ok());
     let hit = HISTORY_CACHE.with(|c| {
         c.borrow().get(path).and_then(|(m, h)| if *m == mtime { Some(h.clone()) } else { None })
@@ -1080,8 +1116,18 @@ fn load_history_cached(vm: &mut VM, path: &str) -> Result<(), String> {
     let history = match hit {
         Some(h) => h,
         None => {
-            let fresh = cubelang::vm::history::History::open_dir(Path::new(path))
+            let v = vault.as_deref().map(|v| v as &dyn cubelang::vm::segment::Vault);
+            let fresh = cubelang::vm::history::History::open_dir_in(Path::new(path), v)
                 .map_err(|e| format!("history_path {}: {}", path, e))?;
+            if vault.is_some() {
+                let seen = HISTORY_GENERATION.with(|g| g.borrow().get(path).copied().unwrap_or(0));
+                if fresh.generation() < seen {
+                    return Err(format!("history_path {}: generation {} is older than generation {} this process \
+                                        already served -- an older copy was put back in its place; refusing it",
+                                       path, fresh.generation(), seen));
+                }
+                HISTORY_GENERATION.with(|g| { g.borrow_mut().insert(path.to_string(), fresh.generation()); });
+            }
             HISTORY_CACHE.with(|c| { c.borrow_mut().insert(path.to_string(), (mtime, fresh.clone())); });
             fresh
         }

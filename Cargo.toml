@@ -26,6 +26,11 @@ hkdf = "0.13"
 argon2 = "0.6"
 aes-gcm = "0.11"
 zeroize = "1"
+# Sealed content (2026-10-24, src/seal.rs): a hybrid KEM, ML-KEM-1024 (FIPS 203; Cryspen's libcrux,
+# the same formally verified family and release as the ML-DSA above) AND X25519 (dalek, on the same
+# curve library as Ed25519); AES-256-GCM over a key derived from both.
+libcrux-ml-kem = "=0.0.11"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 # The layered store (2026-10-24, src/vm/segment.rs): immutable sorted segments as finite-state
 # transducers (BurntSushi's fst, MIT/Unlicense), with its Levenshtein automata for typo-tolerant
 # history search.

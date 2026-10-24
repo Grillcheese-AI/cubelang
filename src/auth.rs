@@ -32,6 +32,12 @@
 //!
 //! Every entry and key file names its scheme (`ml-dsa-87+ed25519`): a later scheme is a new entry,
 //! never a silent reinterpretation.
+//!
+//! Encryption keys (2026-10-24). The same seed derives an ML-KEM-1024 key pair (FIPS 203's (d, z))
+//! and an X25519 key under other HKDF labels, so the signing keys a seed restores are unchanged. An
+//! entry carries the public halves under `kem` (scheme `ml-kem-1024+x25519`), signed by the entry's
+//! own keys (`Purpose::Kem`, deterministic, so the entry is a function of the seed); a keyring in
+//! which a binding does not verify is refused whole. `crate::seal` seals content to these keys.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +72,10 @@ pub enum Purpose {
     Call,
     Register,
     Revoke,
+    /// An entry's own signature over its encryption keys (2026-10-24).
+    Kem,
+    /// A sender's signature inside sealed content (2026-10-24, `crate::seal`).
+    Seal,
 }
 
 impl Purpose {
@@ -74,15 +84,38 @@ impl Purpose {
             Purpose::Call => b"cubelang-call-v1",
             Purpose::Register => b"cubelang-register-v1",
             Purpose::Revoke => b"cubelang-revoke-v1",
+            Purpose::Kem => b"cubelang-kem-v1",
+            Purpose::Seal => b"cubelang-seal-v1",
         }
     }
-    fn tag(self) -> &'static [u8] {
+    pub(crate) fn tag(self) -> &'static [u8] {
         match self {
             Purpose::Call => b"cubelang/call/v1\0",
             Purpose::Register => b"cubelang/register/v1\0",
             Purpose::Revoke => b"cubelang/revoke/v1\0",
+            Purpose::Kem => b"cubelang/kem/v1\0",
+            Purpose::Seal => b"cubelang/seal/v1\0",
         }
     }
+}
+
+/// The encryption scheme (2026-10-24): ML-KEM-1024 (FIPS 203, the CNSA 2.0 key establishment) and
+/// X25519, both; content is readable only by breaking both.
+pub const KEM_SCHEME: &str = "ml-kem-1024+x25519";
+pub(crate) const ML_KEM_1024_EK: usize = 1568;
+pub(crate) const ML_KEM_1024_CT: usize = 1568;
+
+/// An entry's encryption keys, bound to its signing keys by its own signature (both schemes,
+/// `Purpose::Kem`), so they cannot be swapped by whoever can write the keyring -- a root's included,
+/// though a root's registration covers only its signing keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KemKeys {
+    pub scheme: String,
+    /// ML-KEM-1024 encapsulation key, hex.
+    pub ml_kem: String,
+    /// X25519 public key, hex.
+    pub x25519: String,
+    pub binding: HybridSignature,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +172,9 @@ pub struct KeyEntry {
     /// Who registered this entry, when, until when, and their signatures over it. Roots carry none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration: Option<Registration>,
+    /// The keys content is sealed to (2026-10-24); an entry made before then has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<KemKeys>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -308,15 +344,88 @@ fn derive(seed: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
     (xi, ed)
 }
 
+/// The two encryption key seeds one identity seed stands for (2026-10-24): FIPS 203's (d, z) for
+/// ML-KEM-1024 key generation, and the X25519 secret. Same HKDF, other labels: the signing keys a
+/// seed restores are unchanged.
+fn derive_kem(seed: &[u8; 32]) -> (Zeroizing<[u8; 64]>, Zeroizing<[u8; 32]>) {
+    let hk = hkdf::Hkdf::<Sha384>::new(Some(b"cubelang identity v1"), seed);
+    let mut dz = Zeroizing::new([0u8; 64]);
+    let mut x = Zeroizing::new([0u8; 32]);
+    hk.expand(b"ml-kem-1024 d||z", dz.as_mut()).expect("64 bytes is a valid HKDF length");
+    hk.expand(b"x25519 secret", x.as_mut()).expect("32 bytes is a valid HKDF length");
+    (dz, x)
+}
+
+/// The bytes an entry's own signature over its encryption keys covers: who (name, kind, and the
+/// fingerprint of the signing keys), the scheme, and both public keys.
+pub fn kem_binding_message(e: &KeyEntry, scheme: &str, ml_kem: &[u8], x25519: &[u8]) -> Vec<u8> {
+    let mut m = Purpose::Kem.tag().to_vec();
+    field(&mut m, e.name.as_bytes());
+    field(&mut m, e.kind.as_str().as_bytes());
+    field(&mut m, &from_hex(&fingerprint(e)).unwrap_or_default());
+    field(&mut m, scheme.as_bytes());
+    field(&mut m, ml_kem);
+    field(&mut m, x25519);
+    m
+}
+
+/// The fingerprint of a pair of encryption keys (SHA-384): what sealed content names its recipient
+/// by, and what both key derivation and the sender's signature bind.
+pub fn kem_fingerprint(ml_kem: &[u8], x25519: &[u8]) -> [u8; 48] {
+    sha384(&[b"cubelang/kem-fingerprint/v1\0", KEM_SCHEME.as_bytes(), b"\0", ml_kem, x25519])
+}
+
+/// An entry's encryption keys, decoded and checked: the scheme, the sizes, a valid ML-KEM key, a
+/// non-degenerate X25519 key, and the entry's own signature over them.
+pub(crate) fn kem_public(e: &KeyEntry) -> Result<([u8; ML_KEM_1024_EK], [u8; 32]), String> {
+    kem_checked(e, &decode_public(e)?)
+}
+
+/// Check `message` is signed for `purpose` by the keys of `e` (both schemes).
+pub fn verify_entry(e: &KeyEntry, purpose: Purpose, sig: &HybridSignature, message: &[u8]) -> Result<(), String> {
+    decode_public(e)?.verify(purpose, sig, message).map_err(|why| format!("{}: {}", e.name, why))
+}
+
+fn kem_checked(e: &KeyEntry, keys: &PublicKeys) -> Result<([u8; ML_KEM_1024_EK], [u8; 32]), String> {
+    let k = e.kem.as_ref().ok_or_else(|| format!("{} has no encryption keys (an entry made before 2026-10-24; make a new one)", e.name))?;
+    if k.scheme != KEM_SCHEME {
+        return Err(format!("{}: encryption scheme {:?}; this build seals with {} only", e.name, k.scheme, KEM_SCHEME));
+    }
+    let ek: [u8; ML_KEM_1024_EK] = from_hex(&k.ml_kem)
+        .map_err(|x| format!("{}: ml_kem: {}", e.name, x))?
+        .try_into()
+        .map_err(|_| format!("{}: an ML-KEM-1024 key is {} bytes", e.name, ML_KEM_1024_EK))?;
+    let x: [u8; 32] = from_hex(&k.x25519)
+        .map_err(|y| format!("{}: x25519: {}", e.name, y))?
+        .try_into()
+        .map_err(|_| format!("{}: an X25519 key is 32 bytes", e.name))?;
+    if !libcrux_ml_kem::mlkem1024::validate_public_key(&libcrux_ml_kem::mlkem1024::MlKem1024PublicKey::from(ek)) {
+        return Err(format!("{}: not a valid ML-KEM-1024 key", e.name));
+    }
+    if x.iter().all(|b| *b == 0) {
+        return Err(format!("{}: a degenerate X25519 key", e.name));
+    }
+    keys.verify(Purpose::Kem, &k.binding, &kem_binding_message(e, &k.scheme, &ek, &x))
+        .map_err(|why| format!("{}: its encryption keys are not signed by its own keys ({})", e.name, why))?;
+    Ok((ek, x))
+}
+
+/// The two shared secrets of one KEM opening (ML-KEM's, X25519's), wiped when dropped.
+pub(crate) type SharedSecrets = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+
 /// An identity ready to sign. It keeps the ML-DSA seed, not the 4,896-byte signing key: the key is
 /// regenerated for each signature (FIPS 204 key generation is fast) and wiped right after, so the
-/// expanded key exists in memory only while it signs.
+/// expanded key exists in memory only while it signs. The same for ML-KEM's decapsulation key
+/// (2026-10-24): regenerated to open sealed content, wiped after.
 pub struct Identity {
     pub name: String,
     pub kind: Kind,
     xi: Zeroizing<[u8; 32]>,
     ml_dsa_vk: Vec<u8>,
     ed25519: ed25519_dalek::SigningKey,
+    kem_dz: Zeroizing<[u8; 64]>,
+    ml_kem_ek: Vec<u8>,
+    x25519: x25519_dalek::StaticSecret,
 }
 
 /// Redacted: the name and kind, never a key.
@@ -333,7 +442,53 @@ impl Identity {
         let mut kp = ml_dsa_87::generate_key_pair(*xi);
         let ml_dsa_vk = kp.verification_key.as_slice().to_vec();
         kp.signing_key.as_mut_slice().zeroize();
-        Ok(Identity { name: name.to_string(), kind, xi, ml_dsa_vk, ed25519: ed25519_dalek::SigningKey::from_bytes(&ed) })
+        let (kem_dz, x) = derive_kem(seed);
+        let ml_kem_ek = {
+            let kp = libcrux_ml_kem::mlkem1024::generate_key_pair(*kem_dz);
+            let (sk, pk) = kp.into_parts();
+            let ek = pk.as_slice().to_vec();
+            let mut sk: [u8; 3168] = sk.into();
+            sk.zeroize();
+            ek
+        };
+        Ok(Identity {
+            name: name.to_string(), kind, xi, ml_dsa_vk, ed25519: ed25519_dalek::SigningKey::from_bytes(&ed),
+            kem_dz, ml_kem_ek, x25519: x25519_dalek::StaticSecret::from(*x),
+        })
+    }
+
+    /// Open a KEM encapsulation made to this identity: the two shared secrets (ML-KEM's, X25519's).
+    /// ML-KEM rejects implicitly (a forged ciphertext yields an unrelated secret, so the AEAD fails);
+    /// an X25519 exchange with a low-order point is refused.
+    pub(crate) fn kem_open(&self, ct: &[u8; ML_KEM_1024_CT], epk: &[u8; 32]) -> Result<SharedSecrets, String> {
+        let kp = libcrux_ml_kem::mlkem1024::generate_key_pair(*self.kem_dz);
+        let (sk, _pk) = kp.into_parts();
+        let ss = Zeroizing::new(libcrux_ml_kem::mlkem1024::decapsulate(&sk, &libcrux_ml_kem::mlkem1024::MlKem1024Ciphertext::from(*ct)));
+        let mut sk_bytes: [u8; 3168] = sk.into();
+        sk_bytes.zeroize();
+        let shared = self.x25519.diffie_hellman(&x25519_dalek::PublicKey::from(*epk));
+        if !shared.was_contributory() {
+            return Err("sealed content: a degenerate X25519 key".into());
+        }
+        Ok((ss, Zeroizing::new(shared.to_bytes())))
+    }
+
+    /// The fingerprint of this identity's encryption keys (what content sealed to it names).
+    pub fn kem_fingerprint(&self) -> [u8; 48] {
+        kem_fingerprint(&self.ml_kem_ek, x25519_dalek::PublicKey::from(&self.x25519).as_bytes())
+    }
+
+    /// ML-DSA in FIPS 204's deterministic mode, for a signature that must be the same every time
+    /// it is made (the binding of the encryption keys, so `public_entry` is a function of the seed).
+    fn sign_deterministic(&self, purpose: Purpose, message: &[u8]) -> Result<HybridSignature, String> {
+        if !message.starts_with(purpose.tag()) {
+            return Err("refusing to sign: the message is not a CubeLang message of this purpose".into());
+        }
+        let mut kp = ml_dsa_87::generate_key_pair(*self.xi);
+        let signed = ml_dsa_87::sign(&kp.signing_key, message, purpose.context(), [0u8; 32]);
+        kp.signing_key.as_mut_slice().zeroize();
+        let ml = signed.map_err(|e| format!("ML-DSA-87 signing failed: {:?}", e))?;
+        Ok(HybridSignature { ml_dsa: ml.as_slice().to_vec(), ed25519: self.ed25519.sign(message).to_bytes().to_vec() })
     }
 
     /// Open a key file. A sealed file needs its passphrase; a plaintext one takes none.
@@ -357,7 +512,7 @@ impl Identity {
 
     /// The public entry this identity's keys belong to (unregistered).
     pub fn public_entry(&self, model_sha256: Option<String>) -> KeyEntry {
-        KeyEntry {
+        let mut e = KeyEntry {
             name: self.name.clone(),
             kind: self.kind,
             scheme: SCHEME.to_string(),
@@ -365,7 +520,14 @@ impl Identity {
             ed25519: to_hex(self.ed25519.verifying_key().as_bytes()),
             model_sha256: model_sha256.map(|h| h.to_ascii_lowercase()),
             registration: None,
-        }
+            kem: None,
+        };
+        let x = x25519_dalek::PublicKey::from(&self.x25519).to_bytes();
+        let msg = kem_binding_message(&e, KEM_SCHEME, &self.ml_kem_ek, &x);
+        let binding = self.sign_deterministic(Purpose::Kem, &msg)
+            .expect("a binding message always starts with its own tag");
+        e.kem = Some(KemKeys { scheme: KEM_SCHEME.into(), ml_kem: to_hex(&self.ml_kem_ek), x25519: to_hex(&x), binding });
+        e
     }
 
     /// Both signatures for `purpose` (ML-DSA hedged with fresh randomness). Refuses a message that is
@@ -637,6 +799,9 @@ impl Keyring {
                 return Err(format!("keyring: root {} carries a registration; a root is an anchor the host's owner places", r.name));
             }
             let keys = decode_public(r).map_err(|e| format!("keyring: {}", e))?;
+            if r.kem.is_some() {
+                kem_checked(r, &keys).map_err(|e| format!("keyring: {}", e))?;
+            }
             all.insert(r.name.clone(), Admitted { keys, kind: r.kind, not_after_ms: None });
             roots.insert(r.name.clone());
         }
@@ -665,6 +830,11 @@ impl Keyring {
             signer.keys
                 .verify(Purpose::Register, &reg.signature, &registration_message(k, &reg.by, reg.at_ms, reg.not_after_ms))
                 .map_err(|e| format!("keyring: the registration of {} by {}: {}", k.name, reg.by, e))?;
+            // encryption keys, when the entry has them, must carry the entry's own signature: a
+            // keyring with one swapped key pair is refused whole, like a broken chain
+            if k.kem.is_some() {
+                kem_checked(k, &keys).map_err(|e| format!("keyring: {}", e))?;
+            }
             if k.kind == Kind::Registrar {
                 registrars.insert(k.name.clone());
             }
@@ -700,6 +870,19 @@ impl Keyring {
 
     pub fn get(&self, name: &str) -> Option<&KeyEntry> {
         self.roots.iter().chain(self.keys.iter()).find(|k| k.name == name)
+    }
+
+    /// The entry content is sealed to when it is addressed to `name` (2026-10-24): the chain
+    /// admits it now (registered, not revoked, not expired at `now_ms`) and it has encryption keys.
+    pub fn recipient(&self, name: &str, now_ms: u64) -> Result<&KeyEntry, String> {
+        let admitted = self.admitted()?;
+        let a = admitted.get(name).ok_or_else(|| format!("{} is not admitted by the keyring (unknown or revoked)", name))?;
+        if a.not_after_ms.is_some_and(|t| now_ms > t) {
+            return Err(format!("{}: the registration expired", name));
+        }
+        let e = self.get(name).expect("an admitted name is in the keyring");
+        kem_public(e)?;
+        Ok(e)
     }
 
     /// Append a registered entry, checked exactly as a load would check it.
@@ -774,6 +957,19 @@ impl Verifier {
     /// The kind of an admitted caller (None: unknown, revoked or never admitted).
     pub fn kind_of(&self, name: &str) -> Option<Kind> {
         self.admitted.get(name).map(|a| a.kind)
+    }
+
+    /// Check a signature on sealed content (`Purpose::Seal`, 2026-10-24): the signer is admitted
+    /// now and both schemes verify. Sealed content carries no nonce -- it is a document, and a
+    /// copy of a document is the same document -- so nothing is recorded.
+    pub fn check_sender(&self, name: &str, signature: &HybridSignature, message: &[u8], now_ms: u64) -> Result<Kind, String> {
+        let who = self.admitted.get(name)
+            .ok_or_else(|| format!("sender {:?} is not in the keyring (or was revoked)", name))?;
+        if who.not_after_ms.is_some_and(|t| now_ms > t) {
+            return Err(format!("sender {}: the registration expired", name));
+        }
+        who.keys.verify(Purpose::Seal, signature, message).map_err(|e| format!("sender {}: {}", name, e))?;
+        Ok(who.kind)
     }
 
     /// Swap in a reloaded keyring, keeping the pins and the nonces seen (a reload must not reopen a
@@ -1120,5 +1316,54 @@ mod tests {
         assert!(v.check("A", &sig, now, 1, &msg, now).is_ok());
         v.replace_keyring(ring).unwrap();
         assert!(v.check("A", &sig, now, 1, &msg, now).unwrap_err().contains("replay"));
+    }
+
+    /// The fingerprint of the encryption keys `[7u8; 32]` derives (HKDF-SHA-384 → FIPS 203 (d, z) /
+    /// X25519 secret), pinned 2026-10-24: a printed seed must keep opening what was sealed to it.
+    /// (Cross-checked once against independent code: kyber-py's pure-Python FIPS 203 key generation
+    /// from the same (d, z), pyca/cryptography's X25519, and HKDF written out by hand.)
+    const KAT_SEED7_KEM: &str =
+        "3fc17258c68cd3728220be0e211ea8d25bc3329be8baacded09287957a6472acdaafbd25847b442084d3efc88dc3aff2";
+
+    #[test]
+    fn encryption_keys_come_from_the_seed_and_carry_its_signature() {
+        let seed = [7u8; 32];
+        let (_f, pk) = identity_from_seed("A", Kind::Agent, &seed, None, Protect::Plaintext).unwrap();
+        let (ek, x) = kem_public(&pk).unwrap();
+        assert_eq!(to_hex(&kem_fingerprint(&ek, &x)), KAT_SEED7_KEM,
+                   "the encryption key derivation changed: sealed content would no longer open");
+        assert_eq!(fingerprint(&pk), KAT_SEED7_FINGERPRINT, "the signing keys did not move");
+        let id = Identity::from_seed("A", Kind::Agent, &seed).unwrap();
+        assert_eq!(id.kem_fingerprint(), kem_fingerprint(&ek, &x));
+        // an entry is a function of its seed, binding included (deterministic ML-DSA)
+        assert_eq!(id.public_entry(None), id.public_entry(None));
+    }
+
+    #[test]
+    fn a_keyring_with_swapped_encryption_keys_is_refused_whole() {
+        let (_a, a_pk) = ident("A", Kind::User);
+        let (_b, b_pk) = ident("B", Kind::User);
+        let (ring, _root, r) = chain(&[a_pk, b_pk.clone()]);
+        assert!(ring.recipient("A", now_ms()).is_ok());
+
+        // whoever writes the file gives A's entry B's encryption keys: A's registration still
+        // verifies (it covers the signing keys), the binding does not
+        let mut forged = ring.clone();
+        let i = forged.keys.iter().position(|k| k.name == "A").unwrap();
+        forged.keys[i].kem = b_pk.kem.clone();
+        let err = Keyring::from_json(&forged.to_json()).unwrap_err();
+        assert!(err.contains("not signed by its own keys"), "{err}");
+
+        // an entry from before encryption keys still loads, and refuses to be sealed to
+        let mut old = ring.clone();
+        old.keys[i].kem = None;
+        let old = Keyring::from_json(&old.to_json()).unwrap();
+        assert!(old.recipient("A", now_ms()).unwrap_err().contains("no encryption keys"));
+
+        // a revoked entry is no recipient
+        let mut revoked = ring.clone();
+        revoked.add_revocation(revoke(&r, ring.get("A").unwrap(), 5, "lost").unwrap()).unwrap();
+        assert!(revoked.recipient("A", now_ms()).unwrap_err().contains("not admitted"));
+        assert!(revoked.recipient("B", now_ms()).is_ok());
     }
 }
