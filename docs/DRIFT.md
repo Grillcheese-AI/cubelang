@@ -456,6 +456,20 @@ A large fraction of README.md's own examples (every `container`/`world`/
 demonstrating syntax that **cannot be run at all** by the shipped VM — not
 "runs with reduced semantics," but zero bytecode, period.
 
+> **Partly resolved 2026-10-24 (structs):** top-level `struct` declarations
+> are now read by the compiler. A struct value is a map holding every declared
+> field (defaults filled; a missing required field, an unknown or repeated
+> field, an unknown struct, or a literal of the wrong declared type is a
+> compile error). `p.x` / `self.p.x` / `a.b.c` read through a new field
+> operand (it used to read a register literally named "p.x", which nothing
+> could write: every field read was a silent 0, and `f().x` read a register
+> named "x"); `p.x = v` writes; struct, map and array literals work in any
+> operand position (built into temporaries first). Also fixed on the way:
+> `null` compiled to the integer 0; `create m : map<K,V>` never made the empty
+> map this entry's C4 describes (the type operand is a hash and was compared
+> as `t_xxxx`); and `len()` of a map read 0. Pinned by `tests/structs.rs`.
+> `container`/`world`/`safety` and `event`/`extend` are still not visited.
+
 ### C11. A non-trivial expression used as a call argument (or general RHS) silently becomes garbage — and `--strict` does NOT catch it
 `compiler::Compiler::compile_expr_operand` (`src/compiler.rs:1648-1670`) has
 a real encoding only for `IntLit`/`FloatLit`/`StringLit`/`BoolLit`/`Null`/

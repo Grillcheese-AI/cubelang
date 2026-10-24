@@ -334,6 +334,22 @@ fn disasm_bytecode(bc: &[u8]) {
                         pos += 2;
                     }
                 }
+                0x07 => { // Field: base hash, path length, then (len, utf-8 key) per key
+                    if pos + 2 < bc.len() {
+                        let base = format!("{:02x}{:02x}", bc[pos], bc[pos + 1]);
+                        let n = bc[pos + 2] as usize;
+                        pos += 3;
+                        let mut keys = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            let Some(&len) = bc.get(pos) else { break };
+                            let end = (pos + 1 + len as usize).min(bc.len());
+                            keys.push(String::from_utf8_lossy(&bc[pos + 1..end]).into_owned());
+                            pos = end;
+                        }
+                        operands.push(format!("field(named({}).{})", base, keys.join(".")));
+                    }
+                }
+                0x08 => operands.push("null".into()),
                 0x00 => { // None
                     if pos + 1 < bc.len() {
                         pos += 2;

@@ -108,6 +108,11 @@ const OP_TYPE: u8   = 0x03;
 const OP_ROLE: u8   = 0x04;
 const OP_GLOBAL: u8 = 0x05;
 const OP_FLOAT: u8  = 0x06;
+/// A field read, `base.f1.f2` (2026-10-24): the base register's hash, the path
+/// length, then each key as a length-prefixed UTF-8 string.
+const OP_FIELD: u8  = 0x07;
+/// The `null` literal (2026-10-24). It used to compile to the integer 0.
+const OP_NULL: u8   = 0x08;
 const OP_NONE: u8   = 0x00;
 
 /// BLAKE3 2-byte prefix of a string (deterministic hash).
@@ -833,6 +838,9 @@ pub struct Compiler {
     /// 2026-10-24: the source file's struct / enum / alias declarations
     /// (`types::table_of`), gathered once per `compile()` like `used_modules`.
     types: crate::types::TypeTable,
+    /// The struct declarations themselves (with their default expressions),
+    /// for struct literals.
+    struct_decls: HashMap<String, StructDecl>,
 }
 
 impl Compiler {
@@ -855,6 +863,7 @@ impl Compiler {
             operand_errors: Vec::new(),
             current_span: None,
             types: crate::types::TypeTable::default(),
+            struct_decls: HashMap::new(),
         }
     }
 
@@ -905,6 +914,12 @@ impl Compiler {
         // any program compiles -- signatures, struct literals and the
         // run-time checks all resolve type names through it.
         self.types = crate::types::table_of(source);
+        self.struct_decls = source.items.iter()
+            .filter_map(|item| match item {
+                TopLevel::Struct(decl) => Some((decl.name.clone(), decl.clone())),
+                _ => None,
+            })
+            .collect();
 
         let mut programs = Vec::new();
         for item in &source.items {
@@ -1378,6 +1393,11 @@ impl Compiler {
         if self.strict {
             self.strict_check_stmt(stmt);
         }
+        // 2026-10-24: struct, map and array literals in operand positions are
+        // built into temporaries first (this compiler has no other lowering
+        // pass; see C11).
+        let hoisted = self.hoist_literals(stmt);
+        let stmt = hoisted.as_ref().unwrap_or(stmt);
         match stmt {
             Stmt::Opcode(op) => self.compile_opcode(op),
             Stmt::Let(l) => self.compile_let(l),
@@ -1568,7 +1588,14 @@ impl Compiler {
                 self.emit_byte(op::CREATE);
                 self.emit_byte(2); // 2 operands
                 self.emit_named(reg);
-                self.emit_type(ty);
+                // `map<str, number>` / `array<str>` create containers: the VM
+                // knows them by the bare name, as `type_name` spells them.
+                let base = ty.split('<').next().unwrap_or(ty).trim();
+                if base == "map" || base == "array" {
+                    self.emit_type(base);
+                } else {
+                    self.emit_type(ty);
+                }
             }
             OpcodeStmt::Assign { reg, value } => {
                 self.emit_debug(op::ASSIGN, &format!("assign {} = ...", reg));
@@ -2016,6 +2043,36 @@ impl Compiler {
             }
         }
 
+        // Field target (2026-10-24): `p.x = v` / `self.p.x = v` writes the
+        // field of the struct (a map) held in `p`. A nested `a.b.c = v` would
+        // need the inner value read out, changed and written back: refused
+        // below, as before.
+        if let Expr::Field(base, field) = &a.target {
+            let container = match base.as_ref() {
+                Expr::Ident(name) | Expr::SelfAccess(name) => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(container) = container {
+                if !matches!(a.op, AssignOp::Eq) {
+                    self.operand_errors.push(ParseError {
+                        message: format!(
+                            "compound assignment `{:?}` to a field (`{}.{}`) is not supported -- read the \
+                             field into a register, apply the operator there, then assign it back",
+                            a.op, container, field),
+                        span: a.span,
+                    });
+                    return;
+                }
+                self.emit_debug(op::SET_INDEX, &format!("{}.{} = ...", container, field));
+                self.emit_byte(op::SET_INDEX);
+                self.emit_byte(3);
+                self.emit_named(&container);
+                self.emit_global(field);
+                self.compile_expr_operand(&a.value);
+                return;
+            }
+        }
+
         // Anything else: a nested field (`a.b.c = v`), a nested index, a call
         // result. These used to compile to nothing at all. They are now a
         // hard error in every mode, for the same reason as C11 -- a statement
@@ -2030,6 +2087,27 @@ impl Compiler {
     }
 
     fn compile_let(&mut self, let_stmt: &LetStmt) {
+        // 2026-10-24: `let p = Point { x: 1 };` and `let m = { k: v };` build
+        // the value straight into the variable.
+        match &let_stmt.value {
+            Expr::StructLit(name, fields) => {
+                if let Some(ty) = &let_stmt.ty {
+                    let declared = crate::types::TypeSpec::from_expr(ty, &self.types);
+                    let lit = crate::types::TypeSpec::Named(name.clone());
+                    if !declared.accepts_literal(&lit, &self.types) {
+                        self.literal_error(format!(
+                            "`let {}: {}` is given a {} literal", let_stmt.name, declared.spell(), name));
+                    }
+                }
+                self.build_struct(&let_stmt.name, name, fields);
+                return;
+            }
+            Expr::MapLit(pairs) => {
+                self.build_map(&let_stmt.name, pairs);
+                return;
+            }
+            _ => {}
+        }
         // let x = expr → CREATE x + ASSIGN x = expr
         self.emit_debug(op::CREATE, &format!("let {}", let_stmt.name));
         self.emit_byte(op::CREATE);
@@ -2145,17 +2223,31 @@ impl Compiler {
             Expr::FloatLit(f) => self.emit_float_imm(*f),
             Expr::StringLit(s) => self.emit_global(s),
             Expr::BoolLit(b) => self.emit_imm(if *b { 1 } else { 0 }),
-            Expr::Null => self.emit_imm(0),
+            Expr::Null => self.emit_byte(OP_NULL),
             Expr::Ident(name) => self.emit_named(name),
             Expr::SelfAccess(field) => self.emit_named(field),
-            Expr::Field(base, field) => {
-                // For now, emit as the field name (the VM resolves at runtime)
-                if let Expr::Ident(base_name) = base.as_ref() {
-                    self.emit_named(&format!("{}.{}", base_name, field));
-                } else {
-                    self.emit_named(field);
+            // 2026-10-24: a real field read. Until now `p.x` compiled to a
+            // register literally named "p.x", which nothing could ever write
+            // (a field assignment was a compile error), so every field read
+            // silently produced 0; and `f().x` read a register named "x".
+            Expr::Field(..) => match field_path(expr) {
+                Some((base, path)) if path.iter().all(|k| k.len() <= 255) && path.len() <= 255 => {
+                    self.emit_field(&base, &path);
                 }
-            }
+                _ => {
+                    self.operand_errors.push(ParseError {
+                        message: format!(
+                            "a field read needs a variable at its base (`p.x`, `self.p.x`, `a.b.c`){}; \
+                             put the value in a variable first",
+                            if self.current_function.is_empty() { String::new() }
+                            else { format!(" in {}::{}", self.current_program, self.current_function) }),
+                        span: self.current_span.unwrap_or(Span { line: 0, col: 0, offset: 0 }),
+                    });
+                    self.emit_byte(OP_NONE);
+                    self.emit_byte(0x00);
+                    self.emit_byte(0x00);
+                }
+            },
             _ => {
                 // DRIFT.md §C11: this used to silently emit an opaque
                 // OP_NONE placeholder here -- e.g. `double_it(x - y)`
@@ -2237,6 +2329,202 @@ impl Compiler {
         let hash = name_hash(name);
         self.emit_byte(hash[0]);
         self.emit_byte(hash[1]);
+    }
+
+    /// `base.k1.k2...` as one operand (the caller checked the lengths fit a byte).
+    fn emit_field(&mut self, base: &str, path: &[String]) {
+        self.emit_byte(OP_FIELD);
+        let hash = name_hash(base);
+        self.emit_byte(hash[0]);
+        self.emit_byte(hash[1]);
+        self.emit_byte(path.len() as u8);
+        for key in path {
+            self.emit_byte(key.len() as u8);
+            for b in key.as_bytes() {
+                self.emit_byte(*b);
+            }
+        }
+    }
+
+    fn fresh_temp(&mut self, what: &str) -> String {
+        self.label_counter += 1;
+        format!("__{}_{}", what, self.label_counter)
+    }
+
+    fn literal_error(&mut self, message: String) {
+        let at = if self.current_function.is_empty() { String::new() }
+                 else { format!(" (in {}::{})", self.current_program, self.current_function) };
+        self.operand_errors.push(ParseError {
+            message: format!("{}{}", message, at),
+            span: self.current_span.unwrap_or(Span { line: 0, col: 0, offset: 0 }),
+        });
+    }
+
+    /// Build a struct literal into the register `dst` (2026-10-24). A struct
+    /// value is a map holding every declared field: a field the literal leaves
+    /// out takes its declared default; one with no default, a field the struct
+    /// does not declare, a field given twice, or a literal of the wrong type is
+    /// a compile error.
+    fn build_struct(&mut self, dst: &str, name: &str, given: &[(String, Expr)]) {
+        let Some(decl) = self.struct_decls.get(name).cloned() else {
+            self.literal_error(format!("`{} {{ ... }}`: no struct named {} is declared", name, name));
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        for (field, _) in given {
+            if !seen.insert(field.as_str()) {
+                self.literal_error(format!("`{} {{ ... }}` gives the field `{}` twice", name, field));
+            }
+            if !decl.fields.iter().any(|f| &f.name == field) {
+                self.literal_error(format!(
+                    "struct {} has no field `{}` (its fields: {})", name, field,
+                    decl.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")));
+            }
+        }
+        let mut values: Vec<(String, Expr)> = Vec::with_capacity(decl.fields.len());
+        for f in &decl.fields {
+            let value = match given.iter().find(|(n, _)| n == &f.name) {
+                Some((_, v)) => v.clone(),
+                None => match &f.default {
+                    Some(d) => d.clone(),
+                    None => {
+                        self.literal_error(format!(
+                            "`{} {{ ... }}` leaves out `{}`, which has no default", name, f.name));
+                        continue;
+                    }
+                },
+            };
+            let spec = crate::types::TypeSpec::from_expr(&f.ty, &self.types);
+            if let Some(lit) = crate::types::TypeSpec::of_literal(&value) {
+                if !spec.accepts_literal(&lit, &self.types) {
+                    self.literal_error(format!(
+                        "`{}.{}` is declared {} but the literal is {}", name, f.name, spec.spell(), lit.spell()));
+                }
+            }
+            values.push((f.name.clone(), value));
+        }
+        self.emit_container(dst, "map");
+        for (field, value) in values {
+            let value = self.materialize(&value);
+            self.emit_byte(op::SET_INDEX);
+            self.emit_byte(3);
+            self.emit_named(dst);
+            self.emit_global(&field);
+            self.compile_expr_operand(&value);
+        }
+    }
+
+    /// Build a map literal `{ k: v, ... }` into `dst`.
+    fn build_map(&mut self, dst: &str, pairs: &[(Expr, Expr)]) {
+        self.emit_container(dst, "map");
+        for (k, v) in pairs {
+            // a bare word as a key is the key's text, as in `{ name: "x" }`
+            let key = match k {
+                Expr::Ident(word) => Expr::StringLit(word.clone()),
+                other => self.materialize(other),
+            };
+            let value = self.materialize(v);
+            self.emit_byte(op::SET_INDEX);
+            self.emit_byte(3);
+            self.emit_named(dst);
+            self.compile_expr_operand(&key);
+            self.compile_expr_operand(&value);
+        }
+    }
+
+    fn emit_container(&mut self, dst: &str, ty: &str) {
+        self.emit_debug(op::CREATE, &format!("create {} : {}", dst, ty));
+        self.emit_byte(op::CREATE);
+        self.emit_byte(2);
+        self.emit_named(dst);
+        self.emit_type(ty);
+    }
+
+    /// Turn the literals inside an operand expression into registers
+    /// (2026-10-24): a struct, map or array literal is built into a fresh
+    /// temporary first and the expression refers to the temporary. Calls keep
+    /// their shape, with their arguments materialized. Anything else is
+    /// returned unchanged.
+    fn materialize(&mut self, e: &Expr) -> Expr {
+        match e {
+            Expr::StructLit(name, fields) => {
+                let tmp = self.fresh_temp("struct");
+                self.build_struct(&tmp, name, fields);
+                Expr::Ident(tmp)
+            }
+            Expr::MapLit(pairs) => {
+                let tmp = self.fresh_temp("map");
+                self.build_map(&tmp, pairs);
+                Expr::Ident(tmp)
+            }
+            Expr::ArrayLit(elems) => {
+                let tmp = self.fresh_temp("array");
+                let elems: Vec<Expr> = elems.iter().map(|x| self.materialize(x)).collect();
+                self.emit_byte(op::CREATE);
+                self.emit_byte(2);
+                self.emit_named(&tmp);
+                self.emit_type("auto");
+                self.emit_byte(op::MAKE_ARRAY);
+                self.emit_byte((elems.len() as u8).saturating_add(2));
+                self.emit_named(&tmp);
+                self.emit_imm(elems.len() as i64);
+                for x in &elems {
+                    self.compile_expr_operand(x);
+                }
+                Expr::Ident(tmp)
+            }
+            Expr::Call(callee, args) => {
+                Expr::Call(callee.clone(), args.iter().map(|a| self.materialize(a)).collect())
+            }
+            Expr::MethodCall(obj, method, args) => {
+                Expr::MethodCall(obj.clone(), method.clone(), args.iter().map(|a| self.materialize(a)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// The statement with the literals in its operand positions materialized
+    /// (`return Point { x: 1 };`, `f({ k: v })`, `x = [a, b];`), or `None`
+    /// when it holds none. A `let` builds a top-level struct or map literal
+    /// straight into its own variable (`compile_let`), so only the literals
+    /// nested inside it are hoisted here.
+    fn hoist_literals(&mut self, stmt: &Stmt) -> Option<Stmt> {
+        fn has_literal(e: &Expr) -> bool {
+            match e {
+                // an array literal is not an operand either: in an operand
+                // position it is built into a temporary like the others
+                Expr::StructLit(..) | Expr::MapLit(..) | Expr::ArrayLit(..) => true,
+                Expr::Call(_, args) | Expr::MethodCall(_, _, args) => args.iter().any(has_literal),
+                _ => false,
+            }
+        }
+        match stmt {
+            Stmt::Let(l) => {
+                let nested = match &l.value {
+                    Expr::StructLit(_, fs) => fs.iter().any(|(_, v)| has_literal(v)),
+                    Expr::MapLit(ps) => ps.iter().any(|(k, v)| has_literal(k) || has_literal(v)),
+                    Expr::ArrayLit(xs) => xs.iter().any(has_literal),
+                    other => has_literal(other),
+                };
+                if !nested {
+                    return None;
+                }
+                let value = match &l.value {
+                    // the outer literal stays for compile_let; its parts are built there
+                    Expr::StructLit(..) | Expr::MapLit(..) => return None,
+                    Expr::ArrayLit(xs) => Expr::ArrayLit(xs.iter().map(|x| self.materialize(x)).collect()),
+                    other => self.materialize(other),
+                };
+                Some(Stmt::Let(LetStmt { value, ..l.clone() }))
+            }
+            Stmt::Assign(a) if has_literal(&a.value) => {
+                let value = self.materialize(&a.value);
+                Some(Stmt::Assign(AssignStmt { value, ..a.clone() }))
+            }
+            Stmt::Return(Some(e)) if has_literal(e) => Some(Stmt::Return(Some(self.materialize(e)))),
+            Stmt::Expr(e) if has_literal(e) => Some(Stmt::Expr(self.materialize(e))),
+            _ => None,
+        }
     }
 
     fn emit_imm(&mut self, val: i64) {
@@ -2405,6 +2693,20 @@ fn stmt_span(stmt: &Stmt) -> Option<Span> {
         Stmt::Asm(b) => Some(b.span),
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Opcode(_) | Stmt::Expr(_)
         | Stmt::Commit | Stmt::Rollback => None,
+    }
+}
+
+/// `p.x` / `self.p.x` / `a.b.c` as (base register, field path); `None` when
+/// the base is not a variable (`f().x`, `xs[0].y`).
+fn field_path(e: &Expr) -> Option<(String, Vec<String>)> {
+    match e {
+        Expr::Field(base, f) => {
+            let (b, mut path) = field_path(base)?;
+            path.push(f.clone());
+            Some((b, path))
+        }
+        Expr::Ident(n) | Expr::SelfAccess(n) => Some((n.clone(), Vec::new())),
+        _ => None,
     }
 }
 
@@ -2784,7 +3086,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("cannot be encoded as an operand"),
             "error should be the C11 operand diagnostic: {}", msg);
-        assert!(["BinOp", "MapLit", "StructLit", "UnaryOp", "Lambda"].iter().any(|f| msg.contains(f)),
+        // (Struct and map literals are built since 2026-10-24, so they no longer appear here.)
+        assert!(["BinOp", "UnaryOp", "Lambda", "MethodCall", "Call", "Index"].iter().any(|f| msg.contains(f)),
             "error should name the offending expression form: {}", msg);
     }
 

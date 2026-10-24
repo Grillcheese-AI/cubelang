@@ -896,10 +896,25 @@ impl VM {
                     // `type_name` (src/compiler.rs) collapses `map<K,V>` to
                     // "map" and `array<T>` to "array", so the two spellings
                     // below are the only ones that ever reach here.
-                    let init = match ty.as_str() {
-                        "map" => Value::Map(HashMap::new()),
-                        "array" => Value::Array(Vec::new()),
-                        _ => Value::Null,
+                    //
+                    // (2026-10-24) The type operand is a 2-byte hash, so its
+                    // `as_name()` is `t_xxxx` and never equalled "map": the
+                    // empty container was never created, and only SET_INDEX's
+                    // create-from-Null path hid it. Compare the hashes.
+                    let ty_hash = match operands.get(1) {
+                        Some(Operand::Type(h)) => Some(*h),
+                        _ => None,
+                    };
+                    let is = |t: &str| {
+                        let h = blake3::hash(t.as_bytes());
+                        ty_hash == Some([h.as_bytes()[0], h.as_bytes()[1]])
+                    };
+                    let init = if is("map") {
+                        Value::Map(HashMap::new())
+                    } else if is("array") {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Null
                     };
                     self.registers.insert(name, init);
                 }
@@ -929,6 +944,8 @@ impl VM {
                     let len = match self.registers.get(&arr) {
                         Some(Value::Array(v)) => v.len() as i64,
                         Some(Value::Str(s)) => s.len() as i64,
+                        // 2026-10-24: a map's (or struct's) entries; it used to read 0
+                        Some(Value::Map(m)) => m.len() as i64,
                         _ => 0,
                     };
                     self.trace_op(pc, &format!("LEN {} = len({}) → {}", dst, arr, len));
@@ -1793,9 +1810,25 @@ impl VM {
         match op {
             Some(Operand::Imm(n)) => *n,
             Some(Operand::FloatImm(f)) => *f as i64,
+            Some(Operand::Field(base, path)) => self.read_field(base, path).as_i64(),
+            Some(Operand::Null) => 0,
             Some(o) => self.registers.get(&o.as_name()).map(|v| v.as_i64()).unwrap_or(0),
             None => 0,
         }
+    }
+
+    /// `base.f1.f2...`: the base register's value, then each field in turn.
+    /// A missing field, or a field of something that is not a map (a struct
+    /// value is a map), reads as Null -- the same as an index past the end.
+    fn read_field(&self, base: &[u8; 2], path: &[String]) -> Value {
+        let mut v = self.registers.get(&format!("r_{:02x}{:02x}", base[0], base[1])).cloned().unwrap_or(Value::Null);
+        for key in path {
+            v = match v {
+                Value::Map(mut m) => m.remove(key).unwrap_or(Value::Null),
+                _ => return Value::Null,
+            };
+        }
+        v
     }
 
     /// Resolve an operand to a Value, preserving int vs float so arithmetic
@@ -1813,6 +1846,8 @@ impl VM {
         match op {
             Some(Operand::Imm(n)) => Value::Int(*n),
             Some(Operand::FloatImm(f)) => Value::Float(*f),
+            Some(Operand::Field(base, path)) => self.read_field(base, path),
+            Some(Operand::Null) => Value::Null,
             Some(o @ Operand::Named(_)) => {
                 self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Int(0))
             }
@@ -1843,6 +1878,8 @@ impl VM {
         match op {
             Some(Operand::Imm(n)) => Value::Int(*n),
             Some(Operand::FloatImm(f)) => Value::Float(*f),
+            Some(Operand::Field(base, path)) => self.read_field(base, path),
+            Some(Operand::Null) => Value::Null,
             Some(o @ Operand::Named(_)) => {
                 self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Null)
             }
@@ -1909,6 +1946,8 @@ impl VM {
         match op {
             Some(Operand::Imm(n)) => Value::Int(*n),
             Some(Operand::FloatImm(f)) => Value::Float(*f),
+            Some(Operand::Field(base, path)) => self.read_field(base, path),
+            Some(Operand::Null) => Value::Null,
             Some(o) => Value::Str(self.resolve_symbol_name(Some(o))),
             None => Value::Null,
         }
@@ -2145,6 +2184,12 @@ enum Operand {
     Type([u8; 2]),
     Role([u8; 2]),
     Global([u8; 2]),
+    /// A field read (2026-10-24): the base register's hash and the field
+    /// path, spelled out (`p.x`, `a.b.c`). The keys travel as text, not as
+    /// hashes, so a read never depends on reversing a 2-byte hash.
+    Field([u8; 2], Vec<String>),
+    /// The `null` literal (2026-10-24; it used to compile to the integer 0).
+    Null,
     None,
 }
 
@@ -2157,6 +2202,8 @@ impl Operand {
             Operand::Role(h) => format!("role_{:02x}{:02x}", h[0], h[1]),
             Operand::Imm(n) => format!("imm_{}", n),
             Operand::FloatImm(f) => format!("fimm_{}", f),
+            Operand::Field(h, path) => format!("field_{:02x}{:02x}.{}", h[0], h[1], path.join(".")),
+            Operand::Null => "null".into(),
             Operand::None => "_".into(),
         }
     }
@@ -2315,6 +2362,24 @@ fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
                 (Operand::None, 1)
             }
         }
+        0x07 => { // Field: base hash (2), path length (1), then each key as (len, utf-8 bytes)
+            if bytes.len() < 4 {
+                return (Operand::None, bytes.len());
+            }
+            let base = [bytes[1], bytes[2]];
+            let n = bytes[3] as usize;
+            let mut at = 4;
+            let mut path = Vec::with_capacity(n);
+            for _ in 0..n {
+                let Some(&len) = bytes.get(at) else { return (Operand::None, bytes.len()) };
+                let len = len as usize;
+                let Some(raw) = bytes.get(at + 1..at + 1 + len) else { return (Operand::None, bytes.len()) };
+                path.push(String::from_utf8_lossy(raw).into_owned());
+                at += 1 + len;
+            }
+            (Operand::Field(base, path), at)
+        }
+        0x08 => (Operand::Null, 1), // the `null` literal
         0x00 => { // None
             if bytes.len() >= 3 {
                 (Operand::None, 3)
