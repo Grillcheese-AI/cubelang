@@ -101,7 +101,8 @@ COMMANDS:
                    Caller as JSON
     knowledge      build FACTS.jsonl -o OUT.cubeseg (freeze facts into a
                    shared, memory-light segment) | info FILE | lookup FILE
-                   KEY | keys FILE PREFIX
+                   KEY | fuzzy FILE KEY [--edits N] [--limit N] | keys FILE
+                   PREFIX
     history        append DIR [--speaker S] TEXT | search DIR WORDS
                    [--prefix|--fuzzy] [--limit N] | recent DIR [N] | forget
                    DIR ID | merge DIR | gc DIR | info DIR | seal DIR (a

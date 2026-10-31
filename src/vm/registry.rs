@@ -97,6 +97,7 @@ impl ModuleRegistry {
         modules.insert("demo".to_string(), demo_module());
         modules.insert("vsa".to_string(), vsa_module());
         modules.insert("history".to_string(), history_module());
+        modules.insert("knowledge".to_string(), knowledge_module());
         Self { version: REGISTRY_VERSION, modules }
     }
 
@@ -241,6 +242,57 @@ fn history_module() -> Module {
     functions.insert("turn".to_string(), sealed(history_turn));
     functions.insert("recent".to_string(), sealed(history_recent));
     Module { functions }
+}
+
+/// The `knowledge` module (order 0046, 2026-10-31): `fuzzy(key, edits, limit)`, the knowledge store's keys
+/// within `edits` edits of `key` (0 to 2; 1 if left out), nearest first, as maps `{key, edits, text,
+/// source}`, one per fact, at most `limit` keys (default 20, at most 200). A typo lookup through each
+/// segment's index (`knowledge::fuzzy_lookup`); `query` stays exact, and a hit here carries its distance,
+/// never a score of 1.0. Counts against the query budget (`knowledge~N:<key>` in the branch report). Sealed.
+fn knowledge_module() -> Module {
+    let mut functions = HashMap::new();
+    functions.insert("fuzzy".to_string(), ModuleFn { overridable: false, call: knowledge_fuzzy });
+    Module { functions }
+}
+
+fn knowledge_fuzzy(vm: &mut VM, args: &[Value]) -> Value {
+    let Some(key) = text_arg(vm, args.first()) else {
+        vm.native_error = Some("takes the name to look up: a string, or a variable holding one".into());
+        return Value::Null;
+    };
+    let edits = match count_arg(vm, args.get(1)) {
+        None => 1,
+        Some(n @ 0..=2) => n as u32,
+        Some(_) => {
+            vm.native_error = Some("edits: 0, 1 or 2".into());
+            return Value::Null;
+        }
+    };
+    let limit = match count_arg(vm, args.get(2)) {
+        Some(n) if n > 0 => (n as usize).min(HISTORY_MAX),
+        Some(_) => {
+            vm.native_error = Some("a result cap must be at least 1".into());
+            return Value::Null;
+        }
+        None => HISTORY_LIMIT,
+    };
+    if vm.query_budget > 0 && vm.queried.len() as u64 >= vm.query_budget {
+        vm.native_error = Some(format!("query budget exhausted ({} queries)", vm.query_budget));
+        return Value::Null;
+    }
+    let hits = crate::vm::knowledge::fuzzy_lookup(&vm.knowledge, &key, edits, limit);
+    vm.queried.push((format!("knowledge~{}:{}", edits, key), hits.len()));
+    Value::Array(hits.into_iter().flat_map(|h| {
+        let (k, e) = (h.key, h.edits);
+        h.facts.into_iter().map(move |f| {
+            let mut m = HashMap::new();
+            m.insert("key".to_string(), Value::Str(k.clone()));
+            m.insert("edits".to_string(), Value::Int(e as i64));
+            m.insert("text".to_string(), Value::Str(f.text));
+            m.insert("source".to_string(), Value::Str(f.source));
+            Value::Map(m)
+        })
+    }).collect())
 }
 
 use crate::vm::history::{SearchMode, Turn};

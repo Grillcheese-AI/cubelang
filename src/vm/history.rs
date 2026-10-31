@@ -109,7 +109,7 @@ fn fuzzy_distance(term: &str) -> u32 {
 }
 
 /// Edit distance (Levenshtein), for the few turns still in the top layer.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -123,12 +123,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// One query word, ready to match: built once per search and used on every segment (a
-/// Levenshtein automaton is far costlier to build than to run).
+/// One query word, ready to match: built once per search and used on every segment.
 enum Matcher {
     Exact(String),
     Prefix(String),
-    Fuzzy(String, fst::automaton::Levenshtein),
+    Fuzzy(String, crate::vm::lev::Lev),
 }
 
 impl Matcher {
@@ -136,11 +135,8 @@ impl Matcher {
         match mode {
             SearchMode::Exact => Matcher::Exact(word.to_string()),
             SearchMode::Prefix => Matcher::Prefix(word.to_string()),
-            SearchMode::Fuzzy => match fst::automaton::Levenshtein::new(word, fuzzy_distance(word)) {
-                Ok(aut) => Matcher::Fuzzy(word.to_string(), aut),
-                // a word too long for the automaton's state budget: match it exactly
-                Err(_) => Matcher::Exact(word.to_string()),
-            },
+            // (2026-10-31: fst's own Levenshtein missed accented words at distance 2; `vm::lev`)
+            SearchMode::Fuzzy => Matcher::Fuzzy(word.to_string(), crate::vm::lev::Lev::new(word, fuzzy_distance(word))),
         }
     }
 

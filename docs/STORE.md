@@ -46,6 +46,15 @@ a key in the index rather than a copy of the facts, and `remove` finds a key's a
 - `freeze`: the top layer becomes a new segment. `compact`: every layer into one.
 - `KnowledgeStore::open(path)` / `to_segment()` / `KnowledgeSegment::write(path)`.
 - `cubelang knowledge build FACTS.jsonl -o OUT.cubeseg`, `info`, `lookup`, `keys PREFIX`.
+- **Typo lookup** (CubbyLLM order 0046, 2026-10-31): `knowledge::fuzzy_lookup(store, key, edits, limit)`,
+  `cubelang knowledge fuzzy FILE KEY [--edits N] [--limit N]`, and in a program `use knowledge;` then
+  `fuzzy(key, edits, limit)`. Every live key within `edits` (0 to 2; Levenshtein on characters, the
+  normalized key) of the mention, nearest first, then by key, each with its facts, through each segment's
+  own index (`src/vm/lev.rs`: a Levenshtein row walked down its keys; fst 0.4.7's own automaton missed
+  accented keys at distance 2, and the history's fuzzy search now uses this one too), pinned to answer
+  as a scan of every key does. `QUERY` stays exact: a hit carries its
+  `edits`, never a score of 1.0. A program's call counts against the query budget
+  (`knowledge~N:<key>` in the branch report).
 - `run-proto`: `knowledge_path` takes a `.cubeseg` or a `.jsonl` (parsed once and frozen); either way
   the resident process caches it by mtime and every request shares it.
 

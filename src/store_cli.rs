@@ -6,7 +6,7 @@ use std::process;
 
 use cubelang::vm::history::{History, SearchMode};
 use cubelang::vm::segment::Vault;
-use cubelang::vm::knowledge::{KnowledgeStore, keys_with_prefix};
+use cubelang::vm::knowledge::{KnowledgeStore, fuzzy_lookup, keys_with_prefix};
 
 /// A knowledge file as a store: a `.cubeseg` is opened as its frozen segment (no parse); anything
 /// else is read as facts `.jsonl`, parsed once, and frozen into one segment, so every fork of the
@@ -30,7 +30,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 pub fn cmd_knowledge(args: &[String]) {
     let open_knowledge = |p: &str| open_knowledge(p).map_err(|e| format!("knowledge {}", e));
-    let usage = "usage: cubelang knowledge build FACTS.jsonl -o OUT.cubeseg | info FILE | lookup FILE KEY | keys FILE PREFIX [--limit N]";
+    let usage = "usage: cubelang knowledge build FACTS.jsonl -o OUT.cubeseg | info FILE | lookup FILE KEY | fuzzy FILE KEY [--edits N] [--limit N] | keys FILE PREFIX [--limit N]";
     match args.first().map(String::as_str) {
         Some("build") => {
             let (Some(input), Some(out)) = (args.get(1), flag(args, "-o")) else { die(usage) };
@@ -54,6 +54,18 @@ pub fn cmd_knowledge(args: &[String]) {
             let store = open_knowledge(path).unwrap_or_else(|e| die(e));
             for f in store.lookup(key) {
                 println!("{}", serde_json::json!({ "text": f.text, "source": f.source }));
+            }
+        }
+        Some("fuzzy") => {
+            // the keys within N edits (1 by default, at most 2), nearest first, one JSON line per fact
+            let (Some(path), Some(key)) = (args.get(1), args.get(2)) else { die(usage) };
+            let edits = flag(args, "--edits").map(|n| n.parse().unwrap_or_else(|_| die("--edits takes 0, 1 or 2"))).unwrap_or(1);
+            let limit = flag(args, "--limit").map(|n| n.parse().unwrap_or_else(|_| die("--limit takes a number"))).unwrap_or(50);
+            let store = open_knowledge(path).unwrap_or_else(|e| die(e));
+            for h in fuzzy_lookup(&store, key, edits, limit) {
+                for f in &h.facts {
+                    println!("{}", serde_json::json!({ "key": h.key, "edits": h.edits, "text": f.text, "source": f.source }));
+                }
             }
         }
         Some("keys") => {

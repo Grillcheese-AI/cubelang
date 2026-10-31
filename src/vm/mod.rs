@@ -20,6 +20,7 @@ pub mod index;
 pub mod memory;
 pub mod segment;
 pub mod knowledge;
+pub mod lev;
 pub mod history;
 pub mod engine;
 pub mod registry;

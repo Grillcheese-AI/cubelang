@@ -515,6 +515,48 @@ pub fn keys_with_prefix(store: &KnowledgeStore, prefix: &str, limit: usize) -> V
     all.into_iter().filter(|k| !store.lookup_key(k).is_empty()).take(limit).collect()
 }
 
+/// The most edits a typo lookup allows: one or two, as the history's fuzzy search.
+pub const MAX_EDITS: u32 = 2;
+
+/// One key within reach of a mention: the key, how many edits away, its facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuzzyHit {
+    pub key: String,
+    pub edits: u32,
+    pub facts: Vec<Fact>,
+}
+
+/// Typo-tolerant lookup (order 0046, 2026-10-31): every live key at most `edits` edits (Levenshtein, on
+/// Unicode characters; capped at `MAX_EDITS`) from the normalized mention, nearest first, then by key, at
+/// most `limit`, each with its facts. Through each segment's own index (`vm::lev`, a Levenshtein row walked
+/// down its keys), never a read of every key; pinned to answer as a scan of every key does.
+///
+/// Not QUERY: QUERY stays exact. A hit here is a candidate carrying its distance, never a fact at
+/// confidence 1.0 -- the program decides what an edit away is worth (and that 0 edits is the exact hit).
+pub fn fuzzy_lookup(store: &KnowledgeStore, mention: &str, edits: u32, limit: usize) -> Vec<FuzzyHit> {
+    let q = normalize(mention);
+    let d = edits.min(MAX_EDITS);
+    if q.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let near = |k: &str| crate::vm::history::edit_distance(&q, k) <= d as usize;
+    let mut keys: std::collections::BTreeSet<String> = store.top.keys().filter(|k| near(k)).cloned().collect();
+    for s in &store.segments {
+        let mut st = s.map.search(crate::vm::lev::Lev::new(&q, d)).into_stream();
+        while let Some((k, _)) = st.next() {
+            keys.insert(String::from_utf8_lossy(k).into_owned());
+        }
+    }
+    let mut hits: Vec<FuzzyHit> = keys.into_iter().filter_map(|k| {
+        let facts = store.lookup_key(&k);
+        let e = crate::vm::history::edit_distance(&q, &k) as u32;
+        (!facts.is_empty()).then_some(FuzzyHit { key: k, edits: e, facts })
+    }).collect();
+    hits.sort_by(|a, b| a.edits.cmp(&b.edits).then_with(|| a.key.cmp(&b.key)));
+    hits.truncate(limit);
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
