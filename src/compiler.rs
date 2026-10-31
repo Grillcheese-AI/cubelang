@@ -431,6 +431,8 @@ impl CompiledProgram {
                 debug_lines: Vec::new(),
                 // Task 3: not in the .cubebin format yet -- see the field doc.
                 is_override: false,
+                access: Access::External,
+                once: false,
             });
         }
 
@@ -523,6 +525,45 @@ pub struct CompiledFunction {
     /// instead of re-checking. NOT carried through `.cubebin` yet (see
     /// `CompiledProgram::used_modules`'s doc — same gap, same reason).
     pub is_override: bool,
+    /// VM step 0 (2026-09-29): who may call this function, from the
+    /// `@external` / `@internal` / `@system` attribute (External when none is
+    /// written -- unchanged behaviour for every unmarked function). Enforced
+    /// by `VM::call_entry`, the host's entry: `@internal` and `@system` are
+    /// refused there. Not carried through `.cubebin` (same gap as
+    /// `is_override`).
+    pub access: Access,
+    /// `@once`: the VM refuses a second run of this function
+    /// (`VM::exec_function`). Not carried through `.cubebin`.
+    pub once: bool,
+}
+
+/// Who may call a function, from its access attribute. The three the SPEC
+/// names; every unmarked function is `External`, as it always effectively was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    External,
+    Internal,
+    System,
+}
+
+/// The access attribute a signature declares, and the `@once` flag.
+/// `@hook`/`@before`/`@after`/`@cron` are not access and are not here: the
+/// VM has no event bus, middleware or scheduler, so under strict they are
+/// compile errors (`Compiler::check_permissions`) and under `--loose` they
+/// are ignored, as before.
+pub fn access_of(sig: &FunctionSig) -> (Access, bool) {
+    let mut access = Access::External;
+    let mut once = false;
+    for p in &sig.permissions {
+        match p {
+            Permission::External => access = Access::External,
+            Permission::Internal => access = Access::Internal,
+            Permission::System => access = Access::System,
+            Permission::Once => once = true,
+            _ => {}
+        }
+    }
+    (access, once)
 }
 
 impl CompiledFunction {
@@ -776,10 +817,17 @@ impl Compiler {
             self.check_sealed_collision(&func.sig);
         }
 
+        // VM step 0: an attribute the VM cannot honour is a strict error,
+        // not a decoration.
+        if self.strict {
+            self.check_permissions(&func.sig);
+        }
+
         for stmt in &func.body {
             self.compile_stmt(stmt);
         }
 
+        let (access, once) = access_of(&func.sig);
         CompiledFunction {
             name: func.sig.name.clone(),
             params: func.sig.params.iter().map(|p| p.name.clone()).collect(),
@@ -787,6 +835,33 @@ impl Compiler {
             labels: self.labels.clone(),
             debug_lines: self.debug_lines.clone(),
             is_override: func.sig.is_override,
+            access,
+            once,
+        }
+    }
+
+    /// VM step 0 (2026-09-29): the permission attributes the VM does not
+    /// enforce are strict violations. `@external`/`@internal`/`@system` are
+    /// enforced at the host's entry (`VM::call_entry`) and `@once` in the VM,
+    /// so they pass; `@hook`, `@before`, `@after` and `@cron` promise an
+    /// event bus, middleware and a scheduler the VM does not have, and a
+    /// program that compiles with them advertises behaviour it will not get.
+    /// Advertised-and-unenforced is worse than absent.
+    fn check_permissions(&mut self, sig: &FunctionSig) {
+        for p in &sig.permissions {
+            let what = match p {
+                Permission::Hook(t) => format!("@hook({})", t),
+                Permission::Before(f) => format!("@before({})", f),
+                Permission::After(f) => format!("@after({})", f),
+                Permission::Cron(i) => format!("@cron({:?})", i),
+                Permission::Restricted(_) => "@restricted".to_string(),
+                Permission::Ratelimit(..) => "@ratelimit".to_string(),
+                Permission::External | Permission::Internal
+                | Permission::System | Permission::Once => continue,
+            };
+            self.strict_violation(
+                &format!("attribute {} on function {} (parsed, not enforced by the VM)", what, sig.name),
+                Some(sig.span.line));
         }
     }
 

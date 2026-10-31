@@ -17,9 +17,15 @@
 //! calibrates tau_vm = 1.0 / 0.4736328125 / 0.22021484375 against them, so the
 //! test prints them rather than only asserting -- run with
 //! `cargo test --test recover_scope -- --nocapture` to read them.
+//!
+//! VM step 0 (2026-09-29): the absent role is now STRUCTURAL. A frame records
+//! the roles bound into it, and `recover` of a role that is not among them
+//! returns Null with reason `absent_role` before any similarity is computed.
+//! The similarity threshold guards only crosstalk among roles that are
+//! present. The genuine numbers below do not move.
 
 use cubelang::compiler;
-use cubelang::vm::{ExecResult, VM, Value};
+use cubelang::vm::{ExecResult, RecoverReason, VM, Value};
 
 /// A frame with three roles bound, plus a role that is never bound anywhere,
 /// plus a second frame that shares the VM (so the global pool is genuinely
@@ -99,8 +105,11 @@ fn str_of(r: ExecResult) -> Option<String> {
 }
 
 /// Measure directly against the engine so the similarity is visible, not just
-/// the winning symbol.
-fn measure(role: &str, fillers: &[(&str, &str)]) -> Option<(String, f64)> {
+/// the winning symbol -- plus what the VM says about it: the reason and the
+/// runner-up.
+fn measure_with_reason(role: &str, fillers: &[(&str, &str)])
+    -> (Option<(String, f64)>, Option<RecoverReason>, Option<f64>)
+{
     // Load the real program so the VM's name table is populated the way it is
     // in production -- `load` registers every string literal in the program's
     // symbol table, which is exactly the global candidate pool under test.
@@ -110,23 +119,23 @@ fn measure(role: &str, fillers: &[(&str, &str)]) -> Option<(String, f64)> {
     let prog = progs.pop().expect("exactly one program");
     let mut vm = VM::new();
     vm.load(prog);
-
     for (r, f) in fillers {
         vm.vsa_bind_into("frame", r, f);
     }
-    vm.vsa_unbind_cleanup_known("frame", role)
+    let got = vm.vsa_unbind_cleanup_known("frame", role);
+    (got, vm.last_recover_reason, vm.last_recover_runner_up)
 }
 
 #[test]
 fn print_the_calibration_numbers() {
     let bound = [("SUBJECT", "cat"), ("OBJECT", "mouse"), ("VERB", "chased")];
 
-    let genuine = measure("SUBJECT", &bound);
-    let absent = measure("LOCATION", &bound);
+    let (genuine, greason, grunner) = measure_with_reason("SUBJECT", &bound);
+    let (absent, areason, _) = measure_with_reason("LOCATION", &bound);
 
     println!("\n--- WO-1.2 recover scoping: the numbers tau_vm is calibrated against ---");
-    println!("genuine recovery  (SUBJECT, bound):   {:?}", genuine);
-    println!("absent role       (LOCATION, unbound in a BOUND frame): {:?}", absent);
+    println!("genuine recovery  (SUBJECT, bound):   {:?} runner-up {:?} ({:?})", genuine, grunner, greason);
+    println!("absent role       (LOCATION, unbound in a BOUND frame): {:?} ({:?})", absent, areason);
     println!("tau_vm reference: 1 hop 1.0 | 2 hop 0.4736328125 | 3 hop 0.22021484375");
     println!("-----------------------------------------------------------------------\n");
 
@@ -142,26 +151,73 @@ fn print_the_calibration_numbers() {
     assert!(sim > TAU_VM_3HOP,
         "a genuine 3-role recovery must clear tau_vm(3)={TAU_VM_3HOP}, got {sim:.4}");
 
-    // The absent role still returns SOMETHING -- `recover` is never Null on a
-    // bound frame. What this work order changes is WHICH something.
-    let (asym, asim) = absent.expect("a bound frame always yields a nearest candidate");
-    assert!(asim < 0.3, "an unbound role must stay near noise, got {asim:.4}");
-    println!("absent-role winner: {asym:?} at {asim:.4}");
+    // The genuine recovery also reports its runner-up: with three fillers in
+    // the pool there is one, and the margin over it is what separates a
+    // clean recovery from a near-tie.
+    let runner = grunner.expect("a 3-filler pool has a runner-up");
+    assert!(runner < sim, "the runner-up must sit below the winner ({runner:.4} vs {sim:.4})");
+    assert_eq!(greason, Some(RecoverReason::Recovered));
+
+    // VM step 0: the absent role is Null, structurally, with its reason. No
+    // similarity is computed for it, so there is no number to threshold.
+    assert!(absent.is_none(), "an absent role must be Null, got {absent:?}");
+    assert_eq!(areason, Some(RecoverReason::AbsentRole));
 }
 
 #[test]
-fn an_absent_role_resolves_within_the_frame_not_across_the_vm() {
-    // THE work-order assertion. `LOCATION` is bound in no frame. Whatever the
-    // cleanup returns must be one of THIS frame's own fillers -- not
-    // 'helicopter', 'umbrella' or 'unrelated_literal', which exist only in the
-    // global name table.
+fn an_absent_role_is_null_structurally() {
+    // THE step-0 assertion. `LOCATION` is bound in no frame. The frame knows
+    // its own roles, so the answer is Null before any cleanup runs -- not
+    // 'cat', 'mouse' or 'chased' at noise level, and not 'helicopter',
+    // 'umbrella' or 'unrelated_literal' from the global name table.
     let bound = [("SUBJECT", "cat"), ("OBJECT", "mouse"), ("VERB", "chased")];
-    let (sym, sim) = measure("LOCATION", &bound)
-        .expect("a bound frame always yields a nearest candidate");
-    assert!(
-        ["cat", "mouse", "chased"].contains(&sym.as_str()),
-        "an absent role must resolve to one of the frame's OWN fillers, got {sym:?} at {sim:.4}"
-    );
+    let (got, reason, runner) = measure_with_reason("LOCATION", &bound);
+    assert!(got.is_none(), "an absent role must be Null, got {got:?}");
+    assert_eq!(reason, Some(RecoverReason::AbsentRole));
+    assert!(runner.is_none(), "no similarity is computed for an absent role");
+
+    // Through the program too: `recover(frame, LOCATION)` returns Null.
+    assert_eq!(str_of(run("recover_absent_role")), None);
+}
+
+#[test]
+fn absent_role_probe_is_null_in_every_one_of_500_frames() {
+    // The gate the panel set (round 3): absent-role probe Null in 100% of
+    // n >= 500, present-role recovery unchanged. Frames of 2..=4 roles drawn
+    // from a pool of 8, fillers from a pool of 24, one absent role each.
+    let roles = ["SUBJECT", "OBJECT", "VERB", "LOCATION", "TIME", "AGENT", "PATIENT", "INSTRUMENT"];
+    let fillers: Vec<String> = (0..24).map(|i| format!("filler{i}")).collect();
+    let mut seed: u64 = 0x9E3779B97F4A7C15;
+    let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+    let mut null_absent = 0usize;
+    let mut right_present = 0usize;
+    let n = 500;
+    for _ in 0..n {
+        let k = 2 + (next() % 3) as usize;
+        let mut order: Vec<usize> = (0..roles.len()).collect();
+        for i in (1..order.len()).rev() { let j = (next() % (i as u64 + 1)) as usize; order.swap(i, j); }
+        let present = &order[..k];
+        let absent = order[k];
+        let mut vm = VM::new();
+        let mut planted: Vec<(usize, usize)> = Vec::new();
+        for &r in present {
+            let f = (next() % fillers.len() as u64) as usize;
+            vm.vsa_bind_into("frame", roles[r], &fillers[f]);
+            planted.push((r, f));
+        }
+        if vm.vsa_unbind_cleanup_known("frame", roles[absent]).is_none()
+            && vm.last_recover_reason == Some(RecoverReason::AbsentRole) {
+            null_absent += 1;
+        }
+        let (r, f) = planted[0];
+        if let Some((sym, _)) = vm.vsa_unbind_cleanup_known("frame", roles[r]) {
+            if sym == fillers[f] { right_present += 1; }
+        }
+    }
+    println!("absent-role probe: {null_absent}/{n} Null; present-role recovery: {right_present}/{n} right");
+    assert_eq!(null_absent, n, "every absent role must be Null");
+    assert!(right_present * 100 >= n * 95,
+        "present-role recovery must not regress ({right_present}/{n})");
 }
 
 #[test]
