@@ -603,7 +603,7 @@ fn cmd_run(args: &[String]) {
             Err(e) => { eprintln!("error: {}", e); process::exit(1); }
         }
     }
-    if let Some(kp) = knowledge_path.as_ref().filter(|k| k.ends_with(".cubeseg")) {
+    if let Some(kp) = knowledge_path.as_ref().filter(|k| k.ends_with(".cubeseg") || Path::new(k.as_str()).is_dir()) {
         match store_cli::open_knowledge(kp) {
             Ok(store) => {
                 if !json_out {

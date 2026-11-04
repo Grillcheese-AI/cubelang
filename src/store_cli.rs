@@ -8,10 +8,23 @@ use cubelang::vm::history::{History, SearchMode};
 use cubelang::vm::segment::Vault;
 use cubelang::vm::knowledge::{KnowledgeStore, fuzzy_lookup, keys_with_prefix};
 
-/// A knowledge file as a store: a `.cubeseg` is opened as its frozen segment (no parse); anything
-/// else is read as facts `.jsonl`, parsed once, and frozen into one segment, so every fork of the
-/// result shares it.
+/// A knowledge file as a store: a `.cubeseg` is opened as its frozen segment (no parse); a directory
+/// as every `.cubeseg` in it, by file name, each a layer (a store built as shards, CubbyLLM order 0046
+/// R1b); anything else is read as facts `.jsonl`, parsed once, and frozen into one segment, so every
+/// fork of the result shares it.
 pub fn open_knowledge(path: &str) -> Result<KnowledgeStore, String> {
+    if Path::new(path).is_dir() {
+        let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| format!("{}: cannot read: {}", path, e))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map_or(false, |x| x == "cubeseg"))
+            .collect();
+        if segs.is_empty() {
+            return Err(format!("{}: a directory with no .cubeseg in it", path));
+        }
+        segs.sort();
+        return KnowledgeStore::open_layers(&segs);
+    }
     if path.ends_with(".cubeseg") {
         // (the segment reader names the file in its errors)
         return KnowledgeStore::open(Path::new(path));
@@ -30,8 +43,39 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 pub fn cmd_knowledge(args: &[String]) {
     let open_knowledge = |p: &str| open_knowledge(p).map_err(|e| format!("knowledge {}", e));
-    let usage = "usage: cubelang knowledge build FACTS.jsonl -o OUT.cubeseg | info FILE | lookup FILE KEY | fuzzy FILE KEY [--edits N] [--limit N] | keys FILE PREFIX [--limit N]";
+    let usage = "usage: cubelang knowledge build FACTS.jsonl -o OUT.cubeseg | info FILE | lookup FILE KEY | fuzzy FILE KEY [--edits N] [--limit N] | keys FILE PREFIX [--limit N] | batch FILE QUERIES.jsonl [--edits N] [--limit N]";
     match args.first().map(String::as_str) {
+        Some("batch") => {
+            // CubbyLLM order 0046 R1b: many mentions against one store, opened once. QUERIES: one
+            // {"id", "key"} a line. Out: one line each, {"id", "exact": [facts], "near": [{key, edits,
+            // facts}] (with --edits 1 or 2), "us_exact", "us_near"} -- the same lookup and fuzzy_lookup as
+            // `lookup` and `fuzzy`, timed per call.
+            let (Some(path), Some(qpath)) = (args.get(1), args.get(2)) else { die(usage) };
+            let edits: u32 = flag(args, "--edits").map(|n| n.parse().unwrap_or_else(|_| die("--edits takes 0, 1 or 2"))).unwrap_or(0);
+            let limit = flag(args, "--limit").map(|n| n.parse().unwrap_or_else(|_| die("--limit takes a number"))).unwrap_or(100);
+            let t0 = std::time::Instant::now();
+            let store = open_knowledge(path).unwrap_or_else(|e| die(e));
+            eprintln!("opened {} ({} segment(s), {} bytes) in {} ms", path, store.segment_count(), store.segment_bytes(),
+                      t0.elapsed().as_millis());
+            let data = std::fs::read_to_string(qpath).unwrap_or_else(|e| die(format!("{}: {}", qpath, e)));
+            let fact = |f: &cubelang::vm::knowledge::Fact| serde_json::json!({ "text": f.text, "source": f.source });
+            for line in data.lines().filter(|l| !l.trim().is_empty()) {
+                let q: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| die(format!("{}: {}", qpath, e)));
+                let key = q["key"].as_str().unwrap_or("");
+                let t = std::time::Instant::now();
+                let exact: Vec<_> = store.lookup(key).iter().map(fact).collect();
+                let us_exact = t.elapsed().as_secs_f64() * 1e6;
+                let t = std::time::Instant::now();
+                let near: Vec<_> = if edits > 0 {
+                    fuzzy_lookup(&store, key, edits, limit).iter()
+                        .map(|h| serde_json::json!({ "key": h.key, "edits": h.edits, "facts": h.facts.iter().map(fact).collect::<Vec<_>>() }))
+                        .collect()
+                } else { Vec::new() };
+                let us_near = t.elapsed().as_secs_f64() * 1e6;
+                println!("{}", serde_json::json!({ "id": q["id"], "exact": exact, "near": near,
+                                                  "us_exact": (us_exact * 10.0).round() / 10.0, "us_near": (us_near * 10.0).round() / 10.0 }));
+            }
+        }
         Some("build") => {
             let (Some(input), Some(out)) = (args.get(1), flag(args, "-o")) else { die(usage) };
             let started = std::time::Instant::now();

@@ -269,6 +269,19 @@ impl KnowledgeStore {
         KnowledgeStore { segments: vec![Arc::new(seg)], ..Default::default() }
     }
 
+    /// A store over several segments, as its layers in the order given (oldest first). CubbyLLM order 0046,
+    /// R1b (2026-11-04): a names index of ~10^8 keys is built as shards, each small enough to build in memory,
+    /// and opened together; a lookup reads each shard's own index, as it reads a frozen layer's.
+    pub fn from_segments(segs: Vec<KnowledgeSegment>) -> Self {
+        KnowledgeStore { segments: segs.into_iter().map(Arc::new).collect(), ..Default::default() }
+    }
+
+    /// A store over several segment files (see `from_segments`).
+    pub fn open_layers(paths: &[std::path::PathBuf]) -> Result<Self, String> {
+        let segs = paths.iter().map(|p| KnowledgeSegment::open(p)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_segments(segs))
+    }
+
     /// The live keys (every layer folded). O(store): for reports and tests.
     pub fn len(&self) -> usize {
         self.keys().len()
@@ -681,5 +694,25 @@ mod tests {
         let ks = KnowledgeStore::from_segment(back);
         assert_eq!(ks.lookup("mercury").len(), 2);
         assert_eq!(keys_with_prefix(&ks, "mo", 10), vec!["movable type press"]);
+    }
+
+    #[test]
+    fn shards_opened_together_answer_as_one_store() {
+        let mut a = KnowledgeStore::new();
+        a.insert("Paris", "Q90", "label:en");
+        a.insert("Mercury", "Q308", "label:en");
+        let mut b = KnowledgeStore::new();
+        b.insert("Paname", "Q90", "alias:fr");
+        b.insert("Mercury", "Q925", "label:en");
+        let both = KnowledgeStore::from_segments(vec![a.to_segment().unwrap(), b.to_segment().unwrap()]);
+        assert_eq!(both.segment_count(), 2);
+        assert_eq!(both.lookup("paname")[0].text, "Q90");
+        let m: Vec<String> = both.lookup("mercury").into_iter().map(|f| f.text).collect();
+        assert_eq!(m, vec!["Q308", "Q925"]);                        // a key in two shards: both, oldest first
+        let near = fuzzy_lookup(&both, "parls", 1, 10);
+        assert_eq!(near.len(), 1);
+        assert_eq!((near[0].key.as_str(), near[0].edits), ("paris", 1));
+        let far: Vec<String> = fuzzy_lookup(&both, "panama", 2, 10).into_iter().map(|h| h.key).collect();
+        assert_eq!(far, vec!["paname"]);                             // through the other shard's index
     }
 }
