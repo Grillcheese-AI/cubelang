@@ -10,22 +10,41 @@
 
 use fst::Automaton;
 
+/// The widest band: 2 * `knowledge::MAX_EDITS` + 1.
+const BAND: usize = 5;
+
 /// Keys within `distance` edits (Levenshtein, on Unicode characters) of `query`.
+///
+/// Banded (CubbyLLM order 0046, the typo index, 2026-11-04): a cell of the row whose column is more than
+/// `distance` from the row's own index is over the distance whatever follows (|i - j| edits at least), so only
+/// the 2 * distance + 1 cells around the diagonal are carried, capped at distance + 1. The state is then a
+/// few bytes copied, not a row allocated for every byte the index reads. The same answers as the full row.
 pub struct Lev {
     query: Vec<char>,
     distance: u32,
 }
 
 impl Lev {
+    /// `distance` is capped at 2 (the band's width).
     pub fn new(query: &str, distance: u32) -> Self {
-        Lev { query: query.chars().collect(), distance }
+        Lev { query: query.chars().collect(), distance: distance.min(((BAND - 1) / 2) as u32) }
+    }
+
+    fn inf(&self) -> u8 {
+        self.distance as u8 + 1
+    }
+
+    fn width(&self) -> usize {
+        2 * self.distance as usize + 1
     }
 }
 
-/// The row so far, and the bytes of a character not yet whole. `None`: no key below can match.
-#[derive(Clone, Debug)]
+/// Characters read so far (`i`), the band around column `i` (cell `k` is column `i + k - distance`), and
+/// the bytes of a character not yet whole. `None`: no key below can match.
+#[derive(Clone, Copy, Debug)]
 pub struct LevState {
-    row: Vec<u32>,
+    i: u32,
+    band: [u8; BAND],
     pending: [u8; 4],
     n: u8,
 }
@@ -43,11 +62,21 @@ impl Automaton for Lev {
     type State = Option<LevState>;
 
     fn start(&self) -> Self::State {
-        Some(LevState { row: (0..=self.query.len() as u32).collect(), pending: [0; 4], n: 0 })
+        let (d, m, inf) = (self.distance as i64, self.query.len() as i64, self.inf());
+        let mut band = [inf; BAND];
+        for (k, cell) in band.iter_mut().enumerate().take(self.width()) {
+            let j = k as i64 - d;
+            if (0..=m).contains(&j) {
+                *cell = (j as u8).min(inf);
+            }
+        }
+        Some(LevState { i: 0, band, pending: [0; 4], n: 0 })
     }
 
     fn is_match(&self, state: &Self::State) -> bool {
-        state.as_ref().is_some_and(|s| s.n == 0 && *s.row.last().unwrap() <= self.distance)
+        let Some(s) = state else { return false };
+        let k = self.query.len() as i64 - s.i as i64 + self.distance as i64;
+        s.n == 0 && (0..self.width() as i64).contains(&k) && u32::from(s.band[k as usize]) <= self.distance
     }
 
     fn can_match(&self, state: &Self::State) -> bool {
@@ -56,7 +85,7 @@ impl Automaton for Lev {
 
     fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
         let s = state.as_ref()?;
-        let mut next = s.clone();
+        let mut next = *s;
         next.pending[next.n as usize] = byte;
         next.n += 1;
         if next.n < utf8_len(next.pending[0]) {
@@ -64,17 +93,28 @@ impl Automaton for Lev {
         }
         let c = std::str::from_utf8(&next.pending[..next.n as usize]).ok()?.chars().next()?;
         next.n = 0;
-        let prev = &s.row;
-        let mut row = Vec::with_capacity(prev.len());
-        row.push(prev[0] + 1);
-        for (j, q) in self.query.iter().enumerate() {
-            let v = (prev[j] + u32::from(*q != c)).min(prev[j + 1] + 1).min(row[j] + 1);
-            row.push(v);
+        let (d, m, inf, w) = (self.distance as i64, self.query.len() as i64, self.inf(), self.width());
+        let i = s.i as i64 + 1;
+        let mut band = [inf; BAND];
+        for k in 0..w {
+            let j = i + k as i64 - d;
+            if j < 0 || j > m {
+                continue;
+            }
+            if j == 0 {
+                band[k] = (i.min(inf as i64)) as u8;
+                continue;
+            }
+            let diag = s.band[k] + u8::from(self.query[(j - 1) as usize] != c);
+            let up = if k + 1 < w { s.band[k + 1] + 1 } else { inf };
+            let left = if k > 0 { band[k - 1] + 1 } else { inf };
+            band[k] = diag.min(up).min(left).min(inf);
         }
-        if row.iter().all(|&v| v > self.distance) {
+        if band[..w].iter().all(|&v| v > self.distance as u8) {
             return None;
         }
-        next.row = row;
+        next.i = i as u32;
+        next.band = band;
         Some(next)
     }
 }

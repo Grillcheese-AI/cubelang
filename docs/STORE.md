@@ -55,7 +55,19 @@ a key in the index rather than a copy of the facts, and `remove` finds a key's a
   as a scan of every key does. `QUERY` stays exact: a hit carries its
   `edits`, never a score of 1.0. A program's call counts against the query budget
   (`knowledge~N:<key>` in the branch report).
-- `run-proto`: `knowledge_path` takes a `.cubeseg` or a `.jsonl` (parsed once and frozen); either way
+- **The typo index** (CubbyLLM order 0046, 2026-11-04; `src/vm/typo_index.rs`): a store built as shards split by a
+  hash of the key walks the same prefixes once per shard, so a typo lookup over 32 shards walked them 32 times. One
+  `fst::Set` of every shard's keys (keys only, no facts), built once beside the shards by `cubelang knowledge
+  typo-index DIR` (`_typo.fst`, and `_typo.json` naming the shards and their sizes), is walked once instead. Facts
+  are still read from the shards, and only for the nearest keys up to the limit.
+  - A directory opened as a store uses the index only if it was built over exactly those shards; otherwise the store
+    says so on stderr and walks each shard. A layer frozen later (a fork's) is walked through its own index.
+  - The row is banded: only the 2 × edits + 1 cells around the diagonal are carried, so the state is copied, not
+    allocated per byte. The answers are the same, pinned against a scan and against the shards without the index.
+  - Measured on the 0046 names store (32 shards, 76,813,854 keys; index 846 MB, built in 130 s), 1,204 typo
+    mentions at 2 edits: p50 / p95 425 / 609 ms walking every shard, 165 / 202 ms with the banded row, **32 / 38 ms**
+    through the index. Answers are identical throughout.
+- `run-proto`: `knowledge_path` takes a `.cubeseg`, a directory of them (with its typo index), or a `.jsonl` (parsed once and frozen); either way
   the resident process caches it by mtime and every request shares it.
 
 ## History

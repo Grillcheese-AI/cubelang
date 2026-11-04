@@ -21,6 +21,7 @@ pub mod memory;
 pub mod segment;
 pub mod knowledge;
 pub mod lev;
+pub mod typo_index;
 pub mod history;
 pub mod engine;
 pub mod registry;

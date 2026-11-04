@@ -103,6 +103,11 @@ impl std::fmt::Debug for KnowledgeSegment {
 }
 
 impl KnowledgeSegment {
+    /// The segment's own index (key -> record), for the typo index's merge.
+    pub(crate) fn index(&self) -> &fst::Map<Bytes> {
+        &self.map
+    }
+
     /// Keys in this segment (live or tombstoned).
     pub fn len(&self) -> usize {
         self.map.len()
@@ -253,6 +258,8 @@ pub struct KnowledgeStore {
     /// Keys whose segment facts this layer took out (a branch's exclusions,
     /// a re-pointed alias). Their top-layer facts still show.
     masked: HashSet<String>,
+    /// One typo index over the first layers (a store opened from shards; `vm::typo_index`), shared by forks.
+    typo: Option<Arc<crate::vm::typo_index::TypoIndex>>,
 }
 
 impl KnowledgeStore {
@@ -280,6 +287,17 @@ impl KnowledgeStore {
     pub fn open_layers(paths: &[std::path::PathBuf]) -> Result<Self, String> {
         let segs = paths.iter().map(|p| KnowledgeSegment::open(p)).collect::<Result<Vec<_>, _>>()?;
         Ok(Self::from_segments(segs))
+    }
+
+    /// Use `t` for typo lookups over the layers it covers (the first `t.covers`).
+    pub fn set_typo_index(&mut self, t: crate::vm::typo_index::TypoIndex) {
+        assert!(t.covers <= self.segments.len(), "a typo index over more layers than the store has");
+        self.typo = Some(Arc::new(t));
+    }
+
+    /// Whether typo lookups read one typo index over the shards.
+    pub fn has_typo_index(&self) -> bool {
+        self.typo.is_some()
     }
 
     /// The live keys (every layer folded). O(store): for reports and tests.
@@ -451,6 +469,7 @@ impl KnowledgeStore {
         };
         let seg = KnowledgeSegment::build(entries)?;
         self.segments = vec![Arc::new(seg)];
+        self.typo = None; // its layers are gone
         self.top = HashMap::new();
         self.masked = HashSet::new();
         Ok(())
@@ -554,19 +573,38 @@ pub fn fuzzy_lookup(store: &KnowledgeStore, mention: &str, edits: u32, limit: us
     }
     let near = |k: &str| crate::vm::history::edit_distance(&q, k) <= d as usize;
     let mut keys: std::collections::BTreeSet<String> = store.top.keys().filter(|k| near(k)).cloned().collect();
-    for s in &store.segments {
+    // the layers one typo index covers are walked once, through it; any later layer through its own index
+    let skip = match &store.typo {
+        Some(t) => {
+            let mut st = t.set.search(crate::vm::lev::Lev::new(&q, d)).into_stream();
+            while let Some(k) = st.next() {
+                keys.insert(String::from_utf8_lossy(k).into_owned());
+            }
+            t.covers
+        }
+        None => 0,
+    };
+    for s in &store.segments[skip..] {
         let mut st = s.map.search(crate::vm::lev::Lev::new(&q, d)).into_stream();
         while let Some((k, _)) = st.next() {
             keys.insert(String::from_utf8_lossy(k).into_owned());
         }
     }
-    let mut hits: Vec<FuzzyHit> = keys.into_iter().filter_map(|k| {
+    // nearest first, then by key; facts are read only until `limit` live keys are found (a short mention
+    // reaches thousands of keys at two edits, and each read visits every layer)
+    let mut near: Vec<(u32, String)> = keys.into_iter()
+        .map(|k| (crate::vm::history::edit_distance(&q, &k) as u32, k)).collect();
+    near.sort();
+    let mut hits = Vec::new();
+    for (e, k) in near {
+        if hits.len() >= limit {
+            break;
+        }
         let facts = store.lookup_key(&k);
-        let e = crate::vm::history::edit_distance(&q, &k) as u32;
-        (!facts.is_empty()).then_some(FuzzyHit { key: k, edits: e, facts })
-    }).collect();
-    hits.sort_by(|a, b| a.edits.cmp(&b.edits).then_with(|| a.key.cmp(&b.key)));
-    hits.truncate(limit);
+        if !facts.is_empty() {
+            hits.push(FuzzyHit { key: k, edits: e, facts });
+        }
+    }
     hits
 }
 
