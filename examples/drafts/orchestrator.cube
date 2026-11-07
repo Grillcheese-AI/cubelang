@@ -1,0 +1,105 @@
+# orchestrator.cube
+# CubeLang v0.1.0
+# License: Business Source License 1.1 (non-commercial use)
+# Author: Grillcheese Research Laboratory
+
+struct SwarmConfig {
+    max_refusal_threshold: u32 = 5;
+    cooldown_period_ms: u64 = 3600000; # 1 hour
+}
+
+program SwarmOrchestrator implements IOrchestrator, IDeployable {
+    
+    storage {
+        config: immutable SwarmConfig;
+        refusal_registry: mutable map<str, u32>;
+        active_workers: mutable map<str, external_program>;
+        revoked_workers: mutable set<str>;
+    }
+
+    # ── Lifecycle Hooks ──────────────────────────────────────────
+    @system
+    @once
+    public function constructor() {
+        self.config = SwarmConfig {
+            max_refusal_threshold: 5,
+        };
+        self.refusal_registry = {};
+        self.active_workers = {};
+        self.revoked_workers = {};
+    }
+
+    @system
+    public function register_worker(name: str, worker_ref: external_program): void {
+        self.active_workers[name] = worker_ref;
+        log("[Orchestrator] Registered worker node: ${name}");
+    }
+
+    # ── Automated Telemetry & Mitigation Gate ────────────────────
+    @hook(*.error)
+    @internal
+    public function on_worker_falsification(event: ErrorEvent): void {
+        # Ensure the error came from a certified-failed runtime extension
+        if (event.severity != "critical" || !self.active_workers.has(event.program)) {
+            return;
+        }
+
+        let worker_name = event.program;
+        let current_failures = (self.refusal_registry[worker_name] ?? 0) + 1;
+        self.refusal_registry[worker_name] = current_failures;
+
+        log("[WARN] Worker ${worker_name} failed validation pass. Total failures: ${current_failures}/Result Code: ${event.message}");
+
+        # Quarantine check: Check if worker crossed the failure threshold
+        if (current_failures >= self.config.max_refusal_threshold) {
+            self.quarantine_worker(worker_name);
+        }
+    }
+
+    # ── Deterministic Isolation Logic ────────────────────────────
+    @internal
+    private function quarantine_worker(name: str): void {
+        if (self.revoked_workers.has(name)) {
+            return;
+        }
+
+        log("[CRITICAL] Worker ${name} crossed maximum refusal bounds! Triggering immediate circuit breaker.");
+
+        # 1. Execute runtime ABI revoke instruction to cut inter-program communication
+        # Strips the target of its capability to post data to our streaming input queue
+        revoke self.active_workers[name].solve from SwarmRootOrchestrator;
+
+        # 2. Update persistent system orchestration memory
+        self.revoked_workers.insert(name);
+        self.active_workers.delete(name);
+
+        # 3. Emit system-wide broadcast event to notify the wider swarm structure
+        emit WorkerQuarantined {
+            worker: name,
+            total_logged_refusals: self.refusal_registry[name],
+            timestamp: vm.timestamp(),
+        };
+    }
+
+    # ── Standard Orchestration Call Routing ──────────────────────
+    @external
+    public function route(input: str): external_program {
+        let category = self.classify_intent(input);
+
+        # Fallback handling: If targeted worker is revoked, redirect task to core recovery pool
+        if (self.revoked_workers.has(category) || !self.active_workers.has(category)) {
+            log("[Orchestrator] Route target ${category} is locked. Cascading to fallback safe router.");
+            return vm.get_program("BaseFallbackSolver");
+        }
+
+        return self.active_workers[category];
+    }
+
+    private pure function classify_intent(text: str): str {
+        let text_vec: vec = encode(text);
+        # Simple hypervector proximity match to find appropriate routing category
+        if (cosine_sim(text_vec, encode("algebra")) > 0.65) { return "AlgebraWorker"; }
+        if (cosine_sim(text_vec, encode("calculus")) > 0.65) { return "CalculusWorker"; }
+        return "Unknown";
+    }
+}

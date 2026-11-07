@@ -1,0 +1,84 @@
+# mowm_spawner.cube
+# CubeLang v0.1.0
+# License: Business Source License 1.1
+# Author: Grillcheese Research Laboratory
+
+struct WorldStateReport {
+    confidence: f64;
+    residual_vector: vec;
+}
+
+program MoWMSubworldManager implements IOrchestrator, IDeployable {
+
+    storage {
+        registered_worlds: mutable map<u32, external_program>;
+        z_max_boundary: immutable u32 = 4;
+    }
+
+    @system
+    @once
+    public function constructor() {
+        self.registered_worlds = {};
+    }
+
+    # ── Live Execution Monitoring Loop ────────────────────────────
+    @external
+    public function evaluate_transition_bounds(world_id: u32, input_state: vec): void {
+        let target_world = self.registered_worlds[world_id];
+        
+        # 1. Inspect active performance properties of the executing world node
+        let report: WorldStateReport = target_world.get_current_state_report();
+        let tau: f64 = target_world.get_tau_threshold();
+
+        # 2. Check Falsification Condition: Has accuracy dropped below safe tau limits?
+        if (report.confidence < tau) {
+            log("[MoWM] Parent node ${world_id} confidence (${report.confidence}) broke tau limit (${tau}).");
+            
+            let current_depth = target_world.get_depth_z();
+            
+            if (current_depth >= self.z_max_boundary) {
+                log("[CRITICAL] Hard recursion roof reached! Halting further sub-world allocation passes.");
+                throw Error("ERR_MOWM_MAX_RECURSION_DEPTH_EXCEEDED");
+            }
+
+            self.spawn_child_node(world_id, current_depth + 1, report.residual_vector);
+        }
+    }
+
+    # ── Deterministic Sub-World Compilation ───────────────────────
+    @internal
+    private function spawn_child_node(parent_id: u32, next_depth: u32, residual_init: vec): u32 {
+        let next_id = parent_id + 1;
+        log("[SPAWNER] Instantiating sub-world tree node ${next_id} at depth z=${next_depth}.");
+
+        # 1. Deep clone the container profile to isolate structural configurations
+        let child_container_ref = vm.deploy_from_file("containers/base_world_template.cube");
+
+        # 2. Transmit seed variables and residual bounds directly across the VM system channel
+        # This binds the parent's unresolved error signature as the child world's root axiom asset
+        child_container_ref.initialize_recursive_state({
+            world_id: next_id,
+            z_depth: next_depth,
+            axiom_seed_vector: residual_init
+        });
+
+        # 3. Register the child into the orchestrator map
+        self.registered_worlds[next_id] = child_container_ref;
+
+        # 4. Wire the parent's unhandled residual pipe straight into the child's input queue
+        vm.wire(
+            self.registered_worlds[parent_id].outputs.residual_stream, 
+            child_container_ref.inputs.queue
+        );
+
+        # 5. Broadcast a lifecycle event so adjacent swarm nodes are aware of the new node route
+        emit SubworldSpawned {
+            parent_world: parent_id,
+            child_world: next_id,
+            depth_level: next_depth,
+            timestamp: vm.timestamp()
+        };
+
+        return next_id;
+    }
+}

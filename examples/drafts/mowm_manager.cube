@@ -1,0 +1,68 @@
+# mowm_manager.cube
+# CubeLang v0.1.0
+# License: Business Source License 1.1
+# Author: Grillcheese Research Laboratory
+
+struct WorldLookupReport {
+    target_world_id: u32;
+    matched_axiom_id: str;
+    similarity_score: f64;
+    can_execute: bool;
+}
+
+program MoWMRouter implements IOrchestrator, IDeployable {
+    
+    storage {
+        active_world_nodes: mutable map<u32, external_program>;
+        global_tau_cutoff: immutable f64 = 0.589;
+    }
+
+    @system
+    @once
+    public function constructor() {
+        self.active_world_nodes = {};
+    }
+
+    @external
+    @pure
+    public function cross_examine_worlds(query_context: emb): WorldLookupReport {
+        let best_world_id: u32 = 0;
+        let highest_score: f64 = -1.0;
+        let matched_axiom: str = "None";
+
+        for (let [world_id, world_prog] of self.active_world_nodes) {
+            let centroid: emb = world_prog.get_axiom_centroid();
+            let centroid_sim = cosine_sim(query_context, centroid);
+            if (centroid_sim > highest_score) {
+                let [axiom_ref, match_score] = world_prog.best_member(query_context);
+                if (match_score > highest_score) {
+                    highest_score = match_score;
+                    best_world_id = world_id;
+                    matched_axiom = axiom_ref != null ? axiom_ref.name : "None";
+                }
+            }
+        }
+
+        let clear_threshold = highest_score >= self.global_tau_cutoff;
+
+        return WorldLookupReport {
+            target_world_id: best_world_id,
+            matched_axiom_id: matched_axiom,
+            similarity_score: highest_score,
+            can_execute: clear_threshold,
+        };
+    }
+
+    @external
+    public function dispatch(input: str): Output {
+        let current_ctx: ctx = ctx.current();
+        let encoded_query: emb = embed(input, model: "bge-small");
+        let report = self.cross_examine_worlds(encoded_query);
+        if (!report.can_execute) {
+            log("[MoWM] Query context cleared no axiom thresholds. Spawning fallback tracking node.");
+            throw Error("ERR_MOWM_ROUTING_REFUSAL: Target query is out-of-set.");
+        }
+        let target_world = self.active_world_nodes[report.target_world_id];
+        return target_world.execute_transition_step(input, current_ctx);
+    }
+}

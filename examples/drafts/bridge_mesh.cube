@@ -1,0 +1,35 @@
+# bridge_mesh.cube
+container SwarmNetworkGateway implements IOrchestrator, IDeployable {
+    config {
+        name: "SwarmNetworkGateway";
+        version: "0.1.0";
+        max_programs: 10;
+    }
+    io {
+        inputs {
+            raw_telemetry: channel<str>;
+        }
+        outputs {
+            bridge_api: url = "/api/v1/bridge/status";
+            egress_stream: channel<Event>;
+        }
+    }
+    @system
+    @once
+    public function on_start() {
+        log("[Gateway] Booting cross-container bridging architecture...");
+        let math_swarm_container = vm.start_from_file("containers/math_lab.cube");
+        let nlp_parser_container = vm.start_from_file("containers/nlp_lab.cube");
+        vm.wire(math_swarm_container.outputs.solution, nlp_parser_container.inputs.structured);
+        vm.bridge(math_swarm_container, nlp_parser_container, {
+            allow: [
+                "MathRouter.classify",
+                "MathRouter.confidence"
+            ],
+            ratelimit: 5000,
+            period: "1h",
+            audit_log: true
+        });
+        log("[Gateway] Secure bridge interface initialized between MathLab and NLPLab.");
+    }
+}

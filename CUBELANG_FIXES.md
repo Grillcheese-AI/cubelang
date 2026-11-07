@@ -118,6 +118,50 @@ in P0-1 once it genuinely executes — update P0-1's blocklist as each lands.
 
 ---
 
+## P3 — Nick's swarm and MoWM drafts (Cowork, 2026-11-07; Nick's yes)
+
+Four drafts, in `examples/drafts/`: `orchestrator.cube`, `bridge_mesh.cube`, `mowm_manager.cube` and
+`mowm_spawner.cube`. Two copies have comments trimmed; the code is Nick's as written. They were checked with
+`cubelang check` on the release binary built 2026-09-29. The source has commits through 2026-10-31, so first re-run
+each draft against a fresh build and tick off whatever already passes. Build it in a separate target directory: the
+main `target/release` binary is not overwritten.
+
+The drafts are written to the full spec, while the compiler runs the safe subset above (flat operands, no `for`,
+`match`, `call` or early `return` yet). Most of what follows is the gap between the two. Which gaps to close first is
+CubbyLLM's call: orders 0062 (sandboxed helpers) and 0063 (split questions) say what they need.
+
+- [ ] **P3-1 (P0 class): a `container` compiles to nothing, silently.** `bridge_mesh.cube` passes `check`, but
+  `compile` warns "no programs found". The `container`, its `config` and `io` blocks, `vm.start_from_file`,
+  `vm.wire` and `vm.bridge` emit no bytecode. Strict must reject any item it drops; containers compiling is P2-level
+  work. Regression test: the draft.
+- [ ] **P3-2: `@hook` with a wildcard target.** `@hook(*.error)` gives "expected identifier, got Star". Support
+  `*.event`, or give a clear error. `@hook` itself is a strict compile error per the README.
+- [ ] **P3-3: `??`** is used in the README's examples but not parsed. Implement it, or remove it from the docs and
+  record it in `docs/DRIFT.md`.
+- [ ] **P3-4: `grant` / `revoke ... from ...`** are documented (README, "Grant / Revoke Access at Runtime") but not
+  parsed inside a function body. Implement them, or state where they are allowed.
+- [ ] **P3-5: reserved words.** A parameter named `event` fails with "unexpected token in expression: Event". Publish
+  the reserved-word list, and make the error name the keyword.
+- [ ] **P3-6: `@pure` as an attribute** fails ("expected 'function' or 'constructor', got At"). `pure` is a modifier.
+  Accept `@pure` as an alias, or say so in the error.
+- [ ] **P3-7: destructuring.** `for (let [k, v] of map)` and `let [a, b] = f()` both fail ("expected identifier, got
+  LBracket"). Support them, or document that they are not supported.
+- [ ] **P3-8: undeclared interfaces.** `implements IOrchestrator, IDeployable` fails: "neither a VM interface nor an
+  in-file `interface` declaration". Ship these as VM interfaces, or document the in-file declaration they need.
+- [ ] **P3-9: operands.** A map literal (`{}`) and a method call's result can't be operands ("cannot be encoded as
+  an operand ... compute it into a register first"). This is the safe subset's flat-operand rule. Lift it, or make
+  the message point to the rewrite.
+- [ ] **P3-10: not reached yet**, to check once the drafts get further:
+  - `throw` (strict rejects it, per the CLI help);
+  - the ternary `?:`;
+  - named arguments (`embed(input, model: ...)`);
+  - `emit` with a struct literal;
+  - `set.insert` and `map.delete`;
+  - `vm.timestamp()` and `vm.deploy_from_file()`.
+
+This file's global invariant holds for every item: `cargo test` green, a regression test per fix, opcode byte values
+unchanged.
+
 ## Notes
 - The QC pilot ships on P0 + P1 only. P2 is the path to richer programs later.
 - `examples/qc_decision.cube` is the reference safe-subset program; keep it
