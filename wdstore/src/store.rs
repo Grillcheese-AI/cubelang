@@ -56,7 +56,7 @@ impl Store {
         if redirects.len() < 20 || &redirects[..8] != REDIR_MAGIC { return Err("not a redirects file".into()); }
         let names = Names::open(read(dir, "names_exact.fst")?, read(dir, "names_folded.fst")?, read(dir, "names.post")?)?;
         Ok(Store { dir: dir.into(), chunks, ids, redirects, names, reverse: Reverse::open(read(dir, "reverse.wds")?)?,
-                   nodes: Nodes { values: NodeFile::open(read(dir, "values.wds")?)?, refs: NodeFile::open(read(dir, "refs.wds")?)? } })
+                   nodes: Nodes::new(NodeFile::open(read(dir, "values.wds")?)?, NodeFile::open(read(dir, "refs.wds")?)?) })
     }
 
     fn count(b: &[u8]) -> usize { u64::from_le_bytes(b[12..20].try_into().unwrap()) as usize }
@@ -72,6 +72,16 @@ impl Store {
     }
 
     pub fn get(&self, id: Eid) -> Result<Option<Entity>, String> { Ok(self.locate(id)?.map(|x| x.1)) }
+
+    /// (hot or cold, the entity, the value nodes its statements name, by hash).
+    pub fn locate_with_nodes(&self, id: Eid) -> Result<Option<(bool, Entity, std::collections::HashMap<NodeHash, ValueNode>)>, String> {
+        self.nodes.seen.borrow_mut().clear();
+        let Some((cold, e)) = self.locate(id)? else { return Ok(None) };
+        let seen: Vec<(NodeHash, u32)> = self.nodes.seen.borrow_mut().drain().collect();
+        let mut m = std::collections::HashMap::new();
+        for (h, i) in seen { if let Some(v) = self.nodes.values.value(i)? { m.insert(h, v); } }
+        Ok(Some((cold, e, m)))
+    }
 
     fn redirect(&self, id: Eid) -> Option<Eid> {
         find(&self.redirects, 20, Self::count(&self.redirects), 16, id.0)

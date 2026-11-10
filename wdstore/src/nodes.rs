@@ -268,5 +268,17 @@ impl NodeFile {
     }
 }
 
-/// The two node files, which a chunk's reader needs to turn numbers back into hashes.
-pub struct Nodes { pub values: NodeFile, pub refs: NodeFile }
+/// The two node files, which a chunk's reader needs to turn numbers back into hashes; `seen` keeps the value
+/// nodes an entity's decoding named (hash -> number), so a reader can then fetch them (`store::Store::nodes_of`).
+pub struct Nodes { pub values: NodeFile, pub refs: NodeFile, pub seen: std::cell::RefCell<HashMap<NodeHash, u32>> }
+
+impl Nodes {
+    pub fn new(values: NodeFile, refs: NodeFile) -> Nodes { Nodes { values, refs, seen: Default::default() } }
+
+    /// A value node's hash by number, noted in `seen`.
+    pub fn value_hash(&self, i: u32) -> Result<NodeHash, String> {
+        let h = self.values.hash(i)?;
+        self.seen.borrow_mut().insert(h.clone(), i);
+        Ok(h)
+    }
+}

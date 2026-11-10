@@ -57,7 +57,7 @@ pub fn put_nodes(w: &mut W, ix: &dyn Numbering, n: &[(u32, NodeHash)]) -> Result
     Ok(())
 }
 pub fn get_nodes(r: &mut R, n: &Nodes) -> Result<Vec<(u32, NodeHash)>, String> {
-    (0..r.u()?).map(|_| Ok((r.u()? as u32, n.values.hash(r.u()? as u32)?))).collect()
+    (0..r.u()?).map(|_| Ok((r.u()? as u32, n.value_hash(r.u()? as u32)?))).collect()
 }
 
 fn put_entity(w: &mut W, d: &mut Dict, ix: &dyn Numbering, e: &Entity) -> Result<(), String> {
@@ -109,7 +109,7 @@ fn get_entity(r: &mut R, d: &[String], n: &Nodes, id: Eid) -> Result<Entity, Str
         let rank = match f & 3 { 0 => Rank::Deprecated, 1 => Rank::Normal, 2 => Rank::Preferred, _ => return Err("rank".into()) };
         let guid = r.guid((f >> 4) & 3)?;
         let value = get_value(r, d)?;
-        let value_node = if f & 8 != 0 { Some(n.values.hash(r.u()? as u32)?) } else { None };
+        let value_node = if f & 8 != 0 { Some(n.value_hash(r.u()? as u32)?) } else { None };
         let mut s = Statement { pid, guid, rank, best: f & 4 != 0, value, value_node, hot_qualifiers: vec![],
             hot_qualifier_nodes: vec![], cold_qualifiers: vec![], cold_qualifier_nodes: vec![], references: vec![] };
         if f & 64 != 0 {

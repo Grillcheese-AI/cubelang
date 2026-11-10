@@ -295,3 +295,30 @@ fn the_snapshot_names_the_state_a_change_moves_it_a_pin_holds_and_a_broken_chain
     std::fs::write(&p, t).unwrap();
     assert!(chain(&a, None).unwrap_err().contains("line 3 does not follow line 2"));
 }
+
+#[test]
+fn serve_answers_each_request_line_as_of_a_date_and_refuses_a_snapshot_it_does_not_hold() {
+    let (out, _) = built("serve");
+    let snap = wdstore::snapshot::at(&out, None).unwrap().hash;
+    let reqs = format!(concat!(
+        "{{\"op\": \"snapshot\"}}\n",
+        "{{\"op\": \"get\", \"id\": \"Q7\", \"as_of\": \"1990\", \"snapshot\": \"{s}\"}}\n",
+        "{{\"op\": \"get\", \"id\": \"Q42\", \"snapshot\": \"abc\"}}\n",
+        "{{\"op\": \"name\", \"text\": \"Douglas Adams\"}}\n",
+        "{{\"op\": \"who\", \"pid\": 31, \"value\": \"Q5\"}}\n",
+        "{{\"op\": \"labels\", \"ids\": [\"Q42\", \"Q44\"], \"lang\": \"fr\"}}\n",
+        "{{\"op\": \"nope\"}}\n"), s = snap);
+    let mut o = Vec::new();
+    wdstore::serve::serve(&out, std::io::Cursor::new(reqs), &mut o).unwrap();
+    let a: Vec<serde_json::Value> = String::from_utf8(o).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(a.len(), 7);
+    assert_eq!(a[0]["snapshot"], snap);
+    assert_eq!((a[1]["id"].as_str(), a[1]["redirected_from"].as_str()), (Some("Q42"), Some("Q7")));
+    let holds: Vec<&str> = a[1]["statements"].as_array().unwrap().iter().map(|s| s["holds"].as_str().unwrap()).collect();
+    assert_eq!(holds, vec!["undated", "undated", "too_coarse"]);   // P1082's start: its node's precision is not in the store
+    assert_eq!(a[2]["error"], "snapshot_not_held");
+    assert_eq!(a[3]["hits"].as_array().unwrap().len(), 4);
+    assert_eq!(a[4]["hits"][0][0], "Q44");
+    assert_eq!(a[5]["Q42"], "Douglas Adams");
+    assert!(a[5].get("Q44").is_none() && a[6]["error"].as_str().unwrap().contains("unknown op"));
+}

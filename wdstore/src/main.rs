@@ -114,6 +114,7 @@ fn main() {
             upto.and_then(|u| wdstore::snapshot::at(&a[1], u)).map(|s| println!(
                 "{{\"snapshot\": \"{}\", \"manifest\": \"{}\", \"changes\": {}, \"head\": \"{}\"}}", s.hash, s.manifest, s.changes, s.head))
         }
+        Some("serve") if a.len() == 2 => wdstore::serve::serve(&a[1], std::io::stdin().lock(), std::io::stdout().lock()),
         Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: see the head of src/main.rs".into()),
