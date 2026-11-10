@@ -16,6 +16,7 @@
 //! - `spill`: rows sorted in runs on a scratch disk and merged, for the indexes.
 //! - `writer`, `resume`: the store written append-only, checkpointed, resumed after a stop.
 //! - `build`: the dump's text in its order -> the store and a manifest with every input's, file's and the code's hash.
+//! - `snapshot`: the store's state by one hash (the base's manifest and the chained change log).
 //! - `store`: a built store opened: one entity by id, redirects followed, every file checked.
 
 pub mod build;
@@ -29,6 +30,7 @@ pub mod names;
 pub mod nodes;
 pub mod resume;
 pub mod reverse;
+pub mod snapshot;
 pub mod spill;
 pub mod store;
 pub mod turtle;
@@ -39,7 +41,7 @@ pub fn code_hash() -> String {
     let mut h = blake3::Hasher::new();
     for src in [include_str!("build.rs"), include_str!("bz2par.rs"), include_str!("chunk.rs"), include_str!("codec.rs"),
                 include_str!("ingest.rs"), include_str!("model.rs"), include_str!("names.rs"), include_str!("nodes.rs"),
-                include_str!("resume.rs"), include_str!("reverse.rs"), include_str!("spill.rs"), include_str!("store.rs"),
+                include_str!("resume.rs"), include_str!("reverse.rs"), include_str!("snapshot.rs"), include_str!("spill.rs"), include_str!("store.rs"),
                 include_str!("turtle.rs"), include_str!("writer.rs")] {
         h.update(src.as_bytes());
     }

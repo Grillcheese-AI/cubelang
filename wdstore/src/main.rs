@@ -109,6 +109,11 @@ fn main() {
             eprintln!("hot {}, cold {}, missing {}, through a redirect {}", n[0], n[1], n[2], n[3]);
             Ok(())
         }),
+        Some("snapshot") if a.len() == 2 || (a.len() == 4 && a[2] == "--at") => {
+            let upto = if a.len() == 4 { a[3].parse().map(Some).map_err(|_| "--at N".to_string()) } else { Ok(None) };
+            upto.and_then(|u| wdstore::snapshot::at(&a[1], u)).map(|s| println!(
+                "{{\"snapshot\": \"{}\", \"manifest\": \"{}\", \"changes\": {}, \"head\": \"{}\"}}", s.hash, s.manifest, s.changes, s.head))
+        }
         Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: see the head of src/main.rs".into()),

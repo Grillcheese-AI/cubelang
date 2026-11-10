@@ -44,6 +44,7 @@ impl Ckpt {
                       s.statements[0], s.statements[1], s.hot_qualifiers, s.cold_qualifiers, s.references, s.names, s.duplicates);
         for f in &s.failed { o += &format!("failed {}\n", esc(f)); }
         for (k, v) in &s.skipped { o += &format!("skipped {v} {}\n", esc(k)); }
+        o += &format!("dump_date {}\n", esc(&s.dump_date));
         o + "end\n"
     }
 
@@ -71,6 +72,7 @@ impl Ckpt {
                 "failed" => c.stats.failed.push(unesc(v)),
                 "skipped" => { let (cnt, name) = v.split_once(' ').ok_or("checkpoint: skipped")?;
                                c.stats.skipped.insert(unesc(name), cnt.parse().map_err(|_| "checkpoint: skipped")?); }
+                "dump_date" => c.stats.dump_date = unesc(v),
                 "end" => ended = true,
                 _ => return Err(format!("checkpoint: unknown line {line}")),
             }

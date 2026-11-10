@@ -19,6 +19,7 @@ pub struct Stats {
     pub blocks: u64, pub failed: Vec<String>, pub failed_n: u64, pub entities: [u64; 2], pub statements: [u64; 2],
     pub hot_qualifiers: u64, pub cold_qualifiers: u64, pub references: u64, pub names: u64, pub duplicates: u64,
     pub skipped: std::collections::BTreeMap<String, u64>,
+    pub dump_date: String,
 }
 
 pub fn j(s: &str) -> String {
@@ -46,6 +47,16 @@ pub fn ingest_all(text: &str, prm: &Params, threads: usize) -> Vec<Result<Block,
         let hs: Vec<_> = bl.chunks(per).map(|part| s.spawn(move || part.iter().map(|b| ingest::block(b, prm)).collect::<Vec<_>>())).collect();
         hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// The release the parts are, from the download's `manifest.json` beside them (name, size, hash, the record, its
+/// date and licence), as written there; `null` when there is none.
+fn release(first: &str) -> String {
+    let dir = std::path::Path::new(first).parent().map(|p| p.join("manifest.json"));
+    match dir.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(t) => t.split_whitespace().collect::<Vec<_>>().join(" "),
+        None => "null".into(),
+    }
 }
 
 /// Builds `out` from `inputs`: bzip2 parts (the dump, read as one file; resumable) or gzip / plain entity blocks.
@@ -121,8 +132,8 @@ pub fn build_batched(inputs: &[String], out: &str, scratch: &str, per_chunk: usi
     })?;
     if stopped { return Ok(format!("stopped after {batches} batches (a test of resuming)\n")); }
     w.text(std::str::from_utf8(&carry).map_err(|_| "the dump's text is not UTF-8")?, threads)?;
-    let mut man = w.finish(vec![format!("{{\"parts\": {}, \"bytes\": {n}, \"resumed_at_batch\": {}}}", inputs.len(),
-                                        resumed.map(|b| b.to_string()).unwrap_or("null".into()))], t0)?;
+    let mut man = w.finish(vec![format!("{{\"parts\": {}, \"bytes\": {n}, \"resumed_at_batch\": {}, \"release\": {}}}", inputs.len(),
+                                        resumed.map(|b| b.to_string()).unwrap_or("null".into()), release(&inputs[0]))], t0)?;
     if let Some(c) = ck { man = man.replace("\"build_s\"", &format!("\"resumed_from_bit\": {},\n \"build_s\"", c.block_bit)); }
     let _ = std::fs::rename(format!("{out}/{}", crate::resume::FILE), format!("{out}/checkpoint.done.txt"));
     Ok(man)

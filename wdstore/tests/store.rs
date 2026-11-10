@@ -271,3 +271,27 @@ fn a_triple_the_dump_writes_twice_is_kept_once() {
     let e = block(&text, &Params::default()).unwrap().entity.unwrap();
     assert_eq!(e, block(ITEM, &Params::default()).unwrap().entity.unwrap());
 }
+
+#[test]
+fn the_snapshot_names_the_state_a_change_moves_it_a_pin_holds_and_a_broken_chain_fails() {
+    use wdstore::snapshot::{append, at, chain, expect};
+    let (a, _) = built("snap_a");
+    let (b, _) = built("snap_b");
+    let s0 = at(&a, None).unwrap();
+    assert_eq!(s0.changes, 0);
+    assert_eq!(s0.hash, at(&b, None).unwrap().hash);                       // an identical rebuild: the same state
+    let h1 = append(&a, "\"change\": \"close\", \"statement\": \"Q42-AAAA-1\", \"at\": \"2026-11-10T02:00:00Z\"").unwrap();
+    let s1 = at(&a, None).unwrap();
+    assert_ne!(s1.hash, s0.hash);
+    assert_eq!((s1.changes, s1.head.as_str()), (1, h1.as_str()));
+    assert_eq!(at(&a, Some(0)).unwrap(), s0);                              // the pin to the base still names it
+    assert_eq!(expect(&a, &s0.hash).unwrap(), s0);
+    assert!(expect(&a, "0000").unwrap_err().starts_with("snapshot_not_held"));
+    append(&a, "\"change\": \"add\", \"at\": \"2026-11-10T02:01:00Z\"").unwrap();
+    append(&a, "\"change\": \"add\", \"at\": \"2026-11-10T02:02:00Z\"").unwrap();
+    assert_eq!(chain(&a, None).unwrap().0, 3);
+    let p = format!("{a}/changes.log");
+    let t = std::fs::read_to_string(&p).unwrap().replacen("02:01:00Z", "02:01:01Z", 1);
+    std::fs::write(&p, t).unwrap();
+    assert!(chain(&a, None).unwrap_err().contains("line 3 does not follow line 2"));
+}

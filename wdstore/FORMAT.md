@@ -122,6 +122,19 @@ entities, 16.5M statements, 32,919 redirects; 87 s on 12 threads; a build stoppe
 gives the same 72 files, byte for byte, as one never stopped; 1.2 GB written in all (hot and cold chunks, nodes,
 indexes and the build's logs). The dump at this rate: about 2.7 h and about 135 GB, hot store about 75-80 GB.
 
+## The store's state, by one hash (CheezML v0.2; 0055's snapshot addendum)
+
+- **The base:** the hash of every file's name and blake3 as the manifest lists them, sorted. A rebuild writing the
+  same bytes names the same state, whatever its timing. The manifest also names the dump as a release (its download
+  manifest: name, size, md5, the Zenodo record, its date and licence) and the dump's own date
+  (`wikibase:Dump schema:dateModified`), the as-of an undated question uses on a store pinned to the dump.
+- **The change log** (`changes.log`, empty until the first overlay change): one JSON object a line, each starting
+  with the blake3 of the line before (`{"prev": "...", ...}`), so the last line's hash stands for the whole log and a
+  line changed anywhere breaks the chain.
+- **`wdstore snapshot <dir> [--at N]`:** the base hash, the log's length and head, and one snapshot hash over them;
+  `--at N` is the state after the log's first N changes (a pin). A read against a named snapshot that the store
+  does not hold fails with `snapshot_not_held`, never reads the latest instead.
+
 ## Next
 
 The scholarly split (the size line's question in 0055); the build over the whole dump

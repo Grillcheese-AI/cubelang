@@ -67,6 +67,7 @@ impl Writer {
     /// One ingested block, in the dump's order.
     pub fn add(&mut self, b: Block) -> Result<(), String> {
         for (k, v) in b.skipped { *self.st.skipped.entry(k).or_default() += v; }
+        if let Some(d) = b.dump_date { self.st.dump_date = d; }
         for n in &b.value_nodes { self.logs.values.define_value(n)?; }
         for n in &b.ref_nodes { self.logs.refs.define_ref(n, &mut self.logs.values)?; }
         for (a, c) in &b.redirects {
@@ -190,7 +191,7 @@ impl Writer {
         let skipped: Vec<String> = st.skipped.iter().map(|(k, v)| format!("{}: {v}", j(k))).collect();
         let man = format!(concat!("{{\n \"format_version\": 3,\n \"code_blake3\": {},\n",
             " \"params\": {{\"langs\": {:?}, \"wikis\": {:?}, \"hot_qualifiers\": {:?}, \"cold_classes\": [{}], \"per_chunk\": {}}},\n",
-            " \"inputs\": [{}],\n \"files\": [\n  {}\n ],\n",
+            " \"inputs\": [{}],\n \"dump_date\": {},\n \"files\": [\n  {}\n ],\n",
             " \"counts\": {{\"blocks\": {}, \"failed\": {}, \"entities_hot\": {}, \"entities_cold\": {}, \"statements_hot\": {}, ",
             "\"statements_cold\": {}, \"duplicates\": {}, \"hot_qualifiers\": {}, \"cold_qualifiers\": {}, \"references\": {}, \"names\": {}, ",
             "\"value_nodes\": {}, \"value_nodes_undefined\": {}, \"ref_nodes\": {}, \"ref_nodes_undefined\": {}, \"redirects\": {}, ",
@@ -200,7 +201,7 @@ impl Writer {
             " \"bytes_per_statement\": {{\"hot_chunks\": {}, \"cold_chunks\": {}, \"hot_total\": {}}},\n \"build_s\": {}\n}}\n"),
             j(&crate::code_hash()), prm.langs, prm.wikis, prm.hot_qualifiers,
             cold_classes.iter().map(|c| j(&c.text())).collect::<Vec<_>>().join(", "), per_chunk, inputs.join(", "),
-            files.join(",\n  "), st.blocks, st.failed_n, st.entities[0], st.entities[1], st.statements[0], st.statements[1],
+            j(&st.dump_date), files.join(",\n  "), st.blocks, st.failed_n, st.entities[0], st.entities[1], st.statements[0], st.statements[1],
             st.duplicates, st.hot_qualifiers, st.cold_qualifiers, st.references, st.names, vn, vu, rn, ru, redirects.len(),
             rkeys, nkeys[0], nkeys[1], skipped.join(", "), st.failed.iter().map(|s| j(s)).collect::<Vec<_>>().join(", "),
             bytes[0], bytes[1], shared, hot_idx, hot_total, per(bytes[0], st.statements[0]), per(bytes[1], st.statements[1]),

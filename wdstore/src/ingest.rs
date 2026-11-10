@@ -30,6 +30,8 @@ pub struct Block {
     pub redirects: Vec<(Eid, Eid)>,
     /// Triples the store does not keep, by predicate (derived ones: wdt:, psn:, the counts on data:, ...).
     pub skipped: BTreeMap<String, u64>,
+    /// The dump's own date (`wikibase:Dump schema:dateModified`), from its header block.
+    pub dump_date: Option<String>,
 }
 
 fn name(t: &Term) -> Option<&str> { if let Term::Name(n) = t { Some(n) } else { None } }
@@ -77,6 +79,7 @@ pub fn block(text: &str, prm: &Params) -> Result<Block, String> {
     for (s, p, o) in ts {
         let (Some(pn), sn) = (name(&p).map(str::to_string), name(&s).map(str::to_string)) else { skip(&mut b, "iri"); continue };
         match sn.as_deref() {
+            Some("wikibase:Dump") if pn == "schema:dateModified" => b.dump_date = Some(lit(&o)),
             Some(x) if x.starts_with("data:") => match pn.as_str() {
                 "schema:version" => ent.revision = lit(&o).parse().map_err(|_| format!("revision {o:?}"))?,
                 "schema:dateModified" => ent.modified = lit(&o),
