@@ -119,6 +119,41 @@ impl Reverse {
     }
 
     /// Every entity with a statement `pid` = `value`, in id order (at every rank: the caller filters).
+    /// The first `limit` hits of `who`, and how many there are in all (a key's count, read without its postings).
+    pub fn who_first(&self, pid: u32, value: Eid, limit: usize) -> Result<(u64, Vec<Hit>), String> {
+        let want = (pid, value.0);
+        let (mut lo, mut hi) = (0, self.keys);
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            let (p, v, off, n) = self.key(m);
+            match (p, v).cmp(&want) {
+                std::cmp::Ordering::Less => lo = m + 1,
+                std::cmp::Ordering::Greater => hi = m,
+                std::cmp::Ordering::Equal => return Ok((n as u64, self.list(off, n.min(limit as u32))?)),
+            }
+        }
+        Ok((0, vec![]))
+    }
+
+    /// The first `limit` hits of `pointing_at`, and how many there are in all.
+    pub fn pointing_at_first(&self, value: Eid, limit: usize) -> Result<(u64, Vec<(u32, Hit)>), String> {
+        let (mut lo, mut hi) = (0, self.keys);
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            if self.key_at(self.by_value_at, m).1 < value.0 { lo = m + 1 } else { hi = m }
+        }
+        let (mut total, mut out) = (0u64, Vec::new());
+        while lo < self.keys {
+            let (p, v, off, n) = self.key_at(self.by_value_at, lo);
+            if v != value.0 { break; }
+            total += n as u64;
+            let room = limit.saturating_sub(out.len()) as u32;
+            if room > 0 { out.extend(self.list(off, n.min(room))?.into_iter().map(|h| (p, h))); }
+            lo += 1;
+        }
+        Ok((total, out))
+    }
+
     pub fn who(&self, pid: u32, value: Eid) -> Result<Vec<Hit>, String> {
         let want = (pid, value.0);
         let (mut lo, mut hi) = (0, self.keys);

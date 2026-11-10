@@ -107,6 +107,12 @@ impl Store {
     /// Every hot entity with a statement whose main value is `value`, whatever the property: (pid, hit).
     pub fn pointing_at(&self, value: Eid) -> Result<Vec<(u32, Hit)>, String> { self.reverse.pointing_at(value) }
 
+    /// `who` and `pointing_at`, their first `limit` hits and how many there are in all.
+    pub fn who_first(&self, pid: u32, value: Eid, limit: usize) -> Result<(u64, Vec<Hit>), String> { self.reverse.who_first(pid, value, limit) }
+    pub fn pointing_at_first(&self, value: Eid, limit: usize) -> Result<(u64, Vec<(u32, Hit)>), String> {
+        self.reverse.pointing_at_first(value, limit)
+    }
+
     /// Every hot entity a name may mean (exact, else accent-folded, else a bounded typo), in id order, never by fame.
     pub fn name(&self, s: &str) -> Result<Found, String> { self.names.lookup(s) }
 

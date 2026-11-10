@@ -6,8 +6,10 @@
 //!        each statement says whether it holds then: holds, does_not, too_coarse, undated. With `snapshot`, a store
 //!        in another state answers {"error": "snapshot_not_held"} and nothing else.
 //!   {"op": "name", "text": "Douglas Adams"}             every hot entity the name may mean, in id order
-//!   {"op": "who", "pid": 31, "value": "Q5"}              the hot entities with that main value, with their ranks
-//!   {"op": "pointing_at", "value": "Q5"}                 the hot entities pointing at it, whatever the property
+//!   {"op": "who", "pid": 31, "value": "Q5", "limit": 1000}   the first hot entities with that main value (ranks),
+//!                                                        and how many there are in all ("total")
+//!   {"op": "pointing_at", "value": "Q5", "limit": 1000}  the first hot entities pointing at it, whatever the
+//!                                                        property, and how many there are in all
 //!   {"op": "resolve", "id": "Q7"}                        the id that remains
 //!   {"op": "labels", "ids": ["Q5", "P31"], "lang": "en"} each entity's label in that language (absent: none)
 //! The store never reads a clock: a date is always the request's.
@@ -32,6 +34,9 @@ fn asked(s: &str) -> Option<(i64, i64)> {
     };
     span(&lit, p, "Q1985727")
 }
+
+/// A request's `limit` (who, pointing_at): at most this many hits come back, with the total beside them.
+fn limit(r: &J) -> usize { r.get("limit").and_then(J::as_u64).map(|x| x as usize).unwrap_or(1000).min(100_000) }
 
 fn label(st: &Store, id: Eid, lang: &str) -> Result<Option<String>, String> {
     Ok(st.get(id)?.and_then(|e| e.names.into_iter().find(|n| n.lang == lang && n.kind == NameKind::Label).map(|n| n.text)))
@@ -71,10 +76,13 @@ fn answer(st: &Store, snap: &str, r: &J) -> Result<J, String> {
         },
         "who" => {
             let pid = r.get("pid").and_then(J::as_u64).ok_or("pid")? as u32;
-            json!({"hits": st.who(pid, id("value")?)?.iter().map(|h| json!([h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()})
+            let (total, hits) = st.who_first(pid, id("value")?, limit(r))?;
+            json!({"total": total, "hits": hits.iter().map(|h| json!([h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()})
         }
-        "pointing_at" => json!({"hits": st.pointing_at(id("value")?)?.iter()
-            .map(|(p, h)| json!([p, h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()}),
+        "pointing_at" => {
+            let (total, hits) = st.pointing_at_first(id("value")?, limit(r))?;
+            json!({"total": total, "hits": hits.iter().map(|(p, h)| json!([p, h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()})
+        }
         "labels" => {
             let lang = r.get("lang").and_then(J::as_str).unwrap_or("en");
             let mut m = serde_json::Map::new();

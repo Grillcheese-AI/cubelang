@@ -153,23 +153,34 @@ fn main() {
     if let Err(e) = r { eprintln!("{e}"); std::process::exit(1); }
 }
 
-/// Lookup latency, from memory (the files read whole): one entity by id, then one hot name, over a spread of ids.
+/// Lookup latency over about 20,000 ids spread over the store, read twice: the first pass from the disk (pages not
+/// yet in memory: the order's "from SSD"), the second from the page cache. Then one hot name per entity, the same way.
 fn bench(s: &Store) -> Result<(), String> {
-    let ids = s.ids(37);
-    let pct = |mut v: Vec<f64>| { v.sort_by(|a, b| a.total_cmp(b)); let at = |p: usize| v[(v.len() - 1) * p / 100];
-        format!("p50 {:.1} us, p95 {:.1} us, p99 {:.1} us (n {})", at(50), at(95), at(99), v.len()) };
-    let (mut get, mut name, mut labels) = (Vec::new(), Vec::new(), Vec::new());
-    for &id in &ids {
-        let t = std::time::Instant::now();
-        let (cold, e) = s.locate(id)?.ok_or("an indexed id not found")?;
-        get.push(t.elapsed().as_secs_f64() * 1e6);
-        if !cold { if let Some(n) = e.names.iter().find(|n| n.kind != wdstore::model::NameKind::Description) { labels.push(n.text.clone()); } }
+    let n = s.ids(1).len();
+    let ids = s.ids((n / 20_000).max(1));
+    let pct = |mut v: Vec<u128>| { v.sort(); let at = |p: usize| v[(v.len() - 1) * p / 100];
+        format!("p50 {} us, p95 {} us, p99 {} us (n {})", at(50), at(95), at(99), v.len()) };
+    let mut labels = Vec::new();
+    for pass in ["from disk", "cached"] {
+        let mut get = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            let t = std::time::Instant::now();
+            let (cold, e) = s.locate(id)?.ok_or("an indexed id not found")?;
+            get.push(t.elapsed().as_micros());
+            if pass == "from disk" && !cold {
+                if let Some(x) = e.names.iter().find(|x| x.kind != wdstore::model::NameKind::Description) { labels.push(x.text.clone()); }
+            }
+        }
+        println!("get by id, {pass}: {}", pct(get));
     }
-    for l in &labels {
-        let t = std::time::Instant::now();
-        if let wdstore::names::Found::None = s.name(l)? { return Err(format!("{l}: its own label not found")); }
-        name.push(t.elapsed().as_secs_f64() * 1e6);
+    for pass in ["from disk", "cached"] {
+        let mut name = Vec::with_capacity(labels.len());
+        for l in &labels {
+            let t = std::time::Instant::now();
+            if let wdstore::names::Found::None = s.name(l)? { return Err(format!("{l}: its own label not found")); }
+            name.push(t.elapsed().as_micros());
+        }
+        println!("name, {pass}: {}", if name.is_empty() { "no hot names".into() } else { pct(name) });
     }
-    println!("get by id: {}\nname:      {}", pct(get), if name.is_empty() { "no hot names".into() } else { pct(name) });
     Ok(())
 }
