@@ -211,7 +211,8 @@ New fields are added to the proto without renumbering or changing existing ones.
 - [ ] **P4-9: what stays on the host side** (CubbyLLM 0064, not this repo): encrypting the records at rest, signing
   them, and who may read them. The VM's part is to leak nothing on the way there.
 
-**Added 2026-11-10 for CheezML v0.2** (Nick's yes: "Carry it into the VM and store"). A v0.2 record names the store
+**Added 2026-11-10 for CheezML v0.2** (Nick's yes: "Carry it into the VM and store"; the three items approved as
+written the same day: "all good"). A v0.2 record names the store
 state a run read and the date the question was about (`cheez:storeSnapshot` and `cheez:asOf`), and a run that read a
 fact without both fails validation. A record only states what ran, so the report must carry them. They are the
 store's two clocks seen from the run: which state of the store was read (recorded time), and which moment in the
