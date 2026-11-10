@@ -211,6 +211,52 @@ New fields are added to the proto without renumbering or changing existing ones.
 - [ ] **P4-9: what stays on the host side** (CubbyLLM 0064, not this repo): encrypting the records at rest, signing
   them, and who may read them. The VM's part is to leak nothing on the way there.
 
+**Added 2026-11-10 for CheezML v0.2** (Nick's yes: "Carry it into the VM and store"). A v0.2 record names the store
+state a run read and the date the question was about (`cheez:storeSnapshot` and `cheez:asOf`), and a run that read a
+fact without both fails validation. A record only states what ran, so the report must carry them. They are the
+store's two clocks seen from the run: which state of the store was read (recorded time), and which moment in the
+world the question is about (valid time).
+
+**In plain words:** every run says which copy of the knowledge base it read and which date it answered for, so the
+same question can be run again later against the same copy and give the same answer.
+- **Over a conventional model:** a model cannot say which state of its knowledge an answer came from, and it cannot
+  be asked again as of last month.
+
+- [ ] **P4-10: the store state read.** For each store a run reads (a knowledge file today, the `wdstore` crate from
+  CubbyLLM 0055's step 3), the report carries:
+  - its snapshot hash: for a knowledge file, the sha-256 of its bytes as loaded; for `wdstore`, the snapshot hash
+    the store gives (CubbyLLM 0055's addendum of 2026-11-10);
+  - the release it was built from, when the store's manifest names one: its name, version and hash;
+  - for a branch, the hash of its `assume` lines and of its matched exclusions, so base and branch together name
+    exactly what was read;
+  - one hash over all of the above, in a fixed order: the run's snapshot. A CheezML record names one snapshot per
+    run, and this is the one it cites.
+
+  The resident cache keeps the hash with each parsed store and recomputes it when the file changes.
+  - **Pinned runs:** the request may carry `expect_snapshot`. If the store's hash differs, the run fails with the
+    code `store_changed` before any read. It never reads another state instead.
+  - **Tests:** the same file gives the same hash; one changed line gives another; a pinned run against a changed
+    store is refused; a recorded run replayed against its snapshot gives the same report hash (P4-7).
+- [ ] **P4-11: the as-of date.** The request carries `as_of`, a date and time with its zone: the moment in the
+  world the question is about. The report echoes it.
+  - **No other clock.** A program never reads the system clock. A date used in a program comes from `as_of` or from
+    a recorded host call (P5-1), so a replay gives the same result on any day.
+  - **Facts with dates.** When a store's facts carry the period they held (`wdstore` keeps Wikidata's start, end
+    and point-in-time qualifiers with their precision), a QUERY matches only the facts that held at `as_of`. The
+    report counts the facts left out for that reason. A fact whose dates are too coarse to decide is reported with
+    its own code, never guessed.
+  - **Strict mode** rejects a run that reads a store with no `as_of`. Outside strict mode the report says it was
+    not given, and the host cannot write a certificate from that run.
+  - **Tests:** a fact that ended before `as_of` is not matched and is counted; a fact dated to the year, asked as
+    of a day inside that year, gives the "too coarse" code; the same request run on two different days gives the
+    same report hash.
+- [ ] **P4-12: outside sources stay on the host.** The VM makes no outbound network connection. When a run is
+  refused for a missing fact, the host may read a source and admit facts through its gate; CubbyLLM records that
+  read as a `cheez:SourceRead` (orders 0007 and 0064). The next run then reads a new store state and its report shows
+  the new snapshot hash, which is how the host links the answer to the read.
+  - **Tests:** a dependency check fails the build if a network client is added to the VM; a run after an admitted
+    fact reports a snapshot hash different from the run before it.
+
 The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
 
 ---
