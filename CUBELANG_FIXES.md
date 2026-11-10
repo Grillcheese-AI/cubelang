@@ -250,12 +250,30 @@ same question can be run again later against the same copy and give the same ans
   - **Tests:** a fact that ended before `as_of` is not matched and is counted; a fact dated to the year, asked as
     of a day inside that year, gives the "too coarse" code; the same request run on two different days gives the
     same report hash.
-- [ ] **P4-12: outside sources stay on the host.** The VM makes no outbound network connection. When a run is
-  refused for a missing fact, the host may read a source and admit facts through its gate; CubbyLLM records that
-  read as a `cheez:SourceRead` (orders 0007 and 0064). The next run then reads a new store state and its report shows
-  the new snapshot hash, which is how the host links the answer to the read.
-  - **Tests:** a dependency check fails the build if a network client is added to the VM; a run after an admitted
-    fact reports a snapshot hash different from the run before it.
+- [ ] **P4-12: a program can fetch an outside source, through a recorded call** (revised 2026-11-10; Nick: "it
+  needs to do some outbound connection to fetch news or other sources"). News feeds, a live Wikidata lookup and other
+  sources are reached from inside a run, with host functions of a `source` module on the host-call channel (P5-1).
+  - **Who opens the connection.** The host does, and hands the VM the result. In CubbyLLM this is `cubby_serve`'s
+    fetchers, by Nick's rule of 2026-10-22 (what fetches lives in the server and hands the core a fetch function).
+    For the standalone `cubelang` command, a built-in fetcher can be attached with an explicit flag. The VM's core
+    has no network client of its own, so a program can only reach what the run was granted.
+  - **Off by default.** A program must `use source`, and the request names the sources the run may reach. A call
+    to a source outside that list is refused with a code before any connection is made.
+  - **What the report records** for each call, which is what a `cheez:SourceRead` needs: the source's id and
+    address, the query's hash, the response's hash, the time, and the licence the host holds for that source.
+  - **Replay.** A recorded run replays from its recorded responses and never touches the network (P5-1).
+  - **A response is data.** It is never compiled or run as a program. Facts taken from it enter the store only
+    through the host's gate, with their source (CubbyLLM 0007 and 0024); the store then has a new state. The run
+    in progress keeps reading the state it started with, and the next run reads the new one, so a run still names
+    one snapshot (P4-10).
+  - **Only the query leaves.** The report lists every query sent and where, by hash, so an audit shows what left
+    the machine. A tenant whose list of sources is empty sends nothing.
+  - **Limits.** `max_source_calls` joins `Budget`, with a time and a size limit per call. A failed fetch comes back
+    as a code and fails the call. It never becomes a default value.
+  - **Tests:** a `source` call without `use source` does not compile; a source outside the run's list is refused
+    with no connection attempted; a recorded run replays with the network off to the same report hash; a response
+    holding CubeLang text is not executed; a dependency check fails the build if a network client is added to the
+    VM's core.
 
 The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
 
