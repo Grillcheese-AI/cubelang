@@ -265,18 +265,22 @@ those steps is recorded, so a world decision is as checkable as an answer.
   or spawn one when the best similarity is below tau, else consolidate. It returns the world id and whether it
   spawned. These are cubemind's VSAVM semantics (`_specialize`, its WorldManager).
 - [ ] **P5-4: port the pure vector opcodes,** with cubemind's VSAVM as the reference: SEQ, DIFF, MATCH, DECODE,
-  DETECT_PATTERN and PREDICT, and EXPLORE with REWARD (a UCB bandit, deterministic). Block codes as in MoWM
-  (k = 80, l = 128, D = 10,240).
-  - **Parity test per opcode:** the same program and seed in both VMs give the same result, exactly for integers
-    and ids, within 1e-6 for floats.
+  DETECT_PATTERN and PREDICT, and EXPLORE with REWARD (a UCB bandit, deterministic).
+  - **Two vector families.** The Rust VM's vectors are MAP-bipolar (D = 4096 in the VM), while cubemind and MoWM
+    use block codes (k = 80, l = 128). Similarity values therefore differ between the two VMs.
+  - **Parity test per opcode:** on fixtures built so the answer is unambiguous, both VMs give the same discrete
+    result (index, label, id, decision). The similarities are reported side by side, not required to be equal.
+  - **Choosing one vector family** for all three repos is Nick's decision, kept separate from this job. `engine.rs`
+    notes that reconciling the dimensions is out of scope.
 - [ ] **P5-5: learned opcodes stay outside the VM.** SCORE (cubemind uses a learned value model, CVL), FORGE (LoRA
   adapters), DISCOVER and DEBATE become host calls to cubemind if a program needs them.
   - Their outputs are proposals. The report marks every value derived from them.
   - Such a value is never certified unless a later deterministic check verifies it.
 - [ ] **P5-6: no reference semantics yet.** INST, GEN, INFER, MERGE, SPLIT, FILTER, MAP_ROLES, REDUCE,
-  TEMPORAL_BIND, ANALOGY, BROADCAST and SYNC are not implemented in cubemind's VSAVM either. Write one paragraph per
-  opcode first: inputs, output, determinism, failure codes. Nick says yes before any code. Until then, strict mode
-  keeps rejecting them.
+  TEMPORAL_BIND, ANALOGY, BROADCAST and SYNC are not implemented in cubemind's VSAVM either. Neither is **UNIFY**:
+  it logs "UNIFY a b" and computes nothing, so it joins this list. The proposed paragraphs are in
+  `docs/proposals/2026-11-10-trace-only-opcodes.md`. Nick says yes to each before any code; until then, strict mode
+  keeps rejecting them, UNIFY included.
 - [ ] **P5-7: the drafts' `vm.*` helpers.**
   - `vm.timestamp` is the request's time, passed in by the host, fixed for the run and recorded, so runs stay
     replayable.
