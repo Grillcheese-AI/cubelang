@@ -346,3 +346,20 @@ fn serve_brief_gives_label_description_classes_and_set_without_the_statements() 
     assert!(a.get("Q999").is_none());
     assert!(a["Q7"]["datatype"].is_null());                          // an item has none; a property says its own
 }
+
+#[test]
+fn kinds_counts_each_classs_members_by_property_with_labels_and_the_snapshot() {
+    let (out, _) = built("kinds");
+    let st = wdstore::store::Store::open(&out).unwrap();
+    let k = format!("{out}/_kinds");
+    wdstore::kinds::kinds(&st, &k).unwrap();
+    let rels = std::fs::read_to_string(format!("{k}/kind_rels.tsv")).unwrap();
+    let humans = st.who(31, q("Q5")).unwrap().iter().filter(|h| h.best && h.rank as u8 != 0).count();
+    assert!(humans > 0 && rels.lines().any(|l| l == format!("Q5\tP31\t{humans}")),
+            "a kind's size is its members (the reverse index counts {humans}): {rels}");
+    assert!(rels.lines().all(|l| l.split('\t').count() == 3));
+    let meta = std::fs::read_to_string(format!("{k}/meta.tsv")).unwrap();
+    assert!(meta.contains(&format!("snapshot\t{}", wdstore::snapshot::at(&out, None).unwrap().hash)));
+    let labels = std::fs::read_to_string(format!("{k}/labels.tsv")).unwrap();
+    assert!(labels.lines().all(|l| l.split('\t').count() == 2));
+}

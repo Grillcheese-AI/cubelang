@@ -28,6 +28,7 @@ pub mod chunk;
 pub mod codec;
 pub mod export;
 pub mod ingest;
+pub mod kinds;
 pub mod model;
 pub mod names;
 pub mod nodes;

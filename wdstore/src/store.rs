@@ -117,6 +117,10 @@ impl Store {
     pub fn name(&self, s: &str) -> Result<Found, String> { self.names.lookup(s) }
 
     /// Every `step`-th entity id, in id order (a spread sample for the latency measurement).
+    /// The hot set's chunks: how many, and one's entities in order (a pass over every hot entity: `kinds`).
+    pub fn hot_chunks(&self) -> usize { self.chunks[0].len() }
+    pub fn hot_chunk(&self, k: usize) -> Result<Vec<Entity>, String> { chunk::Reader::open(&self.chunks[0][k])?.read_all(&self.nodes) }
+
     pub fn ids(&self, step: usize) -> Vec<Eid> {
         (0..Self::count(&self.ids)).step_by(step.max(1))
             .map(|i| Eid(u64::from_le_bytes(self.ids[20 + 16 * i..28 + 16 * i].try_into().unwrap()))).collect()
