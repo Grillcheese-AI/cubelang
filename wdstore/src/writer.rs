@@ -78,7 +78,8 @@ impl Writer {
     /// One ingested block, in the dump's order.
     pub fn add(&mut self, b: Block) -> Result<(), String> {
         for (k, v) in b.skipped { *self.st.skipped.entry(k).or_default() += v; }
-        if let Some(d) = b.dump_date { self.st.dump_date = d; }
+        // the first header's date: the dump is 8 shards, each with its own header, written over two days
+        if let Some(d) = b.dump_date { if self.st.dump_date.is_empty() { self.st.dump_date = d; } }
         let t = std::time::Instant::now();
         for n in &b.value_nodes { self.logs.values.define_value(n)?; }
         for n in &b.ref_nodes { self.logs.refs.define_ref(n, &mut self.logs.values)?; }
