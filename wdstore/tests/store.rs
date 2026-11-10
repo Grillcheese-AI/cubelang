@@ -307,11 +307,15 @@ fn serve_answers_each_request_line_as_of_a_date_and_refuses_a_snapshot_it_does_n
         "{{\"op\": \"name\", \"text\": \"Douglas Adams\"}}\n",
         "{{\"op\": \"who\", \"pid\": 31, \"value\": \"Q5\"}}\n",
         "{{\"op\": \"labels\", \"ids\": [\"Q42\", \"Q44\"], \"lang\": \"fr\"}}\n",
-        "{{\"op\": \"nope\"}}\n"), s = snap);
+        "{{\"op\": \"nope\"}}\n",
+        "{{\"op\": \"get\", \"id\": \"Q42\", \"nodes\": true}}\n"), s = snap);
     let mut o = Vec::new();
     wdstore::serve::serve(&out, std::io::Cursor::new(reqs), &mut o).unwrap();
     let a: Vec<serde_json::Value> = String::from_utf8(o).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(a.len(), 7);
+    assert_eq!(a.len(), 8);
+    assert!(a[1].get("nodes").is_none());                          // only when asked
+    let named: Vec<&str> = a[7]["statements"].as_array().unwrap().iter().filter_map(|s| s["value_node"].as_str()).collect();
+    assert!(!named.is_empty() && named.iter().all(|h| a[7]["nodes"][*h]["kind"].is_string()), "every value node named is given");
     assert_eq!(a[0]["snapshot"], snap);
     assert_eq!((a[1]["id"].as_str(), a[1]["redirected_from"].as_str()), (Some("Q42"), Some("Q7")));
     let holds: Vec<&str> = a[1]["statements"].as_array().unwrap().iter().map(|s| s["holds"].as_str().unwrap()).collect();

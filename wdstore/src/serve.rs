@@ -4,7 +4,9 @@
 //!   {"op": "get", "id": "Q42", "as_of": "2019", "snapshot": "<hash>"}
 //!        the entity as stored (a redirect followed, said); with `as_of` (YYYY, YYYY-MM or YYYY-MM-DD, Gregorian),
 //!        each statement says whether it holds then: holds, does_not, too_coarse, undated. With `snapshot`, a store
-//!        in another state answers {"error": "snapshot_not_held"} and nothing else.
+//!        in another state answers {"error": "snapshot_not_held"} and nothing else. With `"nodes": true`, also the
+//!        value nodes its statements name, by hash, each with its fields as written (a time's precision and calendar,
+//!        a quantity's unit and bounds): what a reader needs to say a value exactly (a year-precision date is a year).
 //!   {"op": "name", "text": "Douglas Adams"}             every hot entity the name may mean, in id order
 //!   {"op": "who", "pid": 31, "value": "Q5", "limit": 1000}   the first hot entities with that main value (ranks),
 //!                                                        and how many there are in all ("total")
@@ -56,6 +58,16 @@ fn answer(st: &Store, snap: &str, r: &J) -> Result<J, String> {
             let Some((cold, e, nodes)) = st.locate_with_nodes(to)? else { return Ok(json!({"found": false, "id": to.text()})) };
             let mut out: J = serde_json::from_str(&crate::export::entity(&e, cold)).map_err(|x| x.to_string())?;
             if to != asked_id { out["redirected_from"] = json!(asked_id.text()); }
+            if r.get("nodes").and_then(J::as_bool) == Some(true) {
+                let mut m = serde_json::Map::new();
+                for (h, v) in &nodes {
+                    let mut f = serde_json::Map::new();
+                    f.insert("kind".into(), json!(v.kind));
+                    for (k, x) in &v.fields { f.insert(k.clone(), json!(x)); }
+                    m.insert(String::from_utf8_lossy(&h.0).into_owned(), J::Object(f));
+                }
+                out["nodes"] = J::Object(m);
+            }
             if let Some(d) = r.get("as_of").and_then(J::as_str) {
                 let a = asked(d).ok_or(format!("as_of: {d}"))?;
                 let find = |h: &NodeHash| nodes.get(h).cloned();
