@@ -344,4 +344,5 @@ fn serve_brief_gives_label_description_classes_and_set_without_the_statements() 
     assert_eq!((a["Q7"]["id"].as_str(), a["Q7"]["label"].as_str(), a["Q7"]["description"].as_str()), (Some("Q42"), Some("Douglas Adams"), Some("écrivain")));
     assert_eq!((a["Q44"]["types"][0].as_str(), a["Q44"]["cold"].as_bool(), a["Q44"]["statements"].as_u64()), (Some("Q5"), Some(false), Some(1)));
     assert!(a.get("Q999").is_none());
+    assert!(a["Q7"]["datatype"].is_null());                          // an item has none; a property says its own
 }

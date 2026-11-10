@@ -14,7 +14,8 @@
 //!                                                        property, and how many there are in all
 //!   {"op": "resolve", "id": "Q7"}                        the id that remains
 //!   {"op": "labels", "ids": ["Q5", "P31"], "lang": "en"} each entity's label in that language (absent: none)
-//!   {"op": "brief", "ids": ["Q42"], "lang": "en"}      each: label, description, classes (P31), hot or cold, statements
+//!   {"op": "brief", "ids": ["Q42"], "lang": "en"}      each: label, description, classes (P31), hot or cold, statements,
+//!                                                        a property's datatype (null for an item)
 //! The store never reads a clock: a date is always the request's.
 
 use std::io::{BufRead, Write};
@@ -98,7 +99,7 @@ fn answer(st: &Store, snap: &str, r: &J) -> Result<J, String> {
         }
         "brief" => {
             // per id (a redirect followed): its label and description in `lang` (else mul, en, fr), its classes (P31,
-            // best rank), hot or cold, and how many statements; without the statements themselves
+            // best rank), hot or cold, how many statements and, for a property, its datatype; without the statements
             let lang = r.get("lang").and_then(J::as_str).unwrap_or("en");
             let mut m = serde_json::Map::new();
             for x in r.get("ids").and_then(J::as_array).ok_or("ids")? {
@@ -110,7 +111,7 @@ fn answer(st: &Store, snap: &str, r: &J) -> Result<J, String> {
                 let types: Vec<String> = ent.statements.iter().filter(|s| s.pid == 31 && s.best)
                     .filter_map(|s| if let Value::Entity(c) = s.value { Some(c.text()) } else { None }).take(3).collect();
                 m.insert(e.text(), json!({"id": to.text(), "label": pick(NameKind::Label), "description": pick(NameKind::Description),
-                    "types": types, "cold": cold, "statements": ent.statements.len()}));
+                    "types": types, "cold": cold, "statements": ent.statements.len(), "datatype": ent.datatype}));
             }
             J::Object(m)
         }
