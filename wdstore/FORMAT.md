@@ -95,7 +95,7 @@ statement in all. Lookups from memory (`wdstore bench`, 3,275 ids spread over th
 p95 15.4 us, p99 22.5 us; a name p50 2.2 us, p95 5.8 us, p99 8.4 us. The order's lines are 1 ms p95 for a fact and
 50 ms p95 for a name, from SSD: measured on the full build, memory-mapped.
 
-## The full build (format 3, being built)
+## The full build (format 3)
 
 The dump is about 1 TB of Turtle in 121 GB of bzip2, in 8 shards one after another; within a shard the ids rise
 but not strictly (34 descents in one sample segment), so the build never sorts the entities:
@@ -116,6 +116,11 @@ but not strictly (34 descents in one sample segment), so the build never sorts t
 - **Hot and cold:** entities of the bulk classes (scholarly articles, P31 Q13442814, by default; a build
   parameter) go to a cold store of the same format beside the hot one, as the synthesis says.
 - **Deterministic:** one writer, in the dump's order; a second build gives the same bytes (the order's acceptance).
+
+Measured on the dump's last part (1.05 GB of bzip2, 8.5 GB of Turtle), 2026-11-10: 1,235,092 hot and 614,755 cold
+entities, 16.5M statements, 32,919 redirects; 87 s on 12 threads; a build stopped after 8 checkpoints and run again
+gives the same 72 files, byte for byte, as one never stopped; 1.2 GB written in all (hot and cold chunks, nodes,
+indexes and the build's logs). The dump at this rate: about 2.7 h and about 135 GB, hot store about 75-80 GB.
 
 ## Next
 
