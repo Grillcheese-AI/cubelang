@@ -26,6 +26,7 @@ pub mod build;
 pub mod bz2par;
 pub mod chunk;
 pub mod codec;
+pub mod cues;
 pub mod export;
 pub mod ingest;
 pub mod kinds;

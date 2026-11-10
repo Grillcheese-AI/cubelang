@@ -363,3 +363,19 @@ fn kinds_counts_each_classs_members_by_property_with_labels_and_the_snapshot() {
     let labels = std::fs::read_to_string(format!("{k}/labels.tsv")).unwrap();
     assert!(labels.lines().all(|l| l.split('\t').count() == 2));
 }
+
+#[test]
+fn cue_words_are_cut_as_cubbyllms_and_the_pass_writes_its_tables() {
+    assert_eq!(wdstore::cues::words("The Nobel Prize in Physics, 1903 (Sk\u{142}odowska)"), vec!["nobel", "prize", "physics", "odowska"]);
+    assert_eq!(wdstore::cues::words("an ox of 12 to"), Vec::<String>::new());
+    // a labelled class: its members' value words include the kind's own ("human"), as in hdc_cues
+    let class = "data:Q5 a schema:Dataset ;\n\tschema:about wd:Q5 ;\n\tschema:version \"9\"^^xsd:integer .\n\nwd:Q5 a wikibase:Item ;\n\trdfs:label \"human\"@en .\n";
+    let (out, _) = built_with("cues", &format!("{HUMANS}\n{class}"), vec![]);
+    let st = wdstore::store::Store::open(&out).unwrap();
+    let k = format!("{out}/_cues");
+    wdstore::cues::cues(&st, &k).unwrap();
+    let pairs = std::fs::read_to_string(format!("{k}/word_kinds.tsv")).unwrap();
+    assert_eq!(pairs.trim(), "human\tQ5\t1");                         // Q44 (best rank); Q45's P31 is deprecated
+    assert!(std::fs::read_to_string(format!("{k}/fictional.tsv")).unwrap().lines().any(|l| l == "Q14897293"));
+    assert!(std::fs::read_to_string(format!("{k}/meta.tsv")).unwrap().contains(&wdstore::snapshot::at(&out, None).unwrap().hash));
+}

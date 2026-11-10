@@ -7,6 +7,7 @@
 //! wdstore name <dir> "Douglas Adams"          every hot entity the name may mean, in id order
 //! wdstore resolve <dir> <ids.txt>            each id: hot / cold / missing, or the id it redirects to
 //! wdstore dump <dir> <ids.txt|all>             entities as stored, one JSON line each
+//! wdstore cues <dir> <out dir>                 which kinds each value word goes with; the fictional classes
 //! wdstore kinds <dir> <out dir>                which properties each class's members hold (CubbyLLM 0055's kinds table)
 //! wdstore bench <dir> [offset]                lookup latency over a spread of ids, hot and cold apart
 //! wdstore bunzip <out> <parts>...             the parts as one bzip2 file, decoded on every core
@@ -149,6 +150,7 @@ fn main() {
         }
         Some("bench") if a.len() == 2 || a.len() == 3 => Store::open(&a[1])
             .and_then(|s| bench(&s, a.get(2).map(|x| x.parse().unwrap_or(0)).unwrap_or(0))),
+        Some("cues") if a.len() == 3 => Store::open(&a[1]).and_then(|s| wdstore::cues::cues(&s, &a[2])).map(|m| println!("{m}")),
         Some("kinds") if a.len() == 3 => Store::open(&a[1]).and_then(|s| wdstore::kinds::kinds(&s, &a[2])).map(|m| println!("{m}")),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: see the head of src/main.rs".into()),
