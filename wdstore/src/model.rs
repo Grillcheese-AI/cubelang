@@ -31,6 +31,14 @@ impl Eid {
         Some(Eid((k << 56) | (n << SUB_BITS) | sub))
     }
 
+    /// (kind index, number, sub-id): what the codec writes.
+    pub fn parts(self) -> (u8, u64, u64) { ((self.0 >> 56) as u8, self.number(), self.0 & ((1 << SUB_BITS) - 1)) }
+
+    pub fn from_parts(kind: u8, n: u64, sub: u64) -> Option<Eid> {
+        if kind as usize >= KINDS.len() || n >= 1 << 36 || sub >= 1 << SUB_BITS { return None; }
+        Some(Eid((kind as u64) << 56 | n << SUB_BITS | sub))
+    }
+
     pub fn kind(self) -> char { KINDS[(self.0 >> 56) as usize] }
     pub fn number(self) -> u64 { (self.0 >> SUB_BITS) & ((1 << 36) - 1) }
 

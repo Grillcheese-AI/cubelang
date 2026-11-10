@@ -3,7 +3,9 @@
 //! revision, the projection of names and wikis, redirects); a chunk reads back to the same entities and a rebuild
 //! writes the same bytes; no stored value is a float.
 
-use wdstore::chunk::{self, Chunk};
+use wdstore::build;
+use wdstore::codec::{guid_kind, R, W};
+use wdstore::store::Store;
 use wdstore::ingest::{block, Params};
 use wdstore::model::*;
 use wdstore::turtle::{triples, Term};
@@ -111,26 +113,47 @@ fn a_statement_with_no_main_snak_is_an_error_not_a_no_value() {
     assert!(block(bad, &Params::default()).unwrap_err().contains("no main snak"));
 }
 
-fn sample_chunk() -> Chunk {
-    let a = block(ITEM, &Params::default()).unwrap();
-    let r = block(REDIRECT, &Params::default()).unwrap();
-    let mut other = a.entity.clone().unwrap();
-    other.id = Some(q("Q43"));
-    Chunk { entities: vec![a.entity.unwrap(), other], value_nodes: a.value_nodes, ref_nodes: a.ref_nodes, redirects: r.redirects }
+fn built(name: &str) -> (String, Store) {
+    let dir = std::env::temp_dir().join(format!("wdstore_test_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("in.ttl");
+    std::fs::write(&input, format!("{ITEM}\n{}\n{REDIRECT}", ITEM.replace("Q42", "Q43"))).unwrap();
+    let out = dir.join("store").to_str().unwrap().to_string();
+    build::build(&[input.to_str().unwrap().to_string()], &out, 1, &Params::default()).unwrap();
+    let s = Store::open(&out).unwrap();
+    (out, s)
 }
 
 #[test]
-fn a_chunk_reads_back_whole_and_a_rebuild_writes_the_same_bytes() {
-    let c = sample_chunk();
-    let bytes = chunk::write(&c).unwrap();
-    assert_eq!(chunk::write(&c).unwrap(), bytes);
-    let rd = chunk::Reader::open(&bytes).unwrap();
-    assert_eq!(rd.read_all().unwrap(), c);
-    assert_eq!(rd.get(q("Q43")).unwrap().unwrap().id, Some(q("Q43")));
-    assert!(rd.get(q("Q44")).unwrap().is_none());
-    let mut bad = sample_chunk();
-    bad.entities.reverse();
-    assert!(chunk::write(&bad).unwrap_err().contains("out of order"));
+fn a_built_store_reads_back_what_was_ingested_and_a_rebuild_writes_the_same_bytes() {
+    let (out, st) = built("a");
+    let want = block(ITEM, &Params::default()).unwrap().entity.unwrap();
+    assert_eq!(st.get(q("Q42")).unwrap().unwrap(), want);
+    assert_eq!(st.get(q("Q43")).unwrap().unwrap().statements, want.statements);   // the same block under Q43
+    assert!(st.get(q("Q44")).unwrap().is_none() && st.get(q("Q1")).unwrap().is_none());
+    assert_eq!(st.resolve(q("Q7")).unwrap(), q("Q42"));
+    assert_eq!(st.resolve(q("Q42")).unwrap(), q("Q42"));
+    assert!(st.check().unwrap().contains("2 chunks"));
+    let v = &st.nodes.values;
+    let node = (0..v.len() as u32).find_map(|i| v.value(i).unwrap()).unwrap();
+    assert_eq!(node.fields.iter().find(|f| f.0 == "wikibase:timePrecision").unwrap().1, "11");
+    let (out2, _) = built("b");
+    for f in ["chunk_00000.wds", "chunk_00001.wds", "values.wds", "refs.wds", "redirects.wds"] {
+        assert_eq!(std::fs::read(format!("{out}/{f}")).unwrap(), std::fs::read(format!("{out2}/{f}")).unwrap(), "{f}");
+    }
+}
+
+#[test]
+fn statement_ids_round_trip_in_every_case() {
+    for g in ["f89a5f74-ab80-4093-976c-993a927bdcb5", "F89A5F74-AB80-4093-976C-993A927BDCB5",
+              "F89a5f74-AB80-4093-976C-993A927BDCB5", "12345678-1234-1234-1234-123456789012", "AAAA-1", ""] {
+        let k = guid_kind(g);
+        let mut w = W::default();
+        w.guid(g, k);
+        assert_eq!(R::new(&w.b).guid(k).unwrap(), g);
+        assert_eq!(w.b.len(), if k == 0 { g.len() + 1 } else { 16 });
+    }
 }
 
 #[test]
@@ -139,4 +162,17 @@ fn no_stored_value_is_a_float() {
                 include_str!("../src/ingest.rs"), include_str!("../src/turtle.rs")] {
         for bad in ["f32", "f64", "parse::<f"] { assert!(!src.contains(bad), "a float type in the store's code: {bad}"); }
     }
+}
+
+#[test]
+fn a_node_written_in_two_places_is_one_node() {
+    let a = ValueNode { hash: NodeHash(b"aa".to_vec()), kind: "wikibase:QuantityValue".into(),
+                        fields: vec![("wikibase:quantityAmount".into(), "+87.7".into())] };
+    let b = ValueNode { hash: NodeHash(b"aa".to_vec()), kind: String::new(),
+                        fields: vec![("wikibase:quantityNormalized".into(), "wdv:bb".into())] };
+    let m = build::merge_values(vec![b.clone(), a.clone(), a.clone()]).unwrap();
+    assert_eq!(m.len(), 1);
+    assert_eq!((m[0].kind.as_str(), m[0].fields.len()), ("wikibase:QuantityValue", 2));
+    let mut c = a.clone(); c.kind = "wikibase:TimeValue".into();
+    assert!(build::merge_values(vec![a, c]).unwrap_err().contains("two kinds"));
 }

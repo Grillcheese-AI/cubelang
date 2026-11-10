@@ -1,4 +1,4 @@
-# wdstore: the hot store's files (format 1)
+# wdstore: the hot store's files (format 2)
 
 Cubby's hot Wikidata store, CubbyLLM order 0055. Built from the WikiKGQA 2026 challenge's dump (Zenodo 22661413,
 CC0), never from a model. Where it lives (the order leaves it to Claude Code): a crate of its own in the cubelang
@@ -32,31 +32,56 @@ cubelang's `target/release`; the VM depends on it when its hops read it (0055 st
 ## Files
 
 `manifest.json`: the format version, the code's blake3 (`code_hash()`, over the store's sources), the build
-parameters, each input (name, bytes, blake3), each chunk (file, first and last id, entities, bytes, blake3), the
-counts, the skipped triples, the first failed blocks (a block that fails to parse is counted and listed, never
-dropped silently). A build step whose input, code and parameter hashes all match is a cached step.
+parameters, each input (name, bytes, blake3), each file (name, bytes, blake3; a chunk's first and last id and its
+entities), the counts (with the value and reference nodes named but never written: 0 is the line for a full
+build), the skipped triples by prefix, the first failed blocks (a block that fails to parse is counted and listed,
+never dropped silently). A build step whose input, code and parameter hashes all match is a cached step.
 
-`chunk_NNNNN.wds`: entities sorted by id, ids ascending across chunks:
+`chunk_NNNNN.wds`, entities sorted by id, ids ascending across chunks:
 
-    "WDSTORE\0" | u32 version | u64 dict_at | u64 index_at | u64 nodes_at | u64 refs_at | u64 redirects_at
-    entity records | dictionary | index (id u64, offset u64)* | value nodes | reference nodes | redirects
+    "WDSTORE\0" | u32 version | u64 dict_at | u64 index_at | entity records | dictionary | index (id u64, offset u32)*
 
-Varints, length-prefixed UTF-8, one encoding per value: the same input writes the same bytes (`wdstore check`
-re-reads every chunk, re-writes it and compares, and checks each chunk's hash against the manifest). One entity is
-read by a binary search on the index; the rest of the chunk is not decoded. The short strings that repeat
-(datatypes, languages, wikis, node kinds and field names) sit once in the chunk's dictionary.
+A statement: the gap from the previous statement's property; a flags byte (rank, 2 bits; best rank; a main value
+node; the statement id's kind, 2 bits; has qualifiers; has references); the statement id (16 bytes when it is a UUID
+in one case, as written otherwise); the main value (an id as `number << 3 | kind << 1 | has sub-id`); then the main
+value node's number, the qualifiers and the references' numbers, as the flags say.
 
-## Measured (format 1, 2026-11-10)
+`values.wds`, `refs.wds`: every value and reference node once, sorted by hash and numbered from 0:
 
-One segment of the dump's 1% sample (121,169 entities, 1,108,786 statements; 593 MB of Turtle): 0 blocks failed;
-116.0 MB, **104.6 bytes a statement**, built in 10 s; a rebuild writes the same bytes. The dump's last 21.7 MB:
-7,223 entities, 43 redirects, 97.9 bytes a statement. At about 1.72B statements, format 1 would be about 180 GB:
-twice the order's 90 GB line, before scholarly articles go cold.
+    "WDNODES\0" | u32 version | u8 kind | u64 count | u64 dict_at | u64 offsets_at | records | dictionary | offsets
 
-## Next (format 2)
+A record is the hash, whether the input wrote the node, then a value node's kind and fields (each the literal the
+dump wrote) or a reference's snaks and value-node numbers. The dump may write one node's triples in two places (a
+quantity's amount and unit in one block, its `quantityNormalized` link in another): the node is their union.
 
-Where format 1's bytes go, by its own layout: the statement id as text (36-41 bytes, about a third), each reference
-and value node as a 16-20 byte hash, every string inline. Format 2: statement ids as 16 bytes with a case flag;
-value and reference nodes in one sorted node file each, referenced by a 32-bit number; a reverse index (property,
-value entity) -> subjects; the names FST (exact and accent-folded keys, a bounded typo path, never ordered by
-fame); then the build over the whole dump in id-range buckets, resumable chunk by chunk.
+`redirects.wds`: "WDREDIR\0" | u32 version | u64 count | (old id u64, new id u64)* sorted by the old id. `resolve`
+follows at most 8 (a loop is an error, not an answer).
+
+One encoding per value: the same input writes the same bytes. `wdstore check` re-reads every file whole, re-writes
+it and compares, and compares each file's hash with the manifest's. One entity is read by a binary search on its
+chunk's index; the rest of the chunk is not decoded. The short strings that repeat (datatypes, languages, wikis,
+node kinds and field names) sit once in each file's dictionary.
+
+## Measured
+
+One segment of the dump's 1% sample (121,169 entities, 1,108,786 statements; 593 MB of Turtle), 2026-11-10:
+
+| | format 1 | format 2 |
+|---|---|---|
+| blocks failed | 0 | 0 |
+| bytes a statement, entity chunks | 104.6 (nodes inline) | 54.8 |
+| bytes a statement, with the node files | 104.6 | 65.5 |
+| build | 10 s | 11 s |
+| a rebuild writes the same bytes | yes | yes |
+
+At about 1.72B statements, format 2 is about 113 GB for the whole dump; with the scholarly articles cold (55% of the
+statements in the JSON count), about 50-55 GB, under the order's 90 GB line. The node files will not scale with
+the sample (151M distinct references in the dump, estimated): the full build measures them. 6,198 of the segment's
+45,309 value nodes and 5,308 of its 86,719 references are named but written elsewhere in the dump.
+
+## Next
+
+The reverse index (property, value entity) -> subjects; the names FST (exact and accent-folded keys, a bounded typo
+path, never ordered by fame); the scholarly split (the size line's question in 0055); the build over the whole dump
+in id-range buckets, resumable chunk by chunk, memory-mapped reads, and the lookup latencies the order's lines ask
+for (1 ms p95 from SSD).
