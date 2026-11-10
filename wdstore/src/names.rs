@@ -16,7 +16,7 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::codec::{entry, Dict, R, W};
+use crate::codec::{entry, Buf, Dict, R, W};
 use crate::model::*;
 
 pub const MAGIC: &[u8; 8] = b"WDNAMES\0";
@@ -126,10 +126,10 @@ impl NamesWriter {
     }
 }
 
-pub struct Names { exact: Map<Vec<u8>>, folded: Map<Vec<u8>>, post: Vec<u8>, dict: Vec<String> }
+pub struct Names { exact: Map<Buf>, folded: Map<Buf>, post: Buf, dict: Vec<String> }
 
 impl Names {
-    pub fn open(exact: Vec<u8>, folded: Vec<u8>, post: Vec<u8>) -> Result<Names, String> {
+    pub fn open(exact: Buf, folded: Buf, post: Buf) -> Result<Names, String> {
         if post.len() < 20 || &post[..8] != MAGIC { return Err("not a names file".into()); }
         if u32::from_le_bytes(post[8..12].try_into().unwrap()) != VERSION { return Err("names version".into()); }
         let dict = Dict::read(&mut R::at(&post, u64::from_le_bytes(post[12..20].try_into().unwrap()) as usize))?;
@@ -151,22 +151,28 @@ impl Names {
         Ok(())
     }
 
-    /// Every row of one key set (0 exact, 1 folded), as `rows` writes them, in byte order (for the check).
-    pub fn all_rows(&self, which: usize) -> Result<Vec<Vec<u8>>, String> {
+    /// Every row of one key set (0 exact, 1 folded), as `rows` writes them, in byte order, read as it goes (for the
+    /// check).
+    pub fn rows_iter(&self, which: usize) -> impl Iterator<Item = Result<Vec<u8>, String>> + '_ {
         let m = if which == 0 { &self.exact } else { &self.folded };
         let mut s = m.stream();
-        let mut v = Vec::new();
-        while let Some((k, off)) = s.next() {
-            let key = String::from_utf8_lossy(k).to_string();
-            let mut hits = Vec::new();
-            self.list(off, &key, How::Exact, &mut hits)?;
-            for h in hits {
-                let mut r = k.to_vec(); r.push(0); r.extend_from_slice(&order(h.entity).to_be_bytes());
-                r.push((h.kind == NameKind::Alias) as u8); r.extend_from_slice(h.lang.as_bytes());
-                v.push(r);
+        let mut buf: std::collections::VecDeque<Result<Vec<u8>, String>> = Default::default();
+        std::iter::from_fn(move || {
+            while buf.is_empty() {
+                let (k, off) = s.next()?;
+                let key = String::from_utf8_lossy(k).to_string();
+                let mut hits = Vec::new();
+                match self.list(off, &key, How::Exact, &mut hits) {
+                    Err(e) => buf.push_back(Err(e)),
+                    Ok(()) => for h in hits {
+                        let mut r = k.to_vec(); r.push(0); r.extend_from_slice(&order(h.entity).to_be_bytes());
+                        r.push((h.kind == NameKind::Alias) as u8); r.extend_from_slice(h.lang.as_bytes());
+                        buf.push_back(Ok(r));
+                    },
+                }
             }
-        }
-        Ok(v)
+            buf.pop_front()
+        })
     }
 
     /// Every entity a name may mean: exact, else folded, else within the typo bound; in id order.

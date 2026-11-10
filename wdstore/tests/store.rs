@@ -246,3 +246,18 @@ fn a_name_finds_every_entity_it_may_mean_in_id_order_exact_then_folded_then_typo
     assert_eq!(st.name("Adams").unwrap(), Found::None);                       // a part of a name is not the name
     assert_eq!(st.name("Dougl").unwrap(), Found::None);
 }
+
+#[test]
+fn one_changed_byte_fails_the_check() {
+    for f in ["chunk_hot_00001.wds", "reverse.wds", "names.post", "values.wds"] {
+        let (out, st) = built(&format!("tamper_{}", f.replace('.', "_")));
+        drop(st);
+        let p = format!("{out}/{f}");
+        let mut b = std::fs::read(&p).unwrap();
+        let at = b.len() / 2;
+        b[at] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        let r = Store::open(&out).and_then(|s| s.check());
+        assert!(r.is_err(), "{f}: a changed byte passed the check");
+    }
+}

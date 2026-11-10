@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::chunk::{get_snaks, put_snaks};
-use crate::codec::{entry, Dict, R, W};
+use crate::codec::{entry, Buf, Dict, R, W};
 use crate::model::*;
 
 pub const MAGIC: &[u8; 8] = b"WDNODES\0";
@@ -186,10 +186,10 @@ impl Numbering for Ix {
 }
 
 /// One node file, read in place.
-pub struct NodeFile { b: Vec<u8>, kind: u8, n: usize, dict: Vec<String>, offsets_at: usize, extras_at: usize, extras: usize }
+pub struct NodeFile { b: Buf, kind: u8, n: usize, dict: Vec<String>, offsets_at: usize, extras_at: usize, extras: usize }
 
 impl NodeFile {
-    pub fn open(b: Vec<u8>) -> Result<NodeFile, String> {
+    pub fn open(b: Buf) -> Result<NodeFile, String> {
         if b.len() < HEAD || &b[..8] != MAGIC { return Err("not a node file".into()); }
         if u32::from_le_bytes(b[8..12].try_into().unwrap()) != VERSION { return Err("node file version".into()); }
         let kind = b[12];

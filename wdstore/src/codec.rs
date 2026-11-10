@@ -3,6 +3,26 @@
 
 use crate::model::{Eid, NodeHash};
 
+/// A file's bytes: memory-mapped (a built store, read in place from the SSD) or in memory (the tests).
+pub enum Buf { Mem(Vec<u8>), Map(memmap2::Mmap) }
+
+impl Buf {
+    /// The file, memory-mapped. The store's files are written once and never changed while open.
+    pub fn map(path: &str) -> Result<Buf, String> {
+        let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 { return Ok(Buf::Mem(vec![])); }
+        // SAFETY: the store's files are not modified while a store has them open (a build writes a new folder).
+        unsafe { memmap2::Mmap::map(&f) }.map(Buf::Map).map_err(|e| format!("{path}: {e}"))
+    }
+}
+
+impl std::ops::Deref for Buf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { match self { Buf::Mem(v) => v, Buf::Map(m) => m } }
+}
+
+impl AsRef<[u8]> for Buf { fn as_ref(&self) -> &[u8] { self } }
+
 #[derive(Default)]
 pub struct W { pub b: Vec<u8> }
 

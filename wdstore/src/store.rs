@@ -5,11 +5,12 @@
 //! entities and compares them with the files, and compares every file's hash with the manifest's.
 
 use crate::chunk;
-use crate::codec::R;
+use crate::codec::{Buf, R};
 use crate::model::*;
 use crate::names::{Found, Names};
 use crate::nodes::{Ix, NodeFile, Nodes};
 use crate::reverse::{self, Hit, Reverse};
+use crate::spill::Runs;
 
 pub const REDIR_MAGIC: &[u8; 8] = b"WDREDIR\0";
 
@@ -22,7 +23,7 @@ pub fn write_redirects(r: &[(Eid, Eid)]) -> Vec<u8> {
     b
 }
 
-fn read(dir: &str, name: &str) -> Result<Vec<u8>, String> { std::fs::read(format!("{dir}/{name}")).map_err(|e| format!("{name}: {e}")) }
+fn read(dir: &str, name: &str) -> Result<Buf, String> { Buf::map(&format!("{dir}/{name}")) }
 
 /// A sorted table of fixed rows whose first 8 bytes are a u64 key, searched in place.
 fn find(b: &[u8], at: usize, n: usize, size: usize, key: u64) -> Option<usize> {
@@ -36,14 +37,18 @@ fn find(b: &[u8], at: usize, n: usize, size: usize, key: u64) -> Option<usize> {
 }
 
 pub struct Store {
-    pub dir: String, chunks: [Vec<Vec<u8>>; 2], ids: Vec<u8>, pub nodes: Nodes, redirects: Vec<u8>, reverse: Reverse, names: Names,
+    pub dir: String, chunks: [Vec<Buf>; 2], ids: Buf, pub nodes: Nodes, redirects: Buf, reverse: Reverse, names: Names,
 }
 
 impl Store {
     pub fn open(dir: &str) -> Result<Store, String> {
         let mut chunks = [Vec::new(), Vec::new()];
         for (s, set) in ["hot", "cold"].iter().enumerate() {
-            for k in 0.. { match std::fs::read(format!("{dir}/chunk_{set}_{k:05}.wds")) { Ok(b) => chunks[s].push(b), Err(_) => break } }
+            for k in 0.. {
+                let p = format!("{dir}/chunk_{set}_{k:05}.wds");
+                if !std::path::Path::new(&p).exists() { break; }
+                chunks[s].push(Buf::map(&p)?);
+            }
         }
         let ids = read(dir, "ids.wds")?;
         if ids.len() < 20 || &ids[..8] != b"WDIDS\0\0\0" { return Err("not an id table".into()); }
@@ -102,27 +107,35 @@ impl Store {
         };
         for f in ["ids.wds", "redirects.wds", "values.wds", "refs.wds", "reverse.wds", "names_exact.fst", "names_folded.fst", "names.post"] { has(f)?; }
         let ix = Ix::from(&self.nodes)?;
-        let (mut rev, mut names, mut n) = (Vec::new(), [Vec::new(), Vec::new()], [0usize; 2]);
+        // the hot entities' index rows, sorted in runs on disk, then compared row by row with the index files
+        let scratch = format!("{}/_check", self.dir);
+        std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+        let mut runs = ["reverse", "names_exact", "names_folded"].map(|r| Runs::new(&scratch, r, 1 << 29));
+        let mut n = [0usize; 2];
         for (s, set) in ["hot", "cold"].iter().enumerate() {
             for (k, b) in self.chunks[s].iter().enumerate() {
                 has(&format!("chunk_{set}_{k:05}.wds"))?;
                 let ents = chunk::Reader::open(b)?.read_all(&self.nodes)?;
-                if chunk::write(&ents, &ix)? != *b { return Err(format!("chunk {set} {k}: re-writing differs")); }
+                if *chunk::write(&ents, &ix)? != **b { return Err(format!("chunk {set} {k}: re-writing differs")); }
                 n[s] += ents.len();
                 if s == 0 {
                     for e in &ents {
-                        rev.extend(reverse::rows(e));
-                        for (w, rs) in crate::names::rows(e).into_iter().enumerate() { names[w].extend(rs); }
+                        for r in reverse::rows(e) { runs[0].push(r)?; }
+                        for (w, rs) in crate::names::rows(e).into_iter().enumerate() { for r in rs { runs[1 + w].push(r)?; } }
                     }
                 }
             }
         }
         if n[0] + n[1] != Self::count(&self.ids) { return Err("the id table does not list every entity".into()); }
-        rev.sort();
-        if self.reverse.all_rows()? != rev { return Err("reverse.wds: not the hot entities' statements".into()); }
-        for (w, mut rs) in names.into_iter().enumerate() {
-            rs.sort();
-            if self.names.all_rows(w)? != rs { return Err(format!("names ({}): not the hot entities' names", ["exact", "folded"][w])); }
+        let [rr, ex, fo] = runs;
+        let mut it = self.reverse.rows_iter();
+        rr.merge(|r| match it.next() { Some(Ok(x)) if x == r => Ok(()), _ => Err("reverse.wds: not the hot entities' statements".into()) })?;
+        if it.next().is_some() { return Err("reverse.wds: rows no hot entity has".into()); }
+        for (w, runs) in [ex, fo].into_iter().enumerate() {
+            let what = ["exact", "folded"][w];
+            let mut it = self.names.rows_iter(w);
+            runs.merge(|r| match it.next() { Some(Ok(x)) if x == r => Ok(()), _ => Err(format!("names ({what}): not the hot entities' names")) })?;
+            if it.next().is_some() { return Err(format!("names ({what}): names no hot entity bears")); }
         }
         let mut rd = R::at(&self.redirects, 12);
         let nr = rd.u64le()?;

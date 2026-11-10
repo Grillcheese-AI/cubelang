@@ -11,7 +11,7 @@
 
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 
-use crate::codec::{R, W};
+use crate::codec::{Buf, R, W};
 use crate::model::*;
 
 pub const MAGIC: &[u8; 8] = b"WDREVRS\0";
@@ -90,10 +90,10 @@ impl RevWriter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit { pub subject: Eid, pub rank: Rank, pub best: bool }
 
-pub struct Reverse { b: Vec<u8>, keys: usize, keys_at: usize }
+pub struct Reverse { b: Buf, keys: usize, keys_at: usize }
 
 impl Reverse {
-    pub fn open(b: Vec<u8>) -> Result<Reverse, String> {
+    pub fn open(b: Buf) -> Result<Reverse, String> {
         if b.len() < HEAD || &b[..8] != MAGIC { return Err("not a reverse index".into()); }
         if u32::from_le_bytes(b[8..12].try_into().unwrap()) != VERSION { return Err("reverse index version".into()); }
         let mut r = R::at(&b, 12);
@@ -138,18 +138,25 @@ impl Reverse {
         Ok(out)
     }
 
-    /// Every row, as `rows` writes them, in byte order (for the check).
-    pub fn all_rows(&self) -> Result<Vec<Vec<u8>>, String> {
-        let mut v = Vec::new();
-        for k in 0..self.keys {
-            let (p, val, off, n) = self.key(k);
-            for h in self.list(off, n)? {
-                let mut r = Vec::with_capacity(21);
-                r.extend_from_slice(&p.to_be_bytes()); r.extend_from_slice(&val.to_be_bytes());
-                r.extend_from_slice(&order(h.subject).to_be_bytes()); r.push((h.best as u8) << 2 | h.rank as u8);
-                v.push(r);
+    /// Every row, as `rows` writes them, in byte order, read from the file as it goes (for the check).
+    pub fn rows_iter(&self) -> impl Iterator<Item = Result<Vec<u8>, String>> + '_ {
+        let mut buf: std::collections::VecDeque<Result<Vec<u8>, String>> = Default::default();
+        let mut k = 0;
+        std::iter::from_fn(move || {
+            while buf.is_empty() && k < self.keys {
+                let (p, val, off, n) = self.key(k);
+                k += 1;
+                match self.list(off, n) {
+                    Err(e) => buf.push_back(Err(e)),
+                    Ok(hits) => for h in hits {
+                        let mut r = Vec::with_capacity(21);
+                        r.extend_from_slice(&p.to_be_bytes()); r.extend_from_slice(&val.to_be_bytes());
+                        r.extend_from_slice(&order(h.subject).to_be_bytes()); r.push((h.best as u8) << 2 | h.rank as u8);
+                        buf.push_back(Ok(r));
+                    },
+                }
             }
-        }
-        Ok(v)
+            buf.pop_front()
+        })
     }
 }
