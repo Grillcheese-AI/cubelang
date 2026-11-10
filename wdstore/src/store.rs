@@ -6,6 +6,7 @@ use crate::chunk;
 use crate::codec::R;
 use crate::model::*;
 use crate::nodes::{self, Ix, NodeFile, Nodes};
+use crate::reverse::{self, Hit, Reverse};
 
 pub const REDIR_MAGIC: &[u8; 8] = b"WDREDIR\0";
 
@@ -18,7 +19,7 @@ pub fn write_redirects(r: &[(Eid, Eid)]) -> Vec<u8> {
     b
 }
 
-pub struct Store { pub dir: String, chunks: Vec<(Eid, Eid, Vec<u8>)>, pub nodes: Nodes, redirects: Vec<u8> }
+pub struct Store { pub dir: String, chunks: Vec<(Eid, Eid, Vec<u8>)>, pub nodes: Nodes, redirects: Vec<u8>, reverse: Reverse }
 
 fn read(dir: &str, name: &str) -> Result<Vec<u8>, String> { std::fs::read(format!("{dir}/{name}")).map_err(|e| format!("{name}: {e}")) }
 
@@ -34,7 +35,7 @@ impl Store {
         }
         let redirects = read(dir, "redirects.wds")?;
         if redirects.len() < 20 || &redirects[..8] != REDIR_MAGIC { return Err("not a redirects file".into()); }
-        Ok(Store { dir: dir.into(), chunks, redirects,
+        Ok(Store { dir: dir.into(), chunks, redirects, reverse: Reverse::open(read(dir, "reverse.wds")?)?,
                    nodes: Nodes { values: NodeFile::open(read(dir, "values.wds")?)?, refs: NodeFile::open(read(dir, "refs.wds")?)? } })
     }
 
@@ -68,6 +69,9 @@ impl Store {
         Err(format!("{}: a redirect chain over 8 or a loop", id.text()))
     }
 
+    /// Every entity with a statement `pid` = `value` (main values; at every rank, each hit says its rank).
+    pub fn who(&self, pid: u32, value: Eid) -> Result<Vec<Hit>, String> { self.reverse.who(pid, value) }
+
     pub fn statements(&self) -> Result<u64, String> {
         let mut n = 0;
         for (_, _, b) in &self.chunks { n += chunk::Reader::open(b)?.read_all(&self.nodes)?.iter().map(|e| e.statements.len() as u64).sum::<u64>(); }
@@ -94,13 +98,19 @@ impl Store {
         let n = rd.u64le()?;
         let pairs = (0..n).map(|_| Ok((Eid(rd.u64le()?), Eid(rd.u64le()?)))).collect::<Result<Vec<_>, String>>()?;
         if write_redirects(&pairs) != self.redirects { return Err("redirects.wds: re-writing differs".into()); }
+        let mut every = Vec::new();
         for (k, (_, _, b)) in self.chunks.iter().enumerate() {
             has(b, &format!("chunk {k}"))?;
             let ents = chunk::Reader::open(b)?.read_all(&self.nodes)?;
             if chunk::write(&ents, &ix)? != *b { return Err(format!("chunk {k}: re-writing differs")); }
+            every.extend(ents);
         }
-        Ok(format!("{} chunks, {} value nodes ({} undefined), {} references ({} undefined), {} redirects: each re-read and \
-                    re-written to the same bytes, hashes as recorded", self.chunks.len(), v.len(), v.undefined()?, r.len(),
-                   r.undefined()?, n))
+        let rows = reverse::rows(&every);
+        if self.reverse.all_rows()? != rows { return Err("reverse.wds: not the entities' statements".into()); }
+        if reverse::write(&rows)? != self.reverse.bytes() { return Err("reverse.wds: re-writing differs".into()); }
+        has(self.reverse.bytes(), "reverse.wds")?;
+        Ok(format!("{} chunks, {} value nodes ({} undefined), {} references ({} undefined), {} redirects, {} reverse keys: \
+                    each re-read and re-written to the same bytes, hashes as recorded", self.chunks.len(), v.len(),
+                   v.undefined()?, r.len(), r.undefined()?, n, self.reverse.keys()))
     }
 }

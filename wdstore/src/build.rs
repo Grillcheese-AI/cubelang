@@ -8,6 +8,7 @@ use crate::chunk;
 use crate::ingest::{self, Params};
 use crate::model::*;
 use crate::nodes::{self, Ix};
+use crate::reverse;
 use crate::store;
 
 #[derive(Default)]
@@ -139,13 +140,14 @@ pub fn build(inputs: &[String], out: &str, per_chunk: usize, prm: &Params) -> Re
         chunks.push(format!("{}, \"first\": {}, \"last\": {}, \"entities\": {}}}", &e[..e.len() - 1],
             j(&part[0].id.unwrap().text()), j(&part[part.len() - 1].id.unwrap().text()), part.len()));
     }
+    files.push(file_entry(out, "reverse.wds", &reverse::write(&reverse::rows(&p.entities))?)?);
     let undefined_v = vorder.len() - p.value_nodes.len();
     let undefined_r = rorder.len() - p.ref_nodes.len();
-    let node_bytes: u64 = std::fs::metadata(format!("{out}/values.wds")).map(|m| m.len()).unwrap_or(0)
-        + std::fs::metadata(format!("{out}/refs.wds")).map(|m| m.len()).unwrap_or(0);
+    let size = |f: &str| std::fs::metadata(format!("{out}/{f}")).map(|m| m.len()).unwrap_or(0);
+    let (node_bytes, reverse_bytes) = (size("values.wds") + size("refs.wds"), size("reverse.wds"));
     files.extend(chunks);
     let skipped: Vec<String> = st.skipped.iter().map(|(k, v)| format!("{}: {v}", j(k))).collect();
-    let total = chunk_bytes + node_bytes;
+    let total = chunk_bytes + node_bytes + reverse_bytes;
     let man = format!(concat!("{{\n \"format_version\": {},\n \"code_blake3\": {},\n",
         " \"params\": {{\"langs\": {:?}, \"wikis\": {:?}, \"hot_qualifiers\": {:?}, \"per_chunk\": {}}},\n",
         " \"inputs\": [{}],\n \"files\": [\n  {}\n ],\n",
@@ -153,13 +155,13 @@ pub fn build(inputs: &[String], out: &str, per_chunk: usize, prm: &Params) -> Re
         "\"cold_qualifiers\": {}, \"references\": {}, \"names\": {}, \"value_nodes\": {}, \"value_nodes_undefined\": {}, ",
         "\"ref_nodes\": {}, \"ref_nodes_undefined\": {}, \"redirects\": {}}},\n",
         " \"skipped_triples\": {{{}}},\n \"failed_first\": [{}],\n",
-        " \"bytes\": {{\"chunks\": {}, \"nodes\": {}, \"total\": {}}},\n",
+        " \"bytes\": {{\"chunks\": {}, \"nodes\": {}, \"reverse\": {}, \"total\": {}}},\n",
         " \"bytes_per_statement\": {{\"chunks\": {:.1}, \"total\": {:.1}}},\n \"build_s\": {:.1}\n}}\n"),
         chunk::VERSION, j(&crate::code_hash()), prm.langs, prm.wikis, prm.hot_qualifiers, per_chunk, ins.join(", "),
         files.join(",\n  "), st.blocks, st.failed_n, st.entities, st.statements, st.hot_qualifiers, st.cold_qualifiers,
         st.references, st.names, vorder.len(), undefined_v, rorder.len(), undefined_r, p.redirects.len(),
         skipped.join(", "), st.failed.iter().map(|s| j(s)).collect::<Vec<_>>().join(", "),
-        chunk_bytes, node_bytes, total, chunk_bytes as f64 / st.statements.max(1) as f64,
+        chunk_bytes, node_bytes, reverse_bytes, total, chunk_bytes as f64 / st.statements.max(1) as f64,
         total as f64 / st.statements.max(1) as f64, t0.elapsed().as_secs_f64());
     std::fs::write(format!("{out}/manifest.json"), &man).map_err(|e| e.to_string())?;
     Ok(man)

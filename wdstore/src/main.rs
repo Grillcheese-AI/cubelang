@@ -1,6 +1,7 @@
 //! wdstore build --out <dir> [--per-chunk N] <input.ttl[.gz]>...   the store, its manifest
 //! wdstore get <dir> <Q42>                                        one entity, as stored (a redirect followed)
-//! wdstore check <dir>                                            every file re-read whole, re-written, re-hashed
+//! wdstore who <dir> <P31> <Q5>                                  the entities with that statement, and their ranks
+//! wdstore check <dir>                                           every file re-read whole, re-written, re-hashed
 
 use wdstore::{build, ingest::Params, model::Eid, store::Store};
 
@@ -26,6 +27,13 @@ fn main() {
                 s.get(to).map(|e| println!("{e:#?}"))
             }),
             None => Err(format!("not an id: {}", a[2])),
+        },
+        Some("who") if a.len() == 4 => match (Eid::parse(&a[2]), Eid::parse(&a[3])) {
+            (Some(p), Some(v)) if p.kind() == 'P' => Store::open(&a[1]).and_then(|s| s.who(p.number() as u32, v)).map(|h| {
+                for x in &h { println!("{}\t{:?}{}", x.subject.text(), x.rank, if x.best { "\tbest" } else { "" }); }
+                eprintln!("{} entities", h.len());
+            }),
+            _ => Err("who <dir> <P..> <id>".into()),
         },
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: wdstore build --out <dir> [--per-chunk N] <inputs>... | get <dir> <id> | check <dir>".into()),

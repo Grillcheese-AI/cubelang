@@ -59,6 +59,27 @@ wdref:00000000000000000000000000000000000000aa a wikibase:Reference ;
 	schema:name "Douglas Adams"@de .
 "#;
 
+const HUMANS: &str = r#"data:Q45 a schema:Dataset ;
+	schema:about wd:Q45 ;
+	schema:version "3"^^xsd:integer .
+
+wd:Q45 a wikibase:Item ;
+	p:P31 wds:Q45-1 .
+wds:Q45-1 a wikibase:Statement ;
+	wikibase:rank wikibase:DeprecatedRank ;
+	ps:P31 wd:Q5 .
+
+data:Q44 a schema:Dataset ;
+	schema:about wd:Q44 ;
+	schema:version "4"^^xsd:integer .
+
+wd:Q44 a wikibase:Item ;
+	p:P31 wds:Q44-1 .
+wds:Q44-1 a wikibase:Statement, wikibase:BestRank ;
+	wikibase:rank wikibase:NormalRank ;
+	ps:P31 wd:Q5 .
+"#;
+
 const REDIRECT: &str = "data:Q7 a schema:Dataset ;\n\tschema:about wd:Q7 ;\n\tschema:version \"5\"^^xsd:integer .\n\nwd:Q7 owl:sameAs wd:Q42 .\n";
 
 fn q(n: &str) -> Eid { Eid::parse(n).unwrap() }
@@ -118,7 +139,7 @@ fn built(name: &str) -> (String, Store) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let input = dir.join("in.ttl");
-    std::fs::write(&input, format!("{ITEM}\n{}\n{REDIRECT}", ITEM.replace("Q42", "Q43"))).unwrap();
+    std::fs::write(&input, format!("{ITEM}\n{}\n{HUMANS}\n{REDIRECT}", ITEM.replace("Q42", "Q43"))).unwrap();
     let out = dir.join("store").to_str().unwrap().to_string();
     build::build(&[input.to_str().unwrap().to_string()], &out, 1, &Params::default()).unwrap();
     let s = Store::open(&out).unwrap();
@@ -131,15 +152,19 @@ fn a_built_store_reads_back_what_was_ingested_and_a_rebuild_writes_the_same_byte
     let want = block(ITEM, &Params::default()).unwrap().entity.unwrap();
     assert_eq!(st.get(q("Q42")).unwrap().unwrap(), want);
     assert_eq!(st.get(q("Q43")).unwrap().unwrap().statements, want.statements);   // the same block under Q43
-    assert!(st.get(q("Q44")).unwrap().is_none() && st.get(q("Q1")).unwrap().is_none());
+    assert!(st.get(q("Q46")).unwrap().is_none() && st.get(q("Q1")).unwrap().is_none());
     assert_eq!(st.resolve(q("Q7")).unwrap(), q("Q42"));
     assert_eq!(st.resolve(q("Q42")).unwrap(), q("Q42"));
-    assert!(st.check().unwrap().contains("2 chunks"));
+    assert!(st.check().unwrap().contains("4 chunks"));
+    let hits = st.who(31, q("Q5")).unwrap();
+    assert_eq!(hits.iter().map(|h| (h.subject, h.rank, h.best)).collect::<Vec<_>>(),
+               vec![(q("Q44"), Rank::Normal, true), (q("Q45"), Rank::Deprecated, false)]);
+    assert!(st.who(31, q("Q6")).unwrap().is_empty() && st.who(279, q("Q5")).unwrap().is_empty());
     let v = &st.nodes.values;
     let node = (0..v.len() as u32).find_map(|i| v.value(i).unwrap()).unwrap();
     assert_eq!(node.fields.iter().find(|f| f.0 == "wikibase:timePrecision").unwrap().1, "11");
     let (out2, _) = built("b");
-    for f in ["chunk_00000.wds", "chunk_00001.wds", "values.wds", "refs.wds", "redirects.wds"] {
+    for f in ["chunk_00000.wds", "chunk_00003.wds", "values.wds", "refs.wds", "redirects.wds", "reverse.wds"] {
         assert_eq!(std::fs::read(format!("{out}/{f}")).unwrap(), std::fs::read(format!("{out2}/{f}")).unwrap(), "{f}");
     }
 }
