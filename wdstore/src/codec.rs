@@ -120,6 +120,10 @@ impl Dict {
         self.list.push(s.to_string()); self.map.insert(s.to_string(), i);
         i
     }
+    pub fn from_list(list: Vec<String>) -> Dict {
+        let map = list.iter().enumerate().map(|(i, s)| (s.clone(), i as u64)).collect();
+        Dict { list, map }
+    }
     pub fn write(&self, w: &mut W) { w.u(self.list.len() as u64); for s in &self.list { w.s(s); } }
     pub fn read(r: &mut R) -> Result<Vec<String>, String> { (0..r.u()?).map(|_| r.s()).collect() }
 }

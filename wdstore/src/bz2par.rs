@@ -84,9 +84,10 @@ fn decode(stream: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// The blocks of `data` that end inside it, decoded on `threads` threads, in order; and the bit where the first
+/// The blocks of `data` that end inside it, decoded on `threads` threads, in order, each with the bit it starts at;
+/// and the bit where the first
 /// block that does not end inside `data` begins (the caller keeps the bytes from there for the next read).
-pub fn decode_complete(data: &[u8], threads: usize, last: bool) -> Result<(Vec<Vec<u8>>, u64), String> {
+pub fn decode_complete(data: &[u8], threads: usize, last: bool) -> Result<(Vec<(u64, Vec<u8>)>, u64), String> {
     let m = markers(data);
     let end_bits = data.len() as u64 * 8;
     // spans: each block start to the next marker of either kind
@@ -126,7 +127,7 @@ pub fn decode_complete(data: &[u8], threads: usize, last: bool) -> Result<(Vec<V
     let mut i = 0;
     while i < n {
         match outs[i].take().unwrap() {
-            Ok(v) => { res.push(v); i += 1; }
+            Ok(v) => { res.push((spans[i].0, v)); i += 1; }
             Err(e) => {
                 let mut j = i + 1;
                 let mut got = None;
@@ -137,7 +138,7 @@ pub fn decode_complete(data: &[u8], threads: usize, last: bool) -> Result<(Vec<V
                     j += 1;
                 }
                 match got {
-                    Some(v) => { res.push(v); for k in i + 1..=j { outs[k] = None; } i = j + 1; }
+                    Some(v) => { res.push((spans[i].0, v)); for k in i + 1..=j { outs[k] = None; } i = j + 1; }
                     None => return Err(format!("a block at bit {} does not decode: {e}", spans[i].0)),
                 }
             }
@@ -149,10 +150,26 @@ pub fn decode_complete(data: &[u8], threads: usize, last: bool) -> Result<(Vec<V
 /// Every part in order, as one bzip2 file, decoded; `sink` gets the text in order, a block's worth at a time.
 /// `window` bytes are read at a time (each block is under 1 MB compressed).
 pub fn decode_parts(parts: &[String], threads: usize, window: usize, mut sink: impl FnMut(&[u8]) -> Result<(), String>) -> Result<u64, String> {
+    decode_from(parts, 0, threads, window, |t, _| sink(t))
+}
+
+/// The same from byte `start` of the parts taken as one file (a block that starts in that byte, for a resumed
+/// build); `sink` also gets each block's first bit, counted from the start of the first part.
+pub fn decode_from(parts: &[String], start: u64, threads: usize, window: usize,
+                   mut sink: impl FnMut(&[u8], u64) -> Result<(), String>) -> Result<u64, String> {
+    use std::io::{Seek, SeekFrom};
+    let sizes: Vec<u64> = parts.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).map_err(|e| format!("{p}: {e}"))).collect::<Result<_, _>>()?;
+    let (mut k, mut skip) = (0usize, start);
+    while k < parts.len() && skip >= sizes[k] { skip -= sizes[k]; k += 1; }
     let mut buf: Vec<u8> = Vec::new();
-    let mut compressed = 0u64;
-    let mut files = parts.iter();
+    let (mut base, mut compressed) = (start, 0u64);   // base: the byte of the parts that buf[0] is
+    let mut files = parts[k.min(parts.len())..].iter();
     let mut cur: Option<std::fs::File> = None;
+    if let Some(p) = files.next() {
+        let mut f = std::fs::File::open(p).map_err(|e| format!("{p}: {e}"))?;
+        f.seek(SeekFrom::Start(skip)).map_err(|e| e.to_string())?;
+        cur = Some(f);
+    }
     loop {
         let mut chunk = vec![0u8; window];
         let mut got = 0;
@@ -160,17 +177,18 @@ pub fn decode_parts(parts: &[String], threads: usize, window: usize, mut sink: i
             if cur.is_none() {
                 match files.next() { Some(p) => cur = Some(std::fs::File::open(p).map_err(|e| format!("{p}: {e}"))?), None => break }
             }
-            let k = cur.as_mut().unwrap().read(&mut chunk[got..]).map_err(|e| e.to_string())?;
-            if k == 0 { cur = None; } else { got += k; }
+            let n = cur.as_mut().unwrap().read(&mut chunk[got..]).map_err(|e| e.to_string())?;
+            if n == 0 { cur = None; } else { got += n; }
         }
         chunk.truncate(got);
         compressed += got as u64;
         let last = got < window && cur.is_none();
         buf.extend_from_slice(&chunk);
         let (texts, keep) = decode_complete(&buf, threads, last)?;
-        for t in &texts { sink(t)?; }
+        for (bit, t) in &texts { sink(t, base * 8 + bit)?; }
         if last { return Ok(compressed); }
-        let keep_byte = (keep / 8) as usize;
-        buf.drain(..keep_byte.min(buf.len()));
+        let keep_byte = ((keep / 8) as usize).min(buf.len());
+        buf.drain(..keep_byte);
+        base += keep_byte as u64;
     }
 }

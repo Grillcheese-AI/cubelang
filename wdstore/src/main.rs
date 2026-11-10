@@ -1,5 +1,7 @@
-//! wdstore build --out <dir> [--scratch <dir>] [--per-chunk N] [--cold Q13442814,..|none] [--threads N] <inputs>...
-//!     inputs: the dump's bzip2 parts (read as one file) or gzip / plain files of entity blocks
+//! wdstore build --out <dir> [--scratch <dir>] [--per-chunk N] [--cold Q13442814,..|none] [--threads N]
+//!               [--every N] [--stop-after N] <inputs>...
+//!     inputs: the dump's bzip2 parts (read as one file; a checkpoint every N batches of 64 MB of text, and a stopped
+//!     build resumes from it when run again) or gzip / plain files of entity blocks
 //! wdstore get <dir> <Q42>                     one entity, as stored (a redirect followed; hot or cold said)
 //! wdstore who <dir> <P31> <Q5>                the hot entities with that statement, and their ranks
 //! wdstore name <dir> "Douglas Adams"          every hot entity the name may mean, in id order
@@ -16,6 +18,7 @@ fn main() {
     let r = match a.first().map(String::as_str) {
         Some("build") => {
             let (mut out, mut scratch, mut per, mut cold, mut th, mut ins) = (None, None, 100_000usize, "Q13442814".to_string(), threads(), Vec::new());
+            let (mut every, mut stop) = (32u64, None);
             let mut it = a[1..].iter();
             while let Some(x) = it.next() {
                 match x.as_str() {
@@ -24,6 +27,8 @@ fn main() {
                     "--per-chunk" => per = it.next().and_then(|v| v.parse().ok()).unwrap_or(per),
                     "--cold" => cold = it.next().cloned().unwrap_or_default(),
                     "--threads" => th = it.next().and_then(|v| v.parse().ok()).unwrap_or(th),
+                    "--every" => every = it.next().and_then(|v| v.parse().ok()).unwrap_or(every).max(1),
+                    "--stop-after" => stop = it.next().and_then(|v| v.parse().ok()),
                     _ => ins.push(x.clone()),
                 }
             }
@@ -31,7 +36,7 @@ fn main() {
             match out {
                 Some(o) => {
                     let sc = scratch.unwrap_or_else(|| format!("{o}/_scratch"));
-                    build::build(&ins, &o, &sc, per, cold, th).map(|m| print!("{m}"))
+                    build::build(&ins, &o, &sc, per, cold, th, every, stop).map(|m| print!("{m}"))
                 }
                 None => Err("--out".into()),
             }

@@ -7,11 +7,14 @@
 //!   "WDNODES\0" | u32 version | u8 kind (0 values, 1 references) | u64 count | u64 dict_at | u64 offsets_at
 //!   | u64 extras_at | u64 extras | records... | dictionary | offsets (u64 a node: its first record)
 //!   | extras ((number u32, offset u64)* sorted: a node's further records)
-//!   a record: varint number | hash | u8 defined | then a value node's kind and fields, or a reference's snaks and
-//!   value-node numbers
+//!   a record: varint length | varint number | hash | u8 defined | then a value node's kind and fields, or a
+//!   reference's snaks and value-node numbers
+//!
+//! While the build runs, `<file>.num` holds every hash in the order it was numbered (a byte of length, the hash's
+//! text), so a resumed build rebuilds the numbering exactly; the records themselves are scanned for their offsets.
 
 use std::collections::HashMap;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::chunk::{get_snaks, put_snaks};
 use crate::codec::{entry, Dict, R, W};
@@ -30,37 +33,89 @@ pub trait Numbering {
 
 /// One node file being written: the numbering, the records appended so far, their offsets.
 pub struct NodeLog {
-    kind: u8, map: HashMap<NodeHash, u32>, first: Vec<u64>, extras: Vec<(u32, u64)>, dict: Dict,
-    f: std::io::BufWriter<std::fs::File>, pos: u64, pub defined: u64,
+    kind: u8, map: HashMap<NodeHash, u32>, first: Vec<u64>, extras: Vec<(u32, u64)>, pub dict: Dict,
+    f: std::io::BufWriter<std::fs::File>, pos: u64, pub defined: u64, num: std::io::BufWriter<std::fs::File>, num_pos: u64,
 }
+
+/// What a checkpoint keeps of a node log: its two files' lengths, its definitions, its dictionary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogState { pub pos: u64, pub num_pos: u64, pub defined: u64, pub dict: Vec<String> }
 
 impl NodeLog {
     pub fn create(path: &str, kind: u8) -> Result<NodeLog, String> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
         f.write_all(&[0u8; HEAD]).map_err(|e| e.to_string())?;
-        Ok(NodeLog { kind, map: HashMap::new(), first: vec![], extras: vec![], dict: Dict::default(), f, pos: HEAD as u64, defined: 0 })
+        let num = std::io::BufWriter::new(std::fs::File::create(format!("{path}.num")).map_err(|e| format!("{path}.num: {e}"))?);
+        Ok(NodeLog { kind, map: HashMap::new(), first: vec![], extras: vec![], dict: Dict::default(), f, pos: HEAD as u64,
+                     defined: 0, num, num_pos: 0 })
+    }
+
+    /// Both files written through; what a checkpoint records.
+    pub fn state(&mut self) -> Result<LogState, String> {
+        self.f.flush().map_err(|e| e.to_string())?; self.num.flush().map_err(|e| e.to_string())?;
+        self.f.get_ref().sync_data().map_err(|e| e.to_string())?; self.num.get_ref().sync_data().map_err(|e| e.to_string())?;
+        Ok(LogState { pos: self.pos, num_pos: self.num_pos, defined: self.defined, dict: self.dict.list.clone() })
+    }
+
+    /// The log as a checkpoint left it: both files cut to their recorded lengths, the numbering and the records'
+    /// offsets read back from them.
+    pub fn restore(path: &str, kind: u8, st: &LogState) -> Result<NodeLog, String> {
+        let open = |p: &str| std::fs::OpenOptions::new().read(true).write(true).open(p).map_err(|e| format!("{p}: {e}"));
+        let (mut f, mut nf) = (open(path)?, open(&format!("{path}.num"))?);
+        f.set_len(st.pos).map_err(|e| e.to_string())?; nf.set_len(st.num_pos).map_err(|e| e.to_string())?;
+        let mut nb = Vec::new();
+        nf.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?; nf.read_to_end(&mut nb).map_err(|e| e.to_string())?;
+        let (mut map, mut first) = (HashMap::new(), Vec::new());
+        let mut i = 0;
+        while i < nb.len() {
+            let n = nb[i] as usize;
+            map.insert(NodeHash(nb[i + 1..i + 1 + n].to_vec()), first.len() as u32);
+            first.push(NONE); i += 1 + n;
+        }
+        let mut rb = Vec::new();
+        f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?; f.read_to_end(&mut rb).map_err(|e| e.to_string())?;
+        let mut extras = Vec::new();
+        let mut r = R::at(&rb, HEAD);
+        while r.i < rb.len() {
+            let at = r.i as u64;
+            let len = r.u()? as usize;
+            let body = r.i;
+            let n = r.u()? as usize;
+            if n >= first.len() { return Err(format!("{path}: a record for node {n} past the numbering")); }
+            if first[n] == NONE { first[n] = at; } else { extras.push((n as u32, at)); }
+            r.i = body + len;
+        }
+        if r.i != rb.len() { return Err(format!("{path}: a record cut at the checkpoint")); }
+        f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?; nf.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        Ok(NodeLog { kind, map, first, extras, dict: Dict::from_list(st.dict.clone()), f: std::io::BufWriter::new(f), pos: st.pos,
+                     defined: st.defined, num: std::io::BufWriter::new(nf), num_pos: st.num_pos })
     }
 
     pub fn len(&self) -> usize { self.first.len() }
     pub fn is_empty(&self) -> bool { self.first.is_empty() }
 
     /// The node's number: its own, or the next one if the build has not seen it yet.
-    pub fn number(&mut self, h: &NodeHash) -> u32 {
-        if let Some(&n) = self.map.get(h) { return n; }
+    pub fn number(&mut self, h: &NodeHash) -> Result<u32, String> {
+        if let Some(&n) = self.map.get(h) { return Ok(n); }
+        if h.0.len() > 255 { return Err("a node hash over 255 bytes".into()); }
         let n = self.first.len() as u32;
+        self.num.write_all(&[h.0.len() as u8]).and_then(|_| self.num.write_all(&h.0)).map_err(|e| e.to_string())?;
+        self.num_pos += 1 + h.0.len() as u64;
         self.map.insert(h.clone(), n); self.first.push(NONE);
-        n
+        Ok(n)
     }
 
     pub fn get(&self, h: &NodeHash) -> Option<u32> { self.map.get(h).copied() }
 
     fn record(&mut self, h: &NodeHash, body: &W, defined: bool) -> Result<(), String> {
-        let n = self.number(h);
+        let n = self.number(h)?;
         let mut w = W::default();
         w.u(n as u64); w.hash(h); w.byte(defined as u8); w.raw(&body.b);
+        let mut lw = W::default();
+        lw.u(w.b.len() as u64); lw.raw(&w.b);
         if self.first[n as usize] == NONE { self.first[n as usize] = self.pos; } else { self.extras.push((n, self.pos)); }
-        self.f.write_all(&w.b).map_err(|e| e.to_string())?;
-        self.pos += w.b.len() as u64;
+        self.f.write_all(&lw.b).map_err(|e| e.to_string())?;
+        self.pos += lw.b.len() as u64;
         if defined { self.defined += 1; }
         Ok(())
     }
@@ -77,7 +132,7 @@ impl NodeLog {
         let mut b = W::default();
         put_snaks(&mut b, &mut self.dict, &n.snaks);
         b.u(n.nodes.len() as u64);
-        for (p, h) in &n.nodes { b.u(*p as u64); b.u(values.number(h) as u64); }
+        for (p, h) in &n.nodes { b.u(*p as u64); b.u(values.number(h)? as u64); }
         self.record(&n.hash, &b, true)
     }
 
@@ -102,6 +157,7 @@ impl NodeLog {
         let mut f = self.f.into_inner().map_err(|e| e.to_string())?;
         f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         f.write_all(&h).map_err(|e| e.to_string())?;
+        drop(self.num);
         Ok((self.first.len() as u64, undefined.len() as u64))
     }
 }
@@ -164,7 +220,7 @@ impl NodeFile {
         Ok(v)
     }
 
-    pub fn hash(&self, i: u32) -> Result<NodeHash, String> { let mut r = R::at(&self.b, self.off(i)?); r.u()?; r.hash() }
+    pub fn hash(&self, i: u32) -> Result<NodeHash, String> { let mut r = R::at(&self.b, self.off(i)?); r.u()?; r.u()?; r.hash() }
 
     /// A value node by number, its records merged: None if the dump never wrote it.
     pub fn value(&self, i: u32) -> Result<Option<ValueNode>, String> {
@@ -172,7 +228,7 @@ impl NodeFile {
         let mut out: Option<ValueNode> = None;
         for off in self.records(i)? {
             let mut r = R::at(&self.b, off);
-            r.u()?; let hash = r.hash()?;
+            r.u()?; r.u()?; let hash = r.hash()?;
             if r.byte()? == 0 { continue; }
             let kind = entry(&self.dict, r.u()?)?;
             let fields: Vec<(String, String)> = (0..r.u()?).map(|_| Ok((entry(&self.dict, r.u()?)?, r.s()?))).collect::<Result<_, String>>()?;
@@ -189,7 +245,7 @@ impl NodeFile {
         let mut out: Option<RefNode> = None;
         for off in self.records(i)? {
             let mut r = R::at(&self.b, off);
-            r.u()?; let hash = r.hash()?;
+            r.u()?; r.u()?; let hash = r.hash()?;
             if r.byte()? == 0 { continue; }
             let snaks = get_snaks(&mut r, &self.dict)?;
             let nodes: Vec<(u32, NodeHash)> = (0..r.u()?).map(|_| Ok((r.u()? as u32, values.hash(r.u()? as u32)?))).collect::<Result<_, String>>()?;
@@ -206,7 +262,7 @@ impl NodeFile {
     pub fn undefined(&self) -> Result<u64, String> {
         let mut k = 0;
         for i in 0..self.n as u32 {
-            if self.records(i)?.iter().all(|&o| { let mut r = R::at(&self.b, o); r.u().is_ok() && r.hash().is_ok() && r.byte() == Ok(0) }) { k += 1; }
+            if self.records(i)?.iter().all(|&o| { let mut r = R::at(&self.b, o); r.u().is_ok() && r.u().is_ok() && r.hash().is_ok() && r.byte() == Ok(0) }) { k += 1; }
         }
         Ok(k)
     }

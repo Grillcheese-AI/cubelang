@@ -32,6 +32,15 @@ impl Runs {
         Runs { dir: dir.into(), name: name.into(), rows: vec![], held: 0, limit, runs: vec![], count: 0 }
     }
 
+    /// Everything held written as a run; what a checkpoint records (runs, rows).
+    pub fn state(&mut self) -> Result<(usize, u64), String> { self.flush()?; Ok((self.runs.len(), self.count)) }
+
+    /// The runs as a checkpoint left them (runs written after it are written again under the same names).
+    pub fn restore(dir: &str, name: &str, limit: usize, st: (usize, u64)) -> Runs {
+        let runs = (0..st.0).map(|k| format!("{dir}/{name}.run{k:05}")).collect();
+        Runs { dir: dir.into(), name: name.into(), rows: vec![], held: 0, limit, runs, count: st.1 }
+    }
+
     pub fn push(&mut self, row: Vec<u8>) -> Result<(), String> {
         self.held += row.len() + 32;
         self.rows.push(row);

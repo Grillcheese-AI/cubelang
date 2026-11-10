@@ -144,7 +144,7 @@ fn built_with(name: &str, text: &str, cold: Vec<Eid>) -> (String, Store) {
     std::fs::write(&input, text).unwrap();
     let out = dir.join("store").to_str().unwrap().to_string();
     let scratch = dir.join("scratch").to_str().unwrap().to_string();
-    build::build(&[input.to_str().unwrap().to_string()], &out, &scratch, 1, cold, 2).unwrap();
+    build::build(&[input.to_str().unwrap().to_string()], &out, &scratch, 1, cold, 2, 16, None).unwrap();
     let s = Store::open(&out).unwrap();
     (out, s)
 }
@@ -190,7 +190,7 @@ fn no_stored_value_is_a_float() {
     for src in [include_str!("../src/model.rs"), include_str!("../src/codec.rs"), include_str!("../src/chunk.rs"),
                 include_str!("../src/ingest.rs"), include_str!("../src/turtle.rs"), include_str!("../src/nodes.rs"),
                 include_str!("../src/reverse.rs"), include_str!("../src/names.rs"), include_str!("../src/store.rs"), include_str!("../src/spill.rs"),
-                include_str!("../src/bz2par.rs")] {
+                include_str!("../src/bz2par.rs"), include_str!("../src/writer.rs"), include_str!("../src/resume.rs"), include_str!("../src/build.rs")] {
         for bad in ["f32", "f64", "parse::<f"] { assert!(!src.contains(bad), "a float type in the store's code: {bad}"); }
     }
 }
