@@ -213,6 +213,83 @@ New fields are added to the proto without renumbering or changing existing ones.
 
 The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
 
+---
+
+## P5 — Opcodes that compute nothing today, and world calls to MoWM (Cowork, 2026-11-10; Nick's yes)
+
+Nick: "we also need to code the missing function like to create a world and the other ones". His decision
+(2026-11-10): **MoWM owns the worlds** and the VM calls it through a host-call channel, so there is one world tree
+and one encoder and the calibrated thresholds stay valid. Pure vector operations are ported into the VM itself.
+
+**Today:**
+- 25 opcodes are routed to `trace_structural` in `src/vm/engine.rs`: they log a step and compute nothing. They are
+  INST, GEN, SEQ, DIFF, DETECT_PATTERN, PREDICT, MATCH, DEBATE, DISCOVER, DECODE, SCORE, SPECIALIZE, REWARD, INFER,
+  MERGE, SPLIT, FILTER, MAP_ROLES, REDUCE, TEMPORAL_BIND, ANALOGY, BROADCAST, EXPLORE, FORGE and SYNC.
+- The module registry (`src/vm/registry.rs`) holds `demo` and `vsa.recover` only.
+- Nick's MoWM drafts (`examples/drafts/`) call world functions that exist nowhere: the axiom centroid, the best
+  member, the depth z, the tau threshold, spawning a child, a transition step, cross-examining worlds,
+  `vm.timestamp`.
+- cubemind's Python VM (`cubemind/reasoning/vm.py`, named the reference in MoWM's v0.6 ISA spec) has real versions
+  of about half of them.
+
+**In plain words:** a CubeLang program can create, split, route to and question MoWM's worlds, and every one of
+those steps is recorded, so a world decision is as checkable as an answer.
+- **Over a conventional model:** a mixture of experts routes inside the network. Nobody can replay why one expert
+  was chosen, or prove that a new one was created by the rule.
+
+- [ ] **P5-1: the host-call channel.** A registry function can be marked `host`. Calling it sends
+  `HostCall {call_id, module, function, args}` on the `run-proto` connection; the host answers
+  `HostResult {call_id, value | error code, world_state_hash}`; the VM carries on.
+  - Local pipe only (P4-8). A `max_host_calls` budget joins `Budget`.
+  - Every call and its result go into the run report, arguments and results by hash (P4).
+  - **Replay:** given the recorded results, a run reproduces exactly with no host attached. Test: record, replay,
+    same report hash.
+  - A host error comes back as a code and fails the call. It never becomes a default value.
+  - A program reaches only the host functions of modules it `use`s (the registry's deny-by-default rule).
+- [ ] **P5-2: the `mowm` module, as host functions.** The handlers live in the mowm repo
+  (`docs/specs/2026-11-10-vm-world-calls.md` there). First the three that CubbyLLM's routing and split records need:
+  - `create(name)` gives a new world's id;
+  - `split(parent)` gives a child at z + 1, and fails with a code at z_max;
+  - `route(text)` gives the outcome (route or spawn), the best world and its score, the runner-up, the margin,
+    and the ids of the calibrations behind the thresholds used.
+
+  Then:
+  - `best_member(world, text)` and `centroid_score(world, text)`;
+  - `depth(world)`, `parent(world)`, `list()`;
+  - `learn(world, fact)`;
+  - `retire(world)`: retired, never deleted.
+
+  A program compares a score only with a threshold that MoWM returned with its calibration id, never with a literal
+  of its own. The compiler rejects a score compared with a literal in strict mode.
+- [ ] **P5-3: SPECIALIZE runs.** It becomes a host call to MoWM's transition rule: find the world for a transition,
+  or spawn one when the best similarity is below tau, else consolidate. It returns the world id and whether it
+  spawned. These are cubemind's VSAVM semantics (`_specialize`, its WorldManager).
+- [ ] **P5-4: port the pure vector opcodes,** with cubemind's VSAVM as the reference: SEQ, DIFF, MATCH, DECODE,
+  DETECT_PATTERN and PREDICT, and EXPLORE with REWARD (a UCB bandit, deterministic). Block codes as in MoWM
+  (k = 80, l = 128, D = 10,240).
+  - **Parity test per opcode:** the same program and seed in both VMs give the same result, exactly for integers
+    and ids, within 1e-6 for floats.
+- [ ] **P5-5: learned opcodes stay outside the VM.** SCORE (cubemind uses a learned value model, CVL), FORGE (LoRA
+  adapters), DISCOVER and DEBATE become host calls to cubemind if a program needs them.
+  - Their outputs are proposals. The report marks every value derived from them.
+  - Such a value is never certified unless a later deterministic check verifies it.
+- [ ] **P5-6: no reference semantics yet.** INST, GEN, INFER, MERGE, SPLIT, FILTER, MAP_ROLES, REDUCE,
+  TEMPORAL_BIND, ANALOGY, BROADCAST and SYNC are not implemented in cubemind's VSAVM either. Write one paragraph per
+  opcode first: inputs, output, determinism, failure codes. Nick says yes before any code. Until then, strict mode
+  keeps rejecting them.
+- [ ] **P5-7: the drafts' `vm.*` helpers.**
+  - `vm.timestamp` is the request's time, passed in by the host, fixed for the run and recorded, so runs stay
+    replayable.
+  - `vm.get_program` gives the program's hash (P4-5).
+  - `log` writes to the debug log, with no values (P4-8).
+  - `vm.deploy_from_file`, `vm.start_from_file`, `vm.wire` and `vm.bridge` stay with P3-1 (containers).
+- [ ] **P5-8: off the blocklist one by one.** Each opcode or function that lands leaves the strict-mode blocklist,
+  with its regression test, and `validate` (P0-3) reports it as executing.
+
+**Order:** P5-1, then P5-2's first three calls, then P5-3, P5-4, and P5-6's specs.
+
+The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
+
 ## Notes
 - The QC pilot ships on P0 + P1 only. P2 is the path to richer programs later.
 - `examples/qc_decision.cube` is the reference safe-subset program; keep it
