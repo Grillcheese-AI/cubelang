@@ -12,6 +12,7 @@
 //!                                                        property, and how many there are in all
 //!   {"op": "resolve", "id": "Q7"}                        the id that remains
 //!   {"op": "labels", "ids": ["Q5", "P31"], "lang": "en"} each entity's label in that language (absent: none)
+//!   {"op": "brief", "ids": ["Q42"], "lang": "en"}      each: label, description, classes (P31), hot or cold, statements
 //! The store never reads a clock: a date is always the request's.
 
 use std::io::{BufRead, Write};
@@ -82,6 +83,24 @@ fn answer(st: &Store, snap: &str, r: &J) -> Result<J, String> {
         "pointing_at" => {
             let (total, hits) = st.pointing_at_first(id("value")?, limit(r))?;
             json!({"total": total, "hits": hits.iter().map(|(p, h)| json!([p, h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()})
+        }
+        "brief" => {
+            // per id (a redirect followed): its label and description in `lang` (else mul, en, fr), its classes (P31,
+            // best rank), hot or cold, and how many statements; without the statements themselves
+            let lang = r.get("lang").and_then(J::as_str).unwrap_or("en");
+            let mut m = serde_json::Map::new();
+            for x in r.get("ids").and_then(J::as_array).ok_or("ids")? {
+                let Some(e) = x.as_str().and_then(Eid::parse) else { continue };
+                let to = st.resolve(e)?;
+                let Some((cold, ent)) = st.locate(to)? else { continue };
+                let pick = |k: NameKind| [lang, "mul", "en", "fr"].iter()
+                    .find_map(|l| ent.names.iter().find(|n| n.kind == k && n.lang == *l).map(|n| n.text.clone()));
+                let types: Vec<String> = ent.statements.iter().filter(|s| s.pid == 31 && s.best)
+                    .filter_map(|s| if let Value::Entity(c) = s.value { Some(c.text()) } else { None }).take(3).collect();
+                m.insert(e.text(), json!({"id": to.text(), "label": pick(NameKind::Label), "description": pick(NameKind::Description),
+                    "types": types, "cold": cold, "statements": ent.statements.len()}));
+            }
+            J::Object(m)
         }
         "labels" => {
             let lang = r.get("lang").and_then(J::as_str).unwrap_or("en");

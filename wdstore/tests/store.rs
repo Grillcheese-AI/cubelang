@@ -330,3 +330,14 @@ fn every_entity_pointing_at_a_value_whatever_the_property() {
     assert_eq!(hits.iter().map(|(p, h)| (*p, h.subject)).collect::<Vec<_>>(), vec![(31, q("Q44")), (31, q("Q45"))]);
     assert!(st.pointing_at(q("Q999")).unwrap().is_empty());
 }
+
+#[test]
+fn serve_brief_gives_label_description_classes_and_set_without_the_statements() {
+    let (out, _) = built("brief");
+    let mut o = Vec::new();
+    wdstore::serve::serve(&out, std::io::Cursor::new("{\"op\": \"brief\", \"ids\": [\"Q7\", \"Q44\", \"Q999\"], \"lang\": \"fr\"}\n"), &mut o).unwrap();
+    let a: serde_json::Value = serde_json::from_str(String::from_utf8(o).unwrap().trim()).unwrap();
+    assert_eq!((a["Q7"]["id"].as_str(), a["Q7"]["label"].as_str(), a["Q7"]["description"].as_str()), (Some("Q42"), Some("Douglas Adams"), Some("écrivain")));
+    assert_eq!((a["Q44"]["types"][0].as_str(), a["Q44"]["cold"].as_bool(), a["Q44"]["statements"].as_u64()), (Some("Q5"), Some(false), Some(1)));
+    assert!(a.get("Q999").is_none());
+}
