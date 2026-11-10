@@ -95,6 +95,28 @@ statement in all. Lookups from memory (`wdstore bench`, 3,275 ids spread over th
 p95 15.4 us, p99 22.5 us; a name p50 2.2 us, p95 5.8 us, p99 8.4 us. The order's lines are 1 ms p95 for a fact and
 50 ms p95 for a name, from SSD: measured on the full build, memory-mapped.
 
+## The full build (format 3, being built)
+
+The dump is about 1 TB of Turtle in 121 GB of bzip2, in 8 shards one after another; within a shard the ids rise
+but not strictly (34 descents in one sample segment), so the build never sorts the entities:
+
+- **Read:** the 113 parts as one file, decoded on every core (`bz2par`: 238 MB/s out on 12 threads, about 70 min
+  for the dump from a local disk), cut into entity blocks, ingested on every core, handed on in the dump's order.
+- **Entities:** written in dump order, a chunk at a time (each chunk sorted inside); `ids.wds`, a dense table per
+  kind (one 8-byte slot per Q-number: chunk, offset; about 1.1 GB), finds any entity in one read.
+- **Nodes:** numbered by first sighting (a reference or a definition), the hash -> number map in memory (about
+  10 GB at 200M nodes); every definition appended as a record; a node the dump writes in two places is two records,
+  merged on reading; a node never defined is written by hash alone at the end and counted.
+- **Reverse rows and name rows:** sorted in runs on a scratch disk, merged at the end into `reverse.wds` and the two
+  FSTs.
+- **Redirects:** collected, sorted at the end.
+- **Resumable:** every output is append-only; a checkpoint (every few minutes) records each file's length, the
+  bzip2 block the text resumes from and the decoded offset of the next entity. A stopped build truncates its files
+  to the checkpoint and goes on from that block: nothing is decoded twice.
+- **Hot and cold:** entities of the bulk classes (scholarly articles, P31 Q13442814, by default; a build
+  parameter) go to a cold store of the same format beside the hot one, as the synthesis says.
+- **Deterministic:** one writer, in the dump's order; a second build gives the same bytes (the order's acceptance).
+
 ## Next
 
 The scholarly split (the size line's question in 0055); the build over the whole dump

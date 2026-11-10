@@ -134,14 +134,17 @@ fn a_statement_with_no_main_snak_is_an_error_not_a_no_value() {
     assert!(block(bad, &Params::default()).unwrap_err().contains("no main snak"));
 }
 
-fn built(name: &str) -> (String, Store) {
+fn built(name: &str) -> (String, Store) { built_with(name, &format!("{ITEM}\n{}\n{HUMANS}\n{REDIRECT}", ITEM.replace("Q42", "Q43")), vec![]) }
+
+fn built_with(name: &str, text: &str, cold: Vec<Eid>) -> (String, Store) {
     let dir = std::env::temp_dir().join(format!("wdstore_test_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let input = dir.join("in.ttl");
-    std::fs::write(&input, format!("{ITEM}\n{}\n{HUMANS}\n{REDIRECT}", ITEM.replace("Q42", "Q43"))).unwrap();
+    std::fs::write(&input, text).unwrap();
     let out = dir.join("store").to_str().unwrap().to_string();
-    build::build(&[input.to_str().unwrap().to_string()], &out, 1, &Params::default()).unwrap();
+    let scratch = dir.join("scratch").to_str().unwrap().to_string();
+    build::build(&[input.to_str().unwrap().to_string()], &out, &scratch, 1, cold, 2).unwrap();
     let s = Store::open(&out).unwrap();
     (out, s)
 }
@@ -155,7 +158,7 @@ fn a_built_store_reads_back_what_was_ingested_and_a_rebuild_writes_the_same_byte
     assert!(st.get(q("Q46")).unwrap().is_none() && st.get(q("Q1")).unwrap().is_none());
     assert_eq!(st.resolve(q("Q7")).unwrap(), q("Q42"));
     assert_eq!(st.resolve(q("Q42")).unwrap(), q("Q42"));
-    assert!(st.check().unwrap().contains("4 chunks"));
+    assert!(st.check().unwrap().contains("4 hot and 0 cold entities"));
     let hits = st.who(31, q("Q5")).unwrap();
     assert_eq!(hits.iter().map(|h| (h.subject, h.rank, h.best)).collect::<Vec<_>>(),
                vec![(q("Q44"), Rank::Normal, true), (q("Q45"), Rank::Deprecated, false)]);
@@ -164,7 +167,8 @@ fn a_built_store_reads_back_what_was_ingested_and_a_rebuild_writes_the_same_byte
     let node = (0..v.len() as u32).find_map(|i| v.value(i).unwrap()).unwrap();
     assert_eq!(node.fields.iter().find(|f| f.0 == "wikibase:timePrecision").unwrap().1, "11");
     let (out2, _) = built("b");
-    for f in ["chunk_00000.wds", "chunk_00003.wds", "values.wds", "refs.wds", "redirects.wds", "reverse.wds"] {
+    for f in ["chunk_hot_00000.wds", "chunk_hot_00003.wds", "ids.wds", "values.wds", "refs.wds", "redirects.wds", "reverse.wds",
+              "names_exact.fst", "names_folded.fst", "names.post"] {
         assert_eq!(std::fs::read(format!("{out}/{f}")).unwrap(), std::fs::read(format!("{out2}/{f}")).unwrap(), "{f}");
     }
 }
@@ -185,22 +189,46 @@ fn statement_ids_round_trip_in_every_case() {
 fn no_stored_value_is_a_float() {
     for src in [include_str!("../src/model.rs"), include_str!("../src/codec.rs"), include_str!("../src/chunk.rs"),
                 include_str!("../src/ingest.rs"), include_str!("../src/turtle.rs"), include_str!("../src/nodes.rs"),
-                include_str!("../src/reverse.rs"), include_str!("../src/names.rs"), include_str!("../src/store.rs")] {
+                include_str!("../src/reverse.rs"), include_str!("../src/names.rs"), include_str!("../src/store.rs"), include_str!("../src/spill.rs"),
+                include_str!("../src/bz2par.rs")] {
         for bad in ["f32", "f64", "parse::<f"] { assert!(!src.contains(bad), "a float type in the store's code: {bad}"); }
     }
 }
 
 #[test]
-fn a_node_written_in_two_places_is_one_node() {
-    let a = ValueNode { hash: NodeHash(b"aa".to_vec()), kind: "wikibase:QuantityValue".into(),
-                        fields: vec![("wikibase:quantityAmount".into(), "+87.7".into())] };
-    let b = ValueNode { hash: NodeHash(b"aa".to_vec()), kind: String::new(),
-                        fields: vec![("wikibase:quantityNormalized".into(), "wdv:bb".into())] };
-    let m = build::merge_values(vec![b.clone(), a.clone(), a.clone()]).unwrap();
-    assert_eq!(m.len(), 1);
-    assert_eq!((m[0].kind.as_str(), m[0].fields.len()), ("wikibase:QuantityValue", 2));
-    let mut c = a.clone(); c.kind = "wikibase:TimeValue".into();
-    assert!(build::merge_values(vec![a, c]).unwrap_err().contains("two kinds"));
+fn a_node_written_in_two_places_is_read_as_one_and_cold_classes_go_cold() {
+    let split = r#"data:Q50 a schema:Dataset ;
+	schema:about wd:Q50 ;
+	schema:version "1"^^xsd:integer .
+
+wd:Q50 a wikibase:Item ;
+	p:P2048 wds:Q50-a .
+
+wds:Q50-a a wikibase:Statement ;
+	wikibase:rank wikibase:NormalRank ;
+	ps:P2048 "+87.7"^^xsd:decimal ;
+	psv:P2048 wdv:aa .
+
+wdv:aa a wikibase:QuantityValue ;
+	wikibase:quantityAmount "+87.7"^^xsd:decimal .
+
+data:Q51 a schema:Dataset ;
+	schema:about wd:Q51 ;
+	schema:version "2"^^xsd:integer .
+
+wd:Q51 a wikibase:Item .
+
+wdv:aa wikibase:quantityNormalized wdv:bb .
+"#;
+    let (_, st) = built_with("split", &format!("{split}\n{HUMANS}"), vec![q("Q5")]);
+    let v = &st.nodes.values;
+    let aa = (0..v.len() as u32).find(|&i| v.hash(i).unwrap().0 == b"aa").unwrap();
+    let n = v.value(aa).unwrap().unwrap();
+    assert_eq!((n.kind.as_str(), n.fields.len()), ("wikibase:QuantityValue", 2));
+    assert_eq!(v.undefined().unwrap(), 0);     // wdv:bb is a field's text here (normalized values are derived), not a node
+    assert!(st.check().unwrap().contains("2 hot and 2 cold entities"));
+    assert!(st.locate(q("Q44")).unwrap().unwrap().0 && !st.locate(q("Q50")).unwrap().unwrap().0);
+    assert!(st.who(31, q("Q5")).unwrap().is_empty());                         // the indexes are the hot set's
 }
 
 #[test]

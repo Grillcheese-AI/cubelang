@@ -11,6 +11,8 @@
 //!   names.post: "WDNAMES\0" | u32 version | u64 dict_at | postings... | dictionary (languages)
 //!   a posting list: count, then per entry varint (gap << 1 | kind) over (kind << 36 | number), then the language
 
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use unicode_normalization::UnicodeNormalization;
 
@@ -18,11 +20,11 @@ use crate::codec::{entry, Dict, R, W};
 use crate::model::*;
 
 pub const MAGIC: &[u8; 8] = b"WDNAMES\0";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const TYPO_KEYS: usize = 64;
 
 pub fn exact_key(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.replace('\0', " ").split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 pub fn folded_key(s: &str) -> String {
@@ -41,49 +43,87 @@ pub struct NameHit { pub entity: Eid, pub lang: String, pub kind: NameKind, pub 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Found { Hits(Vec<NameHit>), TooMany(usize), None }
 
-fn order(e: Eid) -> u64 { let (k, n, _) = e.parts(); (k as u64) << 36 | n }
+fn order(e: Eid) -> u64 { crate::reverse::order(e) }
 
-type Row = (String, u64, NameKind, String); // key, entity order, kind, lang
-
-fn rows(entities: &[Entity], key: fn(&str) -> String) -> Vec<Row> {
-    let mut v = Vec::new();
-    for e in entities {
-        let Some(id) = e.id else { continue };
-        for n in &e.names {
-            if n.kind == NameKind::Description { continue; }
-            let k = key(&n.text);
-            if !k.is_empty() { v.push((k, order(id), n.kind, n.lang.clone())); }
+/// An entity's name rows, exact then folded: key, a 0 byte, the entity, the kind, the language (bytes that sort as
+/// (key, entity, kind, language); a key never holds a 0 byte).
+pub fn rows(e: &Entity) -> [Vec<Vec<u8>>; 2] {
+    let mut out = [Vec::new(), Vec::new()];
+    let Some(id) = e.id else { return out };
+    for n in &e.names {
+        if n.kind == NameKind::Description { continue; }
+        for (k, key) in [exact_key(&n.text), folded_key(&n.text)].into_iter().enumerate() {
+            if key.is_empty() { continue; }
+            let mut r = Vec::with_capacity(key.len() + 14);
+            r.extend_from_slice(key.as_bytes()); r.push(0); r.extend_from_slice(&order(id).to_be_bytes());
+            r.push((n.kind == NameKind::Alias) as u8); r.extend_from_slice(n.lang.as_bytes());
+            out[k].push(r);
         }
     }
-    v.sort(); v.dedup();
-    v
+    for v in out.iter_mut() { v.sort(); v.dedup(); }
+    out
 }
 
-/// (names_exact.fst, names_folded.fst, names.post).
-pub fn write(entities: &[Entity]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
-    let (mut post, mut d) = (W { b: vec![0; 20] }, Dict::default());
-    let mut fsts = Vec::new();
-    for key in [exact_key as fn(&str) -> String, folded_key] {
-        let rs = rows(entities, key);
-        let mut b = MapBuilder::memory();
-        let mut i = 0;
-        while i < rs.len() {
-            let k = &rs[i].0;
-            let j = i + rs[i..].iter().take_while(|r| &r.0 == k).count();
-            b.insert(k.as_bytes(), post.b.len() as u64).map_err(|e| e.to_string())?;
-            post.u((j - i) as u64);
-            let mut prev = 0u64;
-            for r in &rs[i..j] { post.u((r.1 - prev) << 1 | (r.2 == NameKind::Alias) as u64); prev = r.1; let l = d.id(&r.3); post.u(l); }
-            i = j;
-        }
-        fsts.push(b.into_inner().map_err(|e| e.to_string())?);
+fn split(row: &[u8]) -> Result<(&[u8], u64, u8, &str), String> {
+    let z = row.iter().position(|&b| b == 0).ok_or("a name row without its key's end")?;
+    if row.len() < z + 10 { return Err("a short name row".into()); }
+    Ok((&row[..z], u64::from_be_bytes(row[z + 1..z + 9].try_into().unwrap()), row[z + 9],
+        std::str::from_utf8(&row[z + 10..]).map_err(|_| "a name row's language")?))
+}
+
+/// Writes the two FSTs and `names.post` from rows given in byte order: all the exact rows (`which` 0), then all
+/// the folded ones (1).
+pub struct NamesWriter {
+    fsts: [Option<MapBuilder<BufWriter<std::fs::File>>>; 2], post: BufWriter<std::fs::File>, pos: u64, dict: Dict,
+    which: usize, key: Option<Vec<u8>>, group: Vec<(u64, u8, String)>, pub keys: [u64; 2],
+}
+
+impl NamesWriter {
+    pub fn create(dir: &str) -> Result<NamesWriter, String> {
+        let open = |f: &str| std::fs::File::create(format!("{dir}/{f}")).map(BufWriter::new).map_err(|e| format!("{f}: {e}"));
+        let mut post = open("names.post")?;
+        post.write_all(&[0u8; 20]).map_err(|e| e.to_string())?;
+        let fst = |f: &str| -> Result<MapBuilder<BufWriter<std::fs::File>>, String> { MapBuilder::new(open(f)?).map_err(|e| e.to_string()) };
+        Ok(NamesWriter { fsts: [Some(fst("names_exact.fst")?), Some(fst("names_folded.fst")?)], post, pos: 20,
+                         dict: Dict::default(), which: 0, key: None, group: vec![], keys: [0, 0] })
     }
-    let dict_at = post.b.len() as u64;
-    d.write(&mut post);
-    post.b[..8].copy_from_slice(MAGIC); post.b[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    post.b[12..20].copy_from_slice(&dict_at.to_le_bytes());
-    let folded = fsts.pop().unwrap();
-    Ok((fsts.pop().unwrap(), folded, post.b))
+
+    fn close(&mut self) -> Result<(), String> {
+        let Some(k) = self.key.take() else { return Ok(()) };
+        self.fsts[self.which].as_mut().unwrap().insert(&k, self.pos).map_err(|e| e.to_string())?;
+        self.keys[self.which] += 1;
+        let mut w = W::default();
+        w.u(self.group.len() as u64);
+        let mut prev = 0u64;
+        for (o, kind, lang) in self.group.drain(..) { w.u((o - prev) << 1 | kind as u64); prev = o; let l = self.dict.id(&lang); w.u(l); }
+        self.post.write_all(&w.b).map_err(|e| e.to_string())?;
+        self.pos += w.b.len() as u64;
+        Ok(())
+    }
+
+    pub fn add(&mut self, which: usize, row: &[u8]) -> Result<(), String> {
+        if which < self.which { return Err("exact rows after folded ones".into()); }
+        if which != self.which { self.close()?; self.which = which; }
+        let (key, o, kind, lang) = split(row)?;
+        if self.key.as_deref() != Some(key) { self.close()?; self.key = Some(key.to_vec()); }
+        self.group.push((o, kind, lang.to_string()));
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<[u64; 2], String> {
+        self.close()?;
+        for f in self.fsts.iter_mut() { f.take().unwrap().finish().map_err(|e| e.to_string())?; }
+        let dict_at = self.pos;
+        let mut w = W::default();
+        self.dict.write(&mut w);
+        self.post.write_all(&w.b).map_err(|e| e.to_string())?;
+        let mut f = self.post.into_inner().map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut h = Vec::with_capacity(20);
+        h.extend_from_slice(MAGIC); h.extend_from_slice(&VERSION.to_le_bytes()); h.extend_from_slice(&dict_at.to_le_bytes());
+        f.write_all(&h).map_err(|e| e.to_string())?;
+        Ok(self.keys)
+    }
 }
 
 pub struct Names { exact: Map<Vec<u8>>, folded: Map<Vec<u8>>, post: Vec<u8>, dict: Vec<String> }
@@ -109,6 +149,24 @@ impl Names {
             out.push(NameHit { entity, lang, kind: if x & 1 == 1 { NameKind::Alias } else { NameKind::Label }, key: key.into(), how });
         }
         Ok(())
+    }
+
+    /// Every row of one key set (0 exact, 1 folded), as `rows` writes them, in byte order (for the check).
+    pub fn all_rows(&self, which: usize) -> Result<Vec<Vec<u8>>, String> {
+        let m = if which == 0 { &self.exact } else { &self.folded };
+        let mut s = m.stream();
+        let mut v = Vec::new();
+        while let Some((k, off)) = s.next() {
+            let key = String::from_utf8_lossy(k).to_string();
+            let mut hits = Vec::new();
+            self.list(off, &key, How::Exact, &mut hits)?;
+            for h in hits {
+                let mut r = k.to_vec(); r.push(0); r.extend_from_slice(&order(h.entity).to_be_bytes());
+                r.push((h.kind == NameKind::Alias) as u8); r.extend_from_slice(h.lang.as_bytes());
+                v.push(r);
+            }
+        }
+        Ok(v)
     }
 
     /// Every entity a name may mean: exact, else folded, else within the typo bound; in id order.

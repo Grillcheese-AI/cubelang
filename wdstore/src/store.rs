@@ -1,12 +1,14 @@
-//! A built store, opened: its chunks (by id range), its node files, its redirects. `get` reads one entity;
-//! `resolve` follows a redirect to the id that remains (a benchmark's gold may use the old id); `check` re-reads
-//! every file whole, re-writes it and compares the bytes, and compares each file's hash with the manifest's.
+//! A built store, opened: its hot and cold chunks, the id table, its node files, redirects, reverse index and names.
+//! `get` finds an entity through `ids.wds` (sorted (id, set and chunk, offset), 16 bytes each) and reads its record
+//! alone; `resolve` follows a redirect to the id that remains (a benchmark's gold may use the old id); `check`
+//! re-reads every chunk whole and re-writes it to the same bytes, rebuilds the reverse and name rows from the hot
+//! entities and compares them with the files, and compares every file's hash with the manifest's.
 
 use crate::chunk;
 use crate::codec::R;
 use crate::model::*;
-use crate::nodes::{self, Ix, NodeFile, Nodes};
-use crate::names::{self, Found, Names};
+use crate::names::{Found, Names};
+use crate::nodes::{Ix, NodeFile, Nodes};
 use crate::reverse::{self, Hit, Reverse};
 
 pub const REDIR_MAGIC: &[u8; 8] = b"WDREDIR\0";
@@ -14,56 +16,61 @@ pub const REDIR_MAGIC: &[u8; 8] = b"WDREDIR\0";
 /// `redirects.wds`: "WDREDIR\0" | u32 version | u64 count | (old id u64, new id u64)* sorted by the old id.
 pub fn write_redirects(r: &[(Eid, Eid)]) -> Vec<u8> {
     let mut b = Vec::with_capacity(20 + 16 * r.len());
-    b.extend_from_slice(REDIR_MAGIC); b.extend_from_slice(&2u32.to_le_bytes());
+    b.extend_from_slice(REDIR_MAGIC); b.extend_from_slice(&3u32.to_le_bytes());
     b.extend_from_slice(&(r.len() as u64).to_le_bytes());
     for (a, c) in r { b.extend_from_slice(&a.0.to_le_bytes()); b.extend_from_slice(&c.0.to_le_bytes()); }
     b
 }
 
-pub struct Store { pub dir: String, chunks: Vec<(Eid, Eid, Vec<u8>)>, pub nodes: Nodes, redirects: Vec<u8>, reverse: Reverse,
-                   names: Names, name_files: [Vec<u8>; 3] }
-
 fn read(dir: &str, name: &str) -> Result<Vec<u8>, String> { std::fs::read(format!("{dir}/{name}")).map_err(|e| format!("{name}: {e}")) }
+
+/// A sorted table of fixed rows whose first 8 bytes are a u64 key, searched in place.
+fn find(b: &[u8], at: usize, n: usize, size: usize, key: u64) -> Option<usize> {
+    let k = |i: usize| u64::from_le_bytes(b[at + size * i..at + size * i + 8].try_into().unwrap());
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let m = (lo + hi) / 2;
+        match k(m).cmp(&key) { std::cmp::Ordering::Less => lo = m + 1, std::cmp::Ordering::Greater => hi = m, _ => return Some(at + size * m) }
+    }
+    None
+}
+
+pub struct Store {
+    pub dir: String, chunks: [Vec<Vec<u8>>; 2], ids: Vec<u8>, pub nodes: Nodes, redirects: Vec<u8>, reverse: Reverse, names: Names,
+}
 
 impl Store {
     pub fn open(dir: &str) -> Result<Store, String> {
-        let mut chunks = Vec::new();
-        for k in 0.. {
-            let Ok(b) = std::fs::read(format!("{dir}/chunk_{k:05}.wds")) else { break };
-            let rd = chunk::Reader::open(&b)?;
-            if rd.is_empty() { continue; }
-            let (first, last) = (rd.slot(0).0, rd.slot(rd.len() - 1).0);
-            chunks.push((first, last, b));
+        let mut chunks = [Vec::new(), Vec::new()];
+        for (s, set) in ["hot", "cold"].iter().enumerate() {
+            for k in 0.. { match std::fs::read(format!("{dir}/chunk_{set}_{k:05}.wds")) { Ok(b) => chunks[s].push(b), Err(_) => break } }
         }
+        let ids = read(dir, "ids.wds")?;
+        if ids.len() < 20 || &ids[..8] != b"WDIDS\0\0\0" { return Err("not an id table".into()); }
         let redirects = read(dir, "redirects.wds")?;
         if redirects.len() < 20 || &redirects[..8] != REDIR_MAGIC { return Err("not a redirects file".into()); }
-        let name_files = [read(dir, "names_exact.fst")?, read(dir, "names_folded.fst")?, read(dir, "names.post")?];
-        let names = Names::open(name_files[0].clone(), name_files[1].clone(), name_files[2].clone())?;
-        Ok(Store { dir: dir.into(), chunks, redirects, reverse: Reverse::open(read(dir, "reverse.wds")?)?, names, name_files,
+        let names = Names::open(read(dir, "names_exact.fst")?, read(dir, "names_folded.fst")?, read(dir, "names.post")?)?;
+        Ok(Store { dir: dir.into(), chunks, ids, redirects, names, reverse: Reverse::open(read(dir, "reverse.wds")?)?,
                    nodes: Nodes { values: NodeFile::open(read(dir, "values.wds")?)?, refs: NodeFile::open(read(dir, "refs.wds")?)? } })
     }
 
-    pub fn get(&self, id: Eid) -> Result<Option<Entity>, String> {
-        let k = self.chunks.partition_point(|c| c.1 < id);
-        match self.chunks.get(k) {
-            Some((first, _, b)) if *first <= id => chunk::Reader::open(b)?.get(id, &self.nodes),
-            _ => Ok(None),
-        }
+    fn count(b: &[u8]) -> usize { u64::from_le_bytes(b[12..20].try_into().unwrap()) as usize }
+
+    /// (hot or cold, the entity) by id.
+    pub fn locate(&self, id: Eid) -> Result<Option<(bool, Entity)>, String> {
+        let Some(o) = find(&self.ids, 20, Self::count(&self.ids), 16, id.0) else { return Ok(None) };
+        let c = u32::from_le_bytes(self.ids[o + 8..o + 12].try_into().unwrap());
+        let off = u32::from_le_bytes(self.ids[o + 12..o + 16].try_into().unwrap()) as usize;
+        let (set, k) = ((c >> 31) as usize, (c & 0x7fff_ffff) as usize);
+        let b = self.chunks[set].get(k).ok_or("the id table names a missing chunk")?;
+        Ok(Some((set == 1, chunk::Reader::open(b)?.at(off, id, &self.nodes)?)))
     }
 
+    pub fn get(&self, id: Eid) -> Result<Option<Entity>, String> { Ok(self.locate(id)?.map(|x| x.1)) }
+
     fn redirect(&self, id: Eid) -> Option<Eid> {
-        let n = u64::from_le_bytes(self.redirects[12..20].try_into().unwrap()) as usize;
-        let at = |i: usize| u64::from_le_bytes(self.redirects[20 + 16 * i..28 + 16 * i].try_into().unwrap());
-        let (mut lo, mut hi) = (0, n);
-        while lo < hi {
-            let m = (lo + hi) / 2;
-            match at(m).cmp(&id.0) {
-                std::cmp::Ordering::Equal => return Some(Eid(u64::from_le_bytes(self.redirects[28 + 16 * m..36 + 16 * m].try_into().unwrap()))),
-                std::cmp::Ordering::Less => lo = m + 1,
-                std::cmp::Ordering::Greater => hi = m,
-            }
-        }
-        None
+        find(&self.redirects, 20, Self::count(&self.redirects), 16, id.0)
+            .map(|o| Eid(u64::from_le_bytes(self.redirects[o + 8..o + 16].try_into().unwrap())))
     }
 
     /// The id that remains: followed through redirects (at most 8; a loop is an error, not an answer).
@@ -73,67 +80,55 @@ impl Store {
         Err(format!("{}: a redirect chain over 8 or a loop", id.text()))
     }
 
-    /// Every entity with a statement `pid` = `value` (main values; at every rank, each hit says its rank).
+    /// Every hot entity with a statement `pid` = `value` (main values; at every rank, each hit says its rank).
     pub fn who(&self, pid: u32, value: Eid) -> Result<Vec<Hit>, String> { self.reverse.who(pid, value) }
 
-    /// Every entity a name may mean (exact, else accent-folded, else a bounded typo), in id order, never by fame.
+    /// Every hot entity a name may mean (exact, else accent-folded, else a bounded typo), in id order, never by fame.
     pub fn name(&self, s: &str) -> Result<Found, String> { self.names.lookup(s) }
 
     /// Every `step`-th entity id, in id order (a spread sample for the latency measurement).
-    pub fn ids(&self, step: usize) -> Result<Vec<Eid>, String> {
-        let mut v = Vec::new();
-        let mut k = 0usize;
-        for (_, _, b) in &self.chunks {
-            let rd = chunk::Reader::open(b)?;
-            for i in 0..rd.len() { if k % step.max(1) == 0 { v.push(rd.slot(i).0); } k += 1; }
-        }
-        Ok(v)
+    pub fn ids(&self, step: usize) -> Vec<Eid> {
+        (0..Self::count(&self.ids)).step_by(step.max(1))
+            .map(|i| Eid(u64::from_le_bytes(self.ids[20 + 16 * i..28 + 16 * i].try_into().unwrap()))).collect()
     }
 
-    pub fn statements(&self) -> Result<u64, String> {
-        let mut n = 0;
-        for (_, _, b) in &self.chunks { n += chunk::Reader::open(b)?.read_all(&self.nodes)?.iter().map(|e| e.statements.len() as u64).sum::<u64>(); }
-        Ok(n)
-    }
-
-    /// Every file re-read whole and re-written to the same bytes; every file's hash as the manifest records it.
+    /// Every chunk re-read whole and re-written to the same bytes; the reverse and name rows rebuilt from the hot
+    /// entities and compared with the files; every file's hash as the manifest records it.
     pub fn check(&self) -> Result<String, String> {
         let man = std::fs::read_to_string(format!("{}/manifest.json", self.dir)).map_err(|e| e.to_string())?;
-        let has = |b: &[u8], name: &str| -> Result<(), String> {
-            let h = blake3::hash(b).to_hex().to_string();
+        let has = |name: &str| -> Result<(), String> {
+            let h = blake3::hash(&read(&self.dir, name)?).to_hex().to_string();
             if man.contains(&h) { Ok(()) } else { Err(format!("{name}: hash {h} is not the manifest's")) }
         };
-        let (v, r) = (&self.nodes.values, &self.nodes.refs);
-        let vorder = (0..v.len() as u32).map(|i| v.hash(i)).collect::<Result<Vec<_>, _>>()?;
-        let rorder = (0..r.len() as u32).map(|i| r.hash(i)).collect::<Result<Vec<_>, _>>()?;
-        let vdef: Vec<ValueNode> = (0..v.len() as u32).map(|i| v.value(i)).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect();
-        let rdef: Vec<RefNode> = (0..r.len() as u32).map(|i| r.reference(i, &self.nodes)).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect();
-        let ix = Ix::new(&vorder, &rorder);
-        if nodes::write_values(&vorder, &vdef) != v.bytes() { return Err("values.wds: re-writing differs".into()); }
-        if nodes::write_refs(&rorder, &rdef, &ix)? != r.bytes() { return Err("refs.wds: re-writing differs".into()); }
-        has(v.bytes(), "values.wds")?; has(r.bytes(), "refs.wds")?; has(&self.redirects, "redirects.wds")?;
+        for f in ["ids.wds", "redirects.wds", "values.wds", "refs.wds", "reverse.wds", "names_exact.fst", "names_folded.fst", "names.post"] { has(f)?; }
+        let ix = Ix::from(&self.nodes)?;
+        let (mut rev, mut names, mut n) = (Vec::new(), [Vec::new(), Vec::new()], [0usize; 2]);
+        for (s, set) in ["hot", "cold"].iter().enumerate() {
+            for (k, b) in self.chunks[s].iter().enumerate() {
+                has(&format!("chunk_{set}_{k:05}.wds"))?;
+                let ents = chunk::Reader::open(b)?.read_all(&self.nodes)?;
+                if chunk::write(&ents, &ix)? != *b { return Err(format!("chunk {set} {k}: re-writing differs")); }
+                n[s] += ents.len();
+                if s == 0 {
+                    for e in &ents {
+                        rev.extend(reverse::rows(e));
+                        for (w, rs) in crate::names::rows(e).into_iter().enumerate() { names[w].extend(rs); }
+                    }
+                }
+            }
+        }
+        if n[0] + n[1] != Self::count(&self.ids) { return Err("the id table does not list every entity".into()); }
+        rev.sort();
+        if self.reverse.all_rows()? != rev { return Err("reverse.wds: not the hot entities' statements".into()); }
+        for (w, mut rs) in names.into_iter().enumerate() {
+            rs.sort();
+            if self.names.all_rows(w)? != rs { return Err(format!("names ({}): not the hot entities' names", ["exact", "folded"][w])); }
+        }
         let mut rd = R::at(&self.redirects, 12);
-        let n = rd.u64le()?;
-        let pairs = (0..n).map(|_| Ok((Eid(rd.u64le()?), Eid(rd.u64le()?)))).collect::<Result<Vec<_>, String>>()?;
-        if write_redirects(&pairs) != self.redirects { return Err("redirects.wds: re-writing differs".into()); }
-        let mut every = Vec::new();
-        for (k, (_, _, b)) in self.chunks.iter().enumerate() {
-            has(b, &format!("chunk {k}"))?;
-            let ents = chunk::Reader::open(b)?.read_all(&self.nodes)?;
-            if chunk::write(&ents, &ix)? != *b { return Err(format!("chunk {k}: re-writing differs")); }
-            every.extend(ents);
-        }
-        let rows = reverse::rows(&every);
-        if self.reverse.all_rows()? != rows { return Err("reverse.wds: not the entities' statements".into()); }
-        if reverse::write(&rows)? != self.reverse.bytes() { return Err("reverse.wds: re-writing differs".into()); }
-        has(self.reverse.bytes(), "reverse.wds")?;
-        let (ne, nf, np) = names::write(&every)?;
-        for (k, (f, b)) in [("names_exact.fst", ne), ("names_folded.fst", nf), ("names.post", np)].into_iter().enumerate() {
-            if b != self.name_files[k] { return Err(format!("{f}: not the entities' names")); }
-            has(&b, f)?;
-        }
-        Ok(format!("{} chunks, {} value nodes ({} undefined), {} references ({} undefined), {} redirects, {} reverse keys: \
-                    each re-read and re-written to the same bytes, hashes as recorded", self.chunks.len(), v.len(),
-                   v.undefined()?, r.len(), r.undefined()?, n, self.reverse.keys()))
+        let nr = rd.u64le()?;
+        Ok(format!("{} hot and {} cold entities in {} and {} chunks, {} value nodes ({} undefined), {} references ({} undefined), \
+                    {} redirects, {} reverse keys: each chunk re-written to the same bytes, the indexes the entities' own, \
+                    hashes as recorded", n[0], n[1], self.chunks[0].len(), self.chunks[1].len(), self.nodes.values.len(),
+                   self.nodes.values.undefined()?, self.nodes.refs.len(), self.nodes.refs.undefined()?, nr, self.reverse.keys()))
     }
 }

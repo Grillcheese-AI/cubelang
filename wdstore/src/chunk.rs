@@ -13,7 +13,7 @@
 
 use crate::codec::{entry, guid_kind, Dict, R, W};
 use crate::model::*;
-use crate::nodes::{Ix, Nodes};
+use crate::nodes::{Nodes, Numbering};
 
 pub const MAGIC: &[u8; 8] = b"WDSTORE\0";
 pub const VERSION: u32 = 2;
@@ -51,7 +51,7 @@ pub fn put_snaks(w: &mut W, d: &mut Dict, s: &[Snak]) {
 pub fn get_snaks(r: &mut R, d: &[String]) -> Result<Vec<Snak>, String> {
     (0..r.u()?).map(|_| Ok(Snak { pid: r.u()? as u32, value: get_value(r, d)? })).collect()
 }
-pub fn put_nodes(w: &mut W, ix: &Ix, n: &[(u32, NodeHash)]) -> Result<(), String> {
+pub fn put_nodes(w: &mut W, ix: &dyn Numbering, n: &[(u32, NodeHash)]) -> Result<(), String> {
     w.u(n.len() as u64);
     for (p, h) in n { w.u(*p as u64); w.u(ix.value(h)? as u64); }
     Ok(())
@@ -60,7 +60,7 @@ pub fn get_nodes(r: &mut R, n: &Nodes) -> Result<Vec<(u32, NodeHash)>, String> {
     (0..r.u()?).map(|_| Ok((r.u()? as u32, n.values.hash(r.u()? as u32)?))).collect()
 }
 
-fn put_entity(w: &mut W, d: &mut Dict, ix: &Ix, e: &Entity) -> Result<(), String> {
+fn put_entity(w: &mut W, d: &mut Dict, ix: &dyn Numbering, e: &Entity) -> Result<(), String> {
     w.u(e.revision); w.s(&e.modified);
     match &e.datatype { Some(t) => { w.byte(1); let i = d.id(t); w.u(i); } None => w.byte(0) }
     w.u(e.names.len() as u64);
@@ -123,7 +123,7 @@ fn get_entity(r: &mut R, d: &[String], n: &Nodes, id: Eid) -> Result<Entity, Str
 }
 
 /// The chunk's bytes. Entities sorted by id, none twice; statements by property.
-pub fn write(entities: &[Entity], ix: &Ix) -> Result<Vec<u8>, String> {
+pub fn write(entities: &[Entity], ix: &dyn Numbering) -> Result<Vec<u8>, String> {
     let mut d = Dict::default();
     let mut w = W { b: vec![0; HEAD] };
     let mut index = Vec::with_capacity(entities.len());
@@ -168,6 +168,12 @@ impl<'a> Reader<'a> {
         let o = self.index_body + 12 * k;
         (Eid(u64::from_le_bytes(self.b[o..o + 8].try_into().unwrap())),
          u32::from_le_bytes(self.b[o + 8..o + 12].try_into().unwrap()) as usize)
+    }
+
+    /// The entity whose record starts at `off` (the store's id table gives it).
+    pub fn at(&self, off: usize, id: Eid, n: &Nodes) -> Result<Entity, String> {
+        if off < HEAD || off >= self.b.len() { return Err(format!("{}: offset {off} outside its chunk", id.text())); }
+        get_entity(&mut R::at(self.b, off), &self.dict, n, id)
     }
 
     /// One entity, by binary search on the index; the rest of the chunk is not read.
