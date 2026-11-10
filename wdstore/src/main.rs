@@ -5,6 +5,7 @@
 //! wdstore get <dir> <Q42>                     one entity, as stored (a redirect followed; hot or cold said)
 //! wdstore who <dir> <P31> <Q5>                the hot entities with that statement, and their ranks
 //! wdstore name <dir> "Douglas Adams"          every hot entity the name may mean, in id order
+//! wdstore resolve <dir> <ids.txt>            each id: hot / cold / missing, or the id it redirects to
 //! wdstore bench <dir>                         lookup latency over a spread of ids
 //! wdstore bunzip <out> <parts>...             the parts as one bzip2 file, decoded on every core
 //! wdstore check <dir>                         every chunk re-written to the same bytes, the indexes rebuilt, hashes
@@ -79,6 +80,22 @@ fn main() {
                 eprintln!("{c} bytes in, {n} out, {s:.1} s: {:.1} MB/s in, {:.1} MB/s out, {th} threads", c as f64 / s / 1e6, n as f64 / s / 1e6);
             })
         }
+        Some("resolve") if a.len() == 3 => Store::open(&a[1]).and_then(|s| {
+            // one id a line in; out: the id, then hot / cold / missing, or "-> <id that remains>" and where that is
+            let text = std::fs::read_to_string(&a[2]).map_err(|e| e.to_string())?;
+            let mut o = std::io::BufWriter::new(std::io::stdout().lock());
+            let mut n = [0u64; 4];
+            for id in text.lines().filter_map(|l| Eid::parse(l.trim())) {
+                let to = s.resolve(id)?;
+                let at = match s.locate(to)? { Some((true, _)) => "cold", Some((false, _)) => "hot", None => "missing" };
+                let k = if to != id { 3 } else { ["hot", "cold", "missing"].iter().position(|x| *x == at).unwrap() };
+                n[k] += 1;
+                let line = if to != id { format!("{}\t-> {}\t{at}\n", id.text(), to.text()) } else { format!("{}\t{at}\n", id.text()) };
+                std::io::Write::write_all(&mut o, line.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            eprintln!("hot {}, cold {}, missing {}, through a redirect {}", n[0], n[1], n[2], n[3]);
+            Ok(())
+        }),
         Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: see the head of src/main.rs".into()),
