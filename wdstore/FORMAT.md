@@ -79,9 +79,24 @@ statements in the JSON count), about 50-55 GB, under the order's 90 GB line. The
 the sample (151M distinct references in the dump, estimated): the full build measures them. 6,198 of the segment's
 45,309 value nodes and 5,308 of its 86,719 references are named but written elsewhere in the dump.
 
+## The reverse index and the names (2026-11-10)
+
+`reverse.wds`: for each (property, value entity), the entities whose statement has that value, in id order, each
+with its statement's rank and best-rank flag (a sorted key table of 24-byte entries, then varint gaps). Main values
+only. `names_exact.fst`, `names_folded.fst`, `names.post`: every label and alias kept (EN, FR, `mul`) under an exact
+key (lowercase, spaces collapsed) and a folded one (accents and punctuation dropped too), each mapping to its
+entities in id order with the name's language and kind. A lookup answers from the first stage with a hit: exact,
+folded, then a typo path over the folded keys (one edit from 5 characters, two from 9, none below), all candidates,
+never ordered by fame; over 64 near keys, it says so instead of guessing. `check` rebuilds both from the entities
+and compares the bytes.
+
+Same segment: reverse 4.8 MB (136,280 keys), names 11.5 MB (276,522 names, about 42 bytes a name); 80.2 bytes a
+statement in all. Lookups from memory (`wdstore bench`, 3,275 ids spread over the store): an entity by id p50 9.2 us,
+p95 15.4 us, p99 22.5 us; a name p50 2.2 us, p95 5.8 us, p99 8.4 us. The order's lines are 1 ms p95 for a fact and
+50 ms p95 for a name, from SSD: measured on the full build, memory-mapped.
+
 ## Next
 
-The reverse index (property, value entity) -> subjects; the names FST (exact and accent-folded keys, a bounded typo
-path, never ordered by fame); the scholarly split (the size line's question in 0055); the build over the whole dump
+The scholarly split (the size line's question in 0055); the build over the whole dump
 in id-range buckets, resumable chunk by chunk, memory-mapped reads, and the lookup latencies the order's lines ask
 for (1 ms p95 from SSD).

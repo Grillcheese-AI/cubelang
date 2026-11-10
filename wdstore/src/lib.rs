@@ -10,6 +10,7 @@
 //! - `chunk`, `nodes`, `codec`: the entity chunks and the value and reference node files, written so a rebuild
 //!   gives the same bytes.
 //! - `reverse`: (property, value entity) -> the entities that have it.
+//! - `names`: labels and aliases -> entities, exact, accent-folded, a bounded typo path; never by fame.
 //! - `store`: a built store opened: one entity by id, redirects followed, every file checked.
 //! - `build`: inputs -> chunks + a manifest with every input's, chunk's and the code's hash.
 
@@ -18,6 +19,7 @@ pub mod chunk;
 pub mod codec;
 pub mod ingest;
 pub mod model;
+pub mod names;
 pub mod nodes;
 pub mod reverse;
 pub mod store;
@@ -27,7 +29,7 @@ pub mod turtle;
 pub fn code_hash() -> String {
     let mut h = blake3::Hasher::new();
     for src in [include_str!("build.rs"), include_str!("chunk.rs"), include_str!("codec.rs"), include_str!("ingest.rs"),
-                include_str!("model.rs"), include_str!("nodes.rs"), include_str!("reverse.rs"), include_str!("store.rs"), include_str!("turtle.rs")] {
+                include_str!("model.rs"), include_str!("names.rs"), include_str!("nodes.rs"), include_str!("reverse.rs"), include_str!("store.rs"), include_str!("turtle.rs")] {
         h.update(src.as_bytes());
     }
     h.finalize().to_hex().to_string()

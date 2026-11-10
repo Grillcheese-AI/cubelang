@@ -1,7 +1,8 @@
 //! wdstore build --out <dir> [--per-chunk N] <input.ttl[.gz]>...   the store, its manifest
 //! wdstore get <dir> <Q42>                                        one entity, as stored (a redirect followed)
 //! wdstore who <dir> <P31> <Q5>                                  the entities with that statement, and their ranks
-//! wdstore check <dir>                                           every file re-read whole, re-written, re-hashed
+//! wdstore name <dir> "Douglas Adams"                             every entity the name may mean, in id order
+//! wdstore check <dir>                                          every file re-read whole, re-written, re-hashed
 
 use wdstore::{build, ingest::Params, model::Eid, store::Store};
 
@@ -35,8 +36,38 @@ fn main() {
             }),
             _ => Err("who <dir> <P..> <id>".into()),
         },
+        Some("name") if a.len() == 3 => Store::open(&a[1]).and_then(|s| s.name(&a[2])).map(|f| match f {
+            wdstore::names::Found::Hits(h) => {
+                for x in &h { println!("{}\t{}\t{:?}\t{:?}\t{}", x.entity.text(), x.lang, x.kind, x.how, x.key); }
+                eprintln!("{} candidates", h.len());
+            }
+            wdstore::names::Found::TooMany(n) => println!("too many near names (over {n}): ask"),
+            wdstore::names::Found::None => println!("no entity bears this name"),
+        }),
+        Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: wdstore build --out <dir> [--per-chunk N] <inputs>... | get <dir> <id> | check <dir>".into()),
     };
     if let Err(e) = r { eprintln!("{e}"); std::process::exit(1); }
+}
+
+/// Lookup latency, from memory (the files read whole): one entity by id, then one name, over a spread of ids.
+fn bench(s: &Store) -> Result<(), String> {
+    let ids = s.ids(37)?;
+    let pct = |mut v: Vec<f64>| { v.sort_by(|a, b| a.total_cmp(b)); let at = |p: usize| v[(v.len() - 1) * p / 100];
+        format!("p50 {:.1} us, p95 {:.1} us, p99 {:.1} us (n {})", at(50), at(95), at(99), v.len()) };
+    let (mut get, mut name, mut labels) = (Vec::new(), Vec::new(), Vec::new());
+    for &id in &ids {
+        let t = std::time::Instant::now();
+        let e = s.get(id)?.ok_or("an indexed id not found")?;
+        get.push(t.elapsed().as_secs_f64() * 1e6);
+        if let Some(n) = e.names.iter().find(|n| n.kind != wdstore::model::NameKind::Description) { labels.push(n.text.clone()); }
+    }
+    for l in &labels {
+        let t = std::time::Instant::now();
+        if let wdstore::names::Found::None = s.name(l)? { return Err(format!("{l}: its own label not found")); }
+        name.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    println!("get by id: {}\nname:      {}", pct(get), pct(name));
+    Ok(())
 }

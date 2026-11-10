@@ -184,7 +184,8 @@ fn statement_ids_round_trip_in_every_case() {
 #[test]
 fn no_stored_value_is_a_float() {
     for src in [include_str!("../src/model.rs"), include_str!("../src/codec.rs"), include_str!("../src/chunk.rs"),
-                include_str!("../src/ingest.rs"), include_str!("../src/turtle.rs")] {
+                include_str!("../src/ingest.rs"), include_str!("../src/turtle.rs"), include_str!("../src/nodes.rs"),
+                include_str!("../src/reverse.rs"), include_str!("../src/names.rs"), include_str!("../src/store.rs")] {
         for bad in ["f32", "f64", "parse::<f"] { assert!(!src.contains(bad), "a float type in the store's code: {bad}"); }
     }
 }
@@ -200,4 +201,20 @@ fn a_node_written_in_two_places_is_one_node() {
     assert_eq!((m[0].kind.as_str(), m[0].fields.len()), ("wikibase:QuantityValue", 2));
     let mut c = a.clone(); c.kind = "wikibase:TimeValue".into();
     assert!(build::merge_values(vec![a, c]).unwrap_err().contains("two kinds"));
+}
+
+#[test]
+fn a_name_finds_every_entity_it_may_mean_in_id_order_exact_then_folded_then_typo() {
+    use wdstore::names::{folded_key, Found, How};
+    assert_eq!(folded_key("  École   Normale-Supérieure "), "ecole normale superieure");
+    let (_, st) = built("n");
+    let ents = |f: Found| match f { Found::Hits(h) => h.iter().map(|x| (x.entity.text(), x.lang.clone(), x.how)).collect::<Vec<_>>(), x => panic!("{x:?}") };
+    let ex = ents(st.name("douglas   ADAMS").unwrap());
+    assert_eq!(ex, vec![("Q42".into(), "en".into(), How::Exact), ("Q42".into(), "fr".into(), How::Exact),
+                        ("Q43".into(), "en".into(), How::Exact), ("Q43".into(), "fr".into(), How::Exact)]);
+    assert!(ents(st.name("Douglás Adams").unwrap()).iter().all(|h| h.2 == How::Folded));
+    assert_eq!(ents(st.name("D N Adams").unwrap()).len(), 2);                 // the alias, folded, on both
+    assert!(ents(st.name("Douglas Adans").unwrap()).iter().all(|h| h.2 == How::Typo(1)));
+    assert_eq!(st.name("Adams").unwrap(), Found::None);                       // a part of a name is not the name
+    assert_eq!(st.name("Dougl").unwrap(), Found::None);
 }

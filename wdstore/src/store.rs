@@ -6,6 +6,7 @@ use crate::chunk;
 use crate::codec::R;
 use crate::model::*;
 use crate::nodes::{self, Ix, NodeFile, Nodes};
+use crate::names::{self, Found, Names};
 use crate::reverse::{self, Hit, Reverse};
 
 pub const REDIR_MAGIC: &[u8; 8] = b"WDREDIR\0";
@@ -19,7 +20,8 @@ pub fn write_redirects(r: &[(Eid, Eid)]) -> Vec<u8> {
     b
 }
 
-pub struct Store { pub dir: String, chunks: Vec<(Eid, Eid, Vec<u8>)>, pub nodes: Nodes, redirects: Vec<u8>, reverse: Reverse }
+pub struct Store { pub dir: String, chunks: Vec<(Eid, Eid, Vec<u8>)>, pub nodes: Nodes, redirects: Vec<u8>, reverse: Reverse,
+                   names: Names, name_files: [Vec<u8>; 3] }
 
 fn read(dir: &str, name: &str) -> Result<Vec<u8>, String> { std::fs::read(format!("{dir}/{name}")).map_err(|e| format!("{name}: {e}")) }
 
@@ -35,7 +37,9 @@ impl Store {
         }
         let redirects = read(dir, "redirects.wds")?;
         if redirects.len() < 20 || &redirects[..8] != REDIR_MAGIC { return Err("not a redirects file".into()); }
-        Ok(Store { dir: dir.into(), chunks, redirects, reverse: Reverse::open(read(dir, "reverse.wds")?)?,
+        let name_files = [read(dir, "names_exact.fst")?, read(dir, "names_folded.fst")?, read(dir, "names.post")?];
+        let names = Names::open(name_files[0].clone(), name_files[1].clone(), name_files[2].clone())?;
+        Ok(Store { dir: dir.into(), chunks, redirects, reverse: Reverse::open(read(dir, "reverse.wds")?)?, names, name_files,
                    nodes: Nodes { values: NodeFile::open(read(dir, "values.wds")?)?, refs: NodeFile::open(read(dir, "refs.wds")?)? } })
     }
 
@@ -71,6 +75,20 @@ impl Store {
 
     /// Every entity with a statement `pid` = `value` (main values; at every rank, each hit says its rank).
     pub fn who(&self, pid: u32, value: Eid) -> Result<Vec<Hit>, String> { self.reverse.who(pid, value) }
+
+    /// Every entity a name may mean (exact, else accent-folded, else a bounded typo), in id order, never by fame.
+    pub fn name(&self, s: &str) -> Result<Found, String> { self.names.lookup(s) }
+
+    /// Every `step`-th entity id, in id order (a spread sample for the latency measurement).
+    pub fn ids(&self, step: usize) -> Result<Vec<Eid>, String> {
+        let mut v = Vec::new();
+        let mut k = 0usize;
+        for (_, _, b) in &self.chunks {
+            let rd = chunk::Reader::open(b)?;
+            for i in 0..rd.len() { if k % step.max(1) == 0 { v.push(rd.slot(i).0); } k += 1; }
+        }
+        Ok(v)
+    }
 
     pub fn statements(&self) -> Result<u64, String> {
         let mut n = 0;
@@ -109,6 +127,11 @@ impl Store {
         if self.reverse.all_rows()? != rows { return Err("reverse.wds: not the entities' statements".into()); }
         if reverse::write(&rows)? != self.reverse.bytes() { return Err("reverse.wds: re-writing differs".into()); }
         has(self.reverse.bytes(), "reverse.wds")?;
+        let (ne, nf, np) = names::write(&every)?;
+        for (k, (f, b)) in [("names_exact.fst", ne), ("names_folded.fst", nf), ("names.post", np)].into_iter().enumerate() {
+            if b != self.name_files[k] { return Err(format!("{f}: not the entities' names")); }
+            has(&b, f)?;
+        }
         Ok(format!("{} chunks, {} value nodes ({} undefined), {} references ({} undefined), {} redirects, {} reverse keys: \
                     each re-read and re-written to the same bytes, hashes as recorded", self.chunks.len(), v.len(),
                    v.undefined()?, r.len(), r.undefined()?, n, self.reverse.keys()))
