@@ -6,6 +6,7 @@
 //! wdstore who <dir> <P31> <Q5>                the hot entities with that statement, and their ranks
 //! wdstore name <dir> "Douglas Adams"          every hot entity the name may mean, in id order
 //! wdstore resolve <dir> <ids.txt>            each id: hot / cold / missing, or the id it redirects to
+//! wdstore dump <dir> <ids.txt|all>             entities as stored, one JSON line each
 //! wdstore bench <dir>                         lookup latency over a spread of ids
 //! wdstore bunzip <out> <parts>...             the parts as one bzip2 file, decoded on every core
 //! wdstore check <dir>                         every chunk re-written to the same bytes, the indexes rebuilt, hashes
@@ -42,6 +43,18 @@ fn main() {
                 None => Err("--out".into()),
             }
         }
+        Some("dump") if a.len() == 3 => Store::open(&a[1]).and_then(|s| {
+            // every entity of the store, or those of an ids file (one a line), as JSON lines
+            let ids: Vec<Eid> = if a[2] == "all" { s.ids(1) } else {
+                std::fs::read_to_string(&a[2]).map_err(|e| e.to_string())?.lines().filter_map(|l| Eid::parse(l.trim())).collect() };
+            let mut o = std::io::BufWriter::new(std::io::stdout().lock());
+            for id in ids {
+                if let Some((cold, e)) = s.locate(id)? {
+                    std::io::Write::write_all(&mut o, (wdstore::export::entity(&e, cold) + "\n").as_bytes()).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        }),
         Some("get") if a.len() == 3 => match Eid::parse(&a[2]) {
             Some(id) => Store::open(&a[1]).and_then(|s| {
                 let to = s.resolve(id)?;

@@ -165,7 +165,7 @@ pub fn block(text: &str, prm: &Params) -> Result<Block, String> {
     for (_, (site, title)) in sites {
         if let (Some(si), Some(t)) = (site, title) { if prm.wikis.contains(&si) { ent.sitelinks.push((si, t)); } }
     }
-    ent.names.sort(); ent.sitelinks.sort();
+    ent.names.sort(); ent.names.dedup(); ent.sitelinks.sort(); ent.sitelinks.dedup();
     ent.statements.sort_by(|a, b| (a.pid, &a.guid).cmp(&(b.pid, &b.guid)));
     b.value_nodes = vnodes.into_values().map(|mut n| { n.fields.sort(); n }).collect();
     b.ref_nodes = rnodes.into_values().map(|mut n| { n.snaks.sort_by_key(|s| (s.pid, format!("{:?}", s.value))); n.nodes.sort(); n }).collect();
@@ -173,8 +173,10 @@ pub fn block(text: &str, prm: &Params) -> Result<Block, String> {
     Ok(b)
 }
 
-/// One order for what RDF leaves unordered, so a rebuild writes the same bytes.
+/// One order for what RDF leaves unordered, so a rebuild writes the same bytes; and each triple once: RDF is a set
+/// of triples, so a triple the dump writes three times (a statement's same reference, 2026-11-10) means it once.
 fn canon_statement(st: &mut Statement) {
-    for q in [&mut st.hot_qualifiers, &mut st.cold_qualifiers] { q.sort_by_key(|s| (s.pid, format!("{:?}", s.value))); }
-    st.hot_qualifier_nodes.sort(); st.cold_qualifier_nodes.sort(); st.references.sort();
+    for q in [&mut st.hot_qualifiers, &mut st.cold_qualifiers] { q.sort_by_key(|s| (s.pid, format!("{:?}", s.value))); q.dedup(); }
+    for n in [&mut st.hot_qualifier_nodes, &mut st.cold_qualifier_nodes] { n.sort(); n.dedup(); }
+    st.references.sort(); st.references.dedup();
 }

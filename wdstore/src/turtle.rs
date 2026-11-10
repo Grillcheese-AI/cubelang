@@ -23,7 +23,7 @@ const SPACES: [(&str, &str); 22] = [
     ("http://www.wikidata.org/prop/qualifier/", "pq:"), ("http://www.wikidata.org/prop/reference/value/", "prv:"),
     ("http://www.wikidata.org/prop/reference/value-normalized/", "prn:"), ("http://www.wikidata.org/prop/reference/", "pr:"),
     ("http://www.wikidata.org/prop/novalue/", "wdno:"), ("http://www.wikidata.org/prop/", "p:"),
-    ("http://www.wikidata.org/entity/", "wd:"), ("http://www.wikidata.org/wiki/Special:EntityData/", "data:"),
+    ("http://www.wikidata.org/entity/", "wd:"), ("https://www.wikidata.org/wiki/Special:EntityData/", "data:"),
     ("http://wikiba.se/ontology#", "wikibase:"), ("http://schema.org/", "schema:"),
     ("http://www.w3.org/2001/XMLSchema#", "xsd:"), ("http://www.w3.org/2000/01/rdf-schema#", "rdfs:"),
 ];

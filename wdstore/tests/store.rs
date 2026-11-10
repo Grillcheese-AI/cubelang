@@ -261,3 +261,13 @@ fn one_changed_byte_fails_the_check() {
         assert!(r.is_err(), "{f}: a changed byte passed the check");
     }
 }
+
+#[test]
+fn a_triple_the_dump_writes_twice_is_kept_once() {
+    let text = ITEM.replace("prov:wasDerivedFrom wdref:00000000000000000000000000000000000000aa .",
+        "prov:wasDerivedFrom wdref:00000000000000000000000000000000000000aa,\n\t\twdref:00000000000000000000000000000000000000aa .")
+        .replace("rdfs:label \"Douglas Adams\"@en,", "rdfs:label \"Douglas Adams\"@en, \"Douglas Adams\"@en,");
+    assert_ne!(text, ITEM);
+    let e = block(&text, &Params::default()).unwrap().entity.unwrap();
+    assert_eq!(e, block(ITEM, &Params::default()).unwrap().entity.unwrap());
+}
