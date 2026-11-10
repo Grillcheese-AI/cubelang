@@ -279,8 +279,13 @@ those steps is recorded, so a world decision is as checkable as an answer.
 - [ ] **P5-6: no reference semantics yet.** INST, GEN, INFER, MERGE, SPLIT, FILTER, MAP_ROLES, REDUCE,
   TEMPORAL_BIND, ANALOGY, BROADCAST and SYNC are not implemented in cubemind's VSAVM either. Neither is **UNIFY**:
   it logs "UNIFY a b" and computes nothing, so it joins this list. The proposed paragraphs are in
-  `docs/proposals/2026-11-10-trace-only-opcodes.md`. Nick says yes to each before any code; until then, strict mode
-  keeps rejecting them, UNIFY included.
+  `docs/proposals/2026-11-10-trace-only-opcodes.md`. **Nick approved all thirteen as written (2026-11-10).**
+  - **Suggested order,** by who needs them:
+    - first INFER (its derivation lines feed CubbyLLM 0055's certificates), then FILTER, REDUCE and SPLIT;
+    - then UNIFY, INST and GEN, with CubbyLLM 0057's type checks;
+    - then MERGE, MAP_ROLES, TEMPORAL_BIND, ANALOGY and BROADCAST;
+    - SYNC last, once CubbyLLM 0063 runs parallel sessions.
+  - Strict mode keeps rejecting each one until it lands with its tests (P5-8).
 - [ ] **P5-7: the drafts' `vm.*` helpers.**
   - `vm.timestamp` is the request's time, passed in by the host, fixed for the run and recorded, so runs stay
     replayable.
@@ -290,7 +295,7 @@ those steps is recorded, so a world decision is as checkable as an answer.
 - [ ] **P5-8: off the blocklist one by one.** Each opcode or function that lands leaves the strict-mode blocklist,
   with its regression test, and `validate` (P0-3) reports it as executing.
 
-**Order:** P5-1, then P5-2's first three calls, then P5-3, P5-4, and P5-6's specs.
+**Order:** P5-1, then P5-2's first three calls, then P5-3, P5-4 and P5-6 (approved).
 
 The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
 

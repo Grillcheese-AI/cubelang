@@ -5,7 +5,8 @@ names, plus **UNIFY**, which logs "UNIFY a b" and does nothing (it bypasses `tra
 P5's count). None has a working version in cubemind's Python VM either. The starting points are the one-line
 comments in `opcode-vsa-rs/src/ir.rs` and the surface syntax in `docs/SPEC.md`.
 
-**Nick approves each opcode's paragraph (or changes it) before any code.** Until then, strict mode rejects them.
+**Approved by Nick on 2026-11-10, all thirteen as written** ("I approve"). Each opcode leaves strict mode's
+blocklist only when it lands with its tests (P5-8).
 
 **What it brings, in plain words:** every instruction Cubby's programs can use will either do exactly what its
 paragraph says, or refuse to compile. None will look like it worked while doing nothing.
