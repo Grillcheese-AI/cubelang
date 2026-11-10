@@ -3,9 +3,11 @@
 //! deprecated statements without reading the entities). Main values only; qualifiers' values are not indexed.
 //! Written as a stream from rows sorted by `spill` (more rows than memory holds).
 //!
-//!   "WDREVRS\0" | u32 version | u64 keys | u64 keys_at | postings... | keys
+//!   "WDREVRS\0" | u32 version | u64 keys | u64 keys_at | u64 by_value_at | postings... | keys | keys by value
 //!   postings: per key, varint (gap << 3 | best << 2 | rank) over the subjects' (kind << 36 | number)
 //!   keys: (pid u32, value id u64, postings offset u64, count u32)* sorted by (pid, value id), 24 bytes each
+//!   keys by value: the same keys sorted by (value id, pid), over the same postings: every entity pointing at a
+//!   value, whatever the property (`pointing_at`)
 //!
 //! A subject twice under one key (two statements, same property and value) is listed twice: a gap of 0.
 
@@ -15,8 +17,8 @@ use crate::codec::{Buf, R, W};
 use crate::model::*;
 
 pub const MAGIC: &[u8; 8] = b"WDREVRS\0";
-pub const VERSION: u32 = 3;
-const HEAD: usize = 8 + 4 + 8 + 8;
+pub const VERSION: u32 = 4;
+const HEAD: usize = 8 + 4 + 8 + 8 + 8;
 const KEY: usize = 4 + 8 + 8 + 4;
 
 pub fn order(e: Eid) -> u64 { let (k, n, _) = e.parts(); (k as u64) << 36 | n }
@@ -76,11 +78,15 @@ impl RevWriter {
         self.close_key();
         let keys_at = self.pos;
         self.f.write_all(&self.keys).map_err(|e| e.to_string())?;
+        let mut by_value: Vec<&[u8]> = self.keys.chunks_exact(KEY).collect();
+        by_value.sort_by_key(|k| (u64::from_le_bytes(k[4..12].try_into().unwrap()), u32::from_le_bytes(k[0..4].try_into().unwrap())));
+        for k in &by_value { self.f.write_all(k).map_err(|e| e.to_string())?; }
+        let by_value_at = keys_at + self.keys.len() as u64;
         let mut f = self.f.into_inner().map_err(|e| e.to_string())?;
         f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut h = Vec::with_capacity(HEAD);
         h.extend_from_slice(MAGIC); h.extend_from_slice(&VERSION.to_le_bytes());
-        h.extend_from_slice(&self.nkeys.to_le_bytes()); h.extend_from_slice(&keys_at.to_le_bytes());
+        h.extend_from_slice(&self.nkeys.to_le_bytes()); h.extend_from_slice(&keys_at.to_le_bytes()); h.extend_from_slice(&by_value_at.to_le_bytes());
         f.write_all(&h).map_err(|e| e.to_string())?;
         Ok(self.nkeys)
     }
@@ -90,21 +96,23 @@ impl RevWriter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit { pub subject: Eid, pub rank: Rank, pub best: bool }
 
-pub struct Reverse { b: Buf, keys: usize, keys_at: usize }
+pub struct Reverse { b: Buf, keys: usize, keys_at: usize, by_value_at: usize }
 
 impl Reverse {
     pub fn open(b: Buf) -> Result<Reverse, String> {
         if b.len() < HEAD || &b[..8] != MAGIC { return Err("not a reverse index".into()); }
         if u32::from_le_bytes(b[8..12].try_into().unwrap()) != VERSION { return Err("reverse index version".into()); }
         let mut r = R::at(&b, 12);
-        let (keys, keys_at) = (r.u64le()? as usize, r.u64le()? as usize);
-        if keys_at + KEY * keys != b.len() { return Err("reverse index truncated".into()); }
-        Ok(Reverse { b, keys, keys_at })
+        let (keys, keys_at, by_value_at) = (r.u64le()? as usize, r.u64le()? as usize, r.u64le()? as usize);
+        if keys_at + 2 * KEY * keys != b.len() || by_value_at != keys_at + KEY * keys { return Err("reverse index truncated".into()); }
+        Ok(Reverse { b, keys, keys_at, by_value_at })
     }
     pub fn keys(&self) -> usize { self.keys }
 
-    fn key(&self, k: usize) -> (u32, u64, usize, u32) {
-        let o = self.keys_at + KEY * k;
+    fn key(&self, k: usize) -> (u32, u64, usize, u32) { self.key_at(self.keys_at, k) }
+
+    fn key_at(&self, table: usize, k: usize) -> (u32, u64, usize, u32) {
+        let o = table + KEY * k;
         let b = &self.b;
         (u32::from_le_bytes(b[o..o + 4].try_into().unwrap()), u64::from_le_bytes(b[o + 4..o + 12].try_into().unwrap()),
          u64::from_le_bytes(b[o + 12..o + 20].try_into().unwrap()) as usize, u32::from_le_bytes(b[o + 20..o + 24].try_into().unwrap()))
@@ -124,6 +132,23 @@ impl Reverse {
             }
         }
         Ok(vec![])
+    }
+
+    /// Every entity with a statement whose main value is `value`, whatever the property: (pid, hit), by pid then id.
+    pub fn pointing_at(&self, value: Eid) -> Result<Vec<(u32, Hit)>, String> {
+        let (mut lo, mut hi) = (0, self.keys);
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            if self.key_at(self.by_value_at, m).1 < value.0 { lo = m + 1 } else { hi = m }
+        }
+        let mut out = Vec::new();
+        while lo < self.keys {
+            let (p, v, off, n) = self.key_at(self.by_value_at, lo);
+            if v != value.0 { break; }
+            out.extend(self.list(off, n)?.into_iter().map(|h| (p, h)));
+            lo += 1;
+        }
+        Ok(out)
     }
 
     fn list(&self, off: usize, n: u32) -> Result<Vec<Hit>, String> {

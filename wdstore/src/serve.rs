@@ -7,6 +7,7 @@
 //!        in another state answers {"error": "snapshot_not_held"} and nothing else.
 //!   {"op": "name", "text": "Douglas Adams"}             every hot entity the name may mean, in id order
 //!   {"op": "who", "pid": 31, "value": "Q5"}              the hot entities with that main value, with their ranks
+//!   {"op": "pointing_at", "value": "Q5"}                 the hot entities pointing at it, whatever the property
 //!   {"op": "resolve", "id": "Q7"}                        the id that remains
 //!   {"op": "labels", "ids": ["Q5", "P31"], "lang": "en"} each entity's label in that language (absent: none)
 //! The store never reads a clock: a date is always the request's.
@@ -72,6 +73,8 @@ fn answer(st: &Store, snap: &str, r: &J) -> Result<J, String> {
             let pid = r.get("pid").and_then(J::as_u64).ok_or("pid")? as u32;
             json!({"hits": st.who(pid, id("value")?)?.iter().map(|h| json!([h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()})
         }
+        "pointing_at" => json!({"hits": st.pointing_at(id("value")?)?.iter()
+            .map(|(p, h)| json!([p, h.subject.text(), h.rank as u8, h.best])).collect::<Vec<_>>()}),
         "labels" => {
             let lang = r.get("lang").and_then(J::as_str).unwrap_or("en");
             let mut m = serde_json::Map::new();

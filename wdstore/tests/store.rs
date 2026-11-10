@@ -322,3 +322,11 @@ fn serve_answers_each_request_line_as_of_a_date_and_refuses_a_snapshot_it_does_n
     assert_eq!(a[5]["Q42"], "Douglas Adams");
     assert!(a[5].get("Q44").is_none() && a[6]["error"].as_str().unwrap().contains("unknown op"));
 }
+
+#[test]
+fn every_entity_pointing_at_a_value_whatever_the_property() {
+    let (_, st) = built("pointing");
+    let hits = st.pointing_at(q("Q5")).unwrap();
+    assert_eq!(hits.iter().map(|(p, h)| (*p, h.subject)).collect::<Vec<_>>(), vec![(31, q("Q44")), (31, q("Q45"))]);
+    assert!(st.pointing_at(q("Q999")).unwrap().is_empty());
+}

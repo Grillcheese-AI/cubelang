@@ -98,6 +98,9 @@ impl Store {
     /// Every hot entity with a statement `pid` = `value` (main values; at every rank, each hit says its rank).
     pub fn who(&self, pid: u32, value: Eid) -> Result<Vec<Hit>, String> { self.reverse.who(pid, value) }
 
+    /// Every hot entity with a statement whose main value is `value`, whatever the property: (pid, hit).
+    pub fn pointing_at(&self, value: Eid) -> Result<Vec<(u32, Hit)>, String> { self.reverse.pointing_at(value) }
+
     /// Every hot entity a name may mean (exact, else accent-folded, else a bounded typo), in id order, never by fame.
     pub fn name(&self, s: &str) -> Result<Found, String> { self.names.lookup(s) }
 
