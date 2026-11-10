@@ -256,7 +256,8 @@ same question can be run again later against the same copy and give the same ans
   - **Who opens the connection.** The host does, and hands the VM the result. In CubbyLLM this is `cubby_serve`'s
     fetchers, by Nick's rule of 2026-10-22 (what fetches lives in the server and hands the core a fetch function).
     For the standalone `cubelang` command, a built-in fetcher can be attached with an explicit flag. The VM's core
-    has no network client of its own, so a program can only reach what the run was granted.
+    has no network client of its own, so a program can only reach what the run was granted. Nick confirmed this
+    design on 2026-11-10 ("I'll pick your safe way"): the socket stays out of the VM.
   - **Off by default.** A program must `use source`, and the request names the sources the run may reach. A call
     to a source outside that list is refused with a code before any connection is made.
   - **What the report records** for each call, which is what a `cheez:SourceRead` needs: the source's id and
