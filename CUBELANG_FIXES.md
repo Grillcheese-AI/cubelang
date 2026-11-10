@@ -162,6 +162,57 @@ CubbyLLM's call: orders 0062 (sandboxed helpers) and 0063 (split questions) say 
 This file's global invariant holds for every item: `cargo test` green, a regression test per fix, opcode byte values
 unchanged.
 
+---
+
+## P4 — The run report CheezML needs, kept confidential (Cowork, 2026-11-10; Nick's yes)
+
+CubbyLLM's host turns every VM run into a CheezML record (vocabulary: https://w3id.org/cheezml/; CubbyLLM order
+0064). A record may only state what ran, so the run report must carry it. Today `RunResult` and `BranchReport`
+(`proto/reasoning.proto`) give the outcome, ops, jumps, budgets, wall time, each QUERY's key and hit count, and each
+recover with its runner-up and margin. That is not enough for a certificate. Nick also asked that the answers stay
+confidential: "it should also be encrypted so not everyone can see the answers".
+
+**In plain words:** the VM says exactly which facts it read and which checks passed, so Cubby's receipt is built
+from what really happened, and that receipt stays private.
+- **Over a conventional model:** a model cannot say which facts it used; it can only explain afterwards.
+
+New fields are added to the proto without renumbering or changing existing ones.
+
+- [ ] **P4-1: the facts read.** Each QUERY and RECALL reports the facts it matched, not only a count: each one's id
+  (the knowledge line's key and its position), its `source`, and its revision or content hash. A store hit with no
+  source is reported as such, never filled in.
+- [ ] **P4-2: the checks that ran.** Every COMPARE and every guard reports, in order: the relation, the operands (by
+  register name, with values only as hashes) and the result. The host maps them to the checks it declared. A check
+  that did not run leaves no entry.
+- [ ] **P4-3: the rules applied.** When a run applies a rule (a rule-library program or a folded rule), it reports
+  one line per step: the rule's id or hash, the conclusion, the premises. This is the shape of CubbyLLM 0055's
+  derivations file (asserted, derivations, digest), so a separate checker can re-check it.
+- [ ] **P4-4: errors as codes.** `RunResult.error` becomes a closed enum (budget exceeded, naming which; compile
+  error; strict-mode reject; runtime fault by kind; an empty program). Free text is kept only in a debug field that
+  the host never writes into a record.
+- [ ] **P4-5: what ran.** The report carries the sha-256 of the source and of the compiled bytecode, whether strict
+  mode was on, and the VM's version and commit.
+- [ ] **P4-6: nothing compiled is an error.** A program that compiles to no bytecode fails the run (see P3-1). It is
+  never an ok result.
+- [ ] **P4-7: a hash of the report.** The host gets a sha-256 over a canonical encoding of the report (wall time
+  left out, so the same run gives the same hash). Test: the same request twice gives the same hash.
+- [ ] **P4-8: confidentiality.**
+  - **No values in logs.** The VM never writes a question, an answer, a fact's text or a recovered symbol to its
+    logs or stderr. Debug output that does is behind an explicit development flag that a release build rejects.
+  - **No plain text over a network.** `run-proto` stays on a local pipe or socket. If it ever listens on a network
+    address, it requires TLS with client certificates and refuses a plain connection.
+  - **Values by hash in the report.** The report carries ids and hashes. A value appears only where the host needs
+    it for the answer: the result, and an ASK's question and candidates.
+  - **Knowledge isolation.** The resident process caches parsed stores by (path, mtime). The host passes an allowed
+    root per tenant; a `knowledge_path` outside it is refused, and the cache is never shared between roots. A
+    branch's `assume` facts are never persisted.
+  - **Tests:** a run over planted secret strings leaves none of them in logs, stderr or the report's debug-free
+    fields; a plain connection to a network listener is refused; a knowledge path outside its root is refused.
+- [ ] **P4-9: what stays on the host side** (CubbyLLM 0064, not this repo): encrypting the records at rest, signing
+  them, and who may read them. The VM's part is to leak nothing on the way there.
+
+The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
+
 ## Notes
 - The QC pilot ships on P0 + P1 only. P2 is the path to richer programs later.
 - `examples/qc_decision.cube` is the reference safe-subset program; keep it
