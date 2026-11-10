@@ -294,8 +294,19 @@ those steps is recorded, so a world decision is as checkable as an answer.
   - `vm.deploy_from_file`, `vm.start_from_file`, `vm.wire` and `vm.bridge` stay with P3-1 (containers).
 - [ ] **P5-8: off the blocklist one by one.** Each opcode or function that lands leaves the strict-mode blocklist,
   with its regression test, and `validate` (P0-3) reports it as executing.
+- [ ] **P5-9: every vector carries its kind** (Nick's yes, 2026-11-10). The Rust VM's vectors are MAP-bipolar, and
+  MoWM's and cubemind's are block codes. The two must never meet by accident.
+  - Every vector value carries its family (`map-bipolar` or `block-code`), its size (D, or k × l) and the
+    codebook's seed.
+  - Binding, bundling, similarity or cleanup across two families or two sizes fails with a new code,
+    `VectorFamilyMismatch` (added to P4-4's list). It never returns a similarity.
+  - Vectors that arrive from the host (P5-1) say their family; MoWM's are block codes.
+  - The run report lists the families each run used (P4).
+  - **Tests:** a mixed-family bind fails with the code; a same-family bind works; the report names the family.
+  - The opcode bytes don't change. The family goes in the value's tag, so stored memories keep their format.
+  - Which family the VM should use in the end is measured first, in CubbyLLM 0046's R9.
 
-**Order:** P5-1, then P5-2's first three calls, then P5-3, P5-4 and P5-6 (approved).
+**Order:** P5-1 with P5-9, then P5-2's first three calls, then P5-3, P5-4 and P5-6 (approved).
 
 The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
 
