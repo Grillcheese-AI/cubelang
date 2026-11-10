@@ -7,7 +7,7 @@
 //! wdstore name <dir> "Douglas Adams"          every hot entity the name may mean, in id order
 //! wdstore resolve <dir> <ids.txt>            each id: hot / cold / missing, or the id it redirects to
 //! wdstore dump <dir> <ids.txt|all>             entities as stored, one JSON line each
-//! wdstore bench <dir>                         lookup latency over a spread of ids
+//! wdstore bench <dir> [offset]                lookup latency over a spread of ids, hot and cold apart
 //! wdstore bunzip <out> <parts>...             the parts as one bzip2 file, decoded on every core
 //! wdstore check <dir>                         every chunk re-written to the same bytes, the indexes rebuilt, hashes
 
@@ -146,7 +146,8 @@ fn main() {
             for (us, b, head) in times.iter().take(12) { println!("  {:>8} ms  {:>9} bytes  {head}", us / 1000, b); }
             Ok(())
         }
-        Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
+        Some("bench") if a.len() == 2 || a.len() == 3 => Store::open(&a[1])
+            .and_then(|s| bench(&s, a.get(2).map(|x| x.parse().unwrap_or(0)).unwrap_or(0))),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: see the head of src/main.rs".into()),
     };
@@ -154,24 +155,29 @@ fn main() {
 }
 
 /// Lookup latency over about 20,000 ids spread over the store, read twice: the first pass from the disk (pages not
-/// yet in memory: the order's "from SSD"), the second from the page cache. Then one hot name per entity, the same way.
-fn bench(s: &Store) -> Result<(), String> {
-    let n = s.ids(1).len();
-    let ids = s.ids((n / 20_000).max(1));
-    let pct = |mut v: Vec<u128>| { v.sort(); let at = |p: usize| v[(v.len() - 1) * p / 100];
+/// yet in memory: the order's "from SSD"), the second from the page cache; the hot store and the cold set apart (they
+/// may sit on different disks). Then one hot name per entity, the same way. `offset` picks another spread of ids, so a
+/// rerun reads pages the last run did not bring into memory.
+fn bench(s: &Store, offset: usize) -> Result<(), String> {
+    let all = s.ids(1);
+    let step = (all.len() / 20_000).max(1);
+    let ids: Vec<_> = all.iter().skip(offset % step).step_by(step).cloned().collect();
+    drop(all);
+    let pct = |mut v: Vec<u128>| { if v.is_empty() { return "none".to_string(); } v.sort(); let at = |p: usize| v[(v.len() - 1) * p / 100];
         format!("p50 {} us, p95 {} us, p99 {} us (n {})", at(50), at(95), at(99), v.len()) };
     let mut labels = Vec::new();
     for pass in ["from disk", "cached"] {
-        let mut get = Vec::with_capacity(ids.len());
+        let (mut hot, mut cold_t) = (Vec::with_capacity(ids.len()), Vec::new());
         for &id in &ids {
             let t = std::time::Instant::now();
             let (cold, e) = s.locate(id)?.ok_or("an indexed id not found")?;
-            get.push(t.elapsed().as_micros());
+            if cold { cold_t.push(t.elapsed().as_micros()) } else { hot.push(t.elapsed().as_micros()) }
             if pass == "from disk" && !cold {
                 if let Some(x) = e.names.iter().find(|x| x.kind != wdstore::model::NameKind::Description) { labels.push(x.text.clone()); }
             }
         }
-        println!("get by id, {pass}: {}", pct(get));
+        println!("get by id, hot, {pass}: {}", pct(hot));
+        println!("get by id, cold set, {pass}: {}", pct(cold_t));
     }
     for pass in ["from disk", "cached"] {
         let mut name = Vec::with_capacity(labels.len());
