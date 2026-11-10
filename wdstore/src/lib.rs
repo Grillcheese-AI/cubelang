@@ -5,6 +5,7 @@
 //! entity's revision (recorded time), its EN/FR/mul names and its enwiki/frwiki titles; plus the value and reference
 //! nodes and the redirects. `FORMAT.md` describes the files.
 //!
+//! - `bz2par`: the dump's bzip2 decoded on every core, block by block, in order.
 //! - `turtle`: the dump's Turtle, token by token.
 //! - `ingest`: one entity's block -> what the store keeps.
 //! - `chunk`, `nodes`, `codec`: the entity chunks and the value and reference node files, written so a rebuild
@@ -15,6 +16,7 @@
 //! - `build`: inputs -> chunks + a manifest with every input's, chunk's and the code's hash.
 
 pub mod build;
+pub mod bz2par;
 pub mod chunk;
 pub mod codec;
 pub mod ingest;

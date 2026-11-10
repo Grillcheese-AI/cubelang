@@ -44,6 +44,19 @@ fn main() {
             wdstore::names::Found::TooMany(n) => println!("too many near names (over {n}): ask"),
             wdstore::names::Found::None => println!("no entity bears this name"),
         }),
+        Some("bunzip") if a.len() >= 3 => {
+            // wdstore bunzip <out> <parts>...: the parts as one bzip2 file, decoded on every core
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&a[1]).map_err(|e| e.to_string()).unwrap());
+            let t0 = std::time::Instant::now();
+            let mut n = 0u64;
+            wdstore::bz2par::decode_parts(&a[2..], threads, 64 << 20, |t| {
+                n += t.len() as u64; std::io::Write::write_all(&mut f, t).map_err(|e| e.to_string())
+            }).map(|c| {
+                let s = t0.elapsed().as_secs_f64();
+                eprintln!("{c} bytes in, {n} out, {s:.1} s: {:.1} MB/s in, {:.1} MB/s out, {threads} threads", c as f64 / s / 1e6, n as f64 / s / 1e6);
+            })
+        }
         Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: wdstore build --out <dir> [--per-chunk N] <inputs>... | get <dir> <id> | check <dir>".into()),
