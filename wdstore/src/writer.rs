@@ -22,6 +22,8 @@ pub struct Writer {
     out: String, prm: Params, cold_classes: Vec<Eid>, per_chunk: usize, logs: Logs, pending: [Vec<Entity>; 2],
     chunks: [u32; 2], bytes: [u64; 2], ids: BufWriter<std::fs::File>, redirects: BufWriter<std::fs::File>,
     chunk_log: BufWriter<std::fs::File>, lens: [u64; 3], runs: [Runs; 3], pub st: Stats,
+    /// Where the writer's time goes, in ms: ingest (all cores), nodes, rows, chunks, checkpoints.
+    pub ms: [u128; 5],
 }
 
 fn append(path: &str, keep: Option<u64>) -> Result<BufWriter<std::fs::File>, String> {
@@ -31,8 +33,12 @@ fn append(path: &str, keep: Option<u64>) -> Result<BufWriter<std::fs::File>, Str
     }.map_err(|e| format!("{path}: {e}"))?;
     let mut f = f;
     std::io::Seek::seek(&mut f, std::io::SeekFrom::End(0)).map_err(|e| e.to_string())?;
-    Ok(BufWriter::new(f))
+    Ok(BufWriter::with_capacity(8 << 20, f))
 }
+
+/// Where the cold set's chunks go: `WDSTORE_COLD_DIR`, else the store's own folder. A store whose cold chunks are
+/// elsewhere says where in `cold_dir.txt` (a local path, in the store's folder only).
+pub fn cold_dir(out: &str) -> String { std::env::var("WDSTORE_COLD_DIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| out.to_string()) }
 
 fn sync(w: &mut BufWriter<std::fs::File>) -> Result<(), String> {
     w.flush().map_err(|e| e.to_string())?; w.get_ref().sync_data().map_err(|e| e.to_string())
@@ -42,11 +48,16 @@ impl Writer {
     pub fn create(out: &str, scratch: &str, prm: Params, cold_classes: Vec<Eid>, per_chunk: usize) -> Result<Writer, String> {
         std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+        let cold = cold_dir(out);
+        if cold != out {
+            std::fs::create_dir_all(&cold).map_err(|e| e.to_string())?;
+            std::fs::write(format!("{out}/cold_dir.txt"), &cold).map_err(|e| e.to_string())?;
+        }
         let logs = Logs { values: NodeLog::create(&format!("{out}/values.wds"), 0)?, refs: NodeLog::create(&format!("{out}/refs.wds"), 1)? };
         Ok(Writer { prm, cold_classes, per_chunk, logs, pending: [vec![], vec![]], chunks: [0, 0], bytes: [0, 0],
             ids: append(&format!("{out}/ids.log"), None)?, redirects: append(&format!("{out}/redirects.log"), None)?,
             chunk_log: append(&format!("{out}/chunks.log"), None)?, lens: [0; 3],
-            runs: RUNS.map(|n| Runs::new(scratch, n, SORT_MEM / 3)), st: Stats::default(), out: out.into() })
+            runs: RUNS.map(|n| Runs::new(scratch, n, SORT_MEM / 3)), st: Stats::default(), out: out.into(), ms: [0; 5] })
     }
 
     pub fn restore(out: &str, scratch: &str, prm: Params, cold_classes: Vec<Eid>, per_chunk: usize, c: &Ckpt) -> Result<Writer, String> {
@@ -57,7 +68,7 @@ impl Writer {
         Ok(Writer { prm, cold_classes, per_chunk, logs, pending: [vec![], vec![]], chunks: c.chunks, bytes: c.bytes,
             ids: append(&format!("{out}/ids.log"), Some(c.ids))?, redirects: append(&format!("{out}/redirects.log"), Some(c.redirects))?,
             chunk_log: append(&format!("{out}/chunks.log"), Some(c.chunk_log))?, lens: [c.ids, c.redirects, c.chunk_log],
-            runs, st: c.stats.clone(), out: out.into() })
+            runs, st: c.stats.clone(), out: out.into(), ms: [0; 5] })
     }
 
     fn cold(&self, e: &Entity) -> bool {
@@ -68,6 +79,7 @@ impl Writer {
     pub fn add(&mut self, b: Block) -> Result<(), String> {
         for (k, v) in b.skipped { *self.st.skipped.entry(k).or_default() += v; }
         if let Some(d) = b.dump_date { self.st.dump_date = d; }
+        let t = std::time::Instant::now();
         for n in &b.value_nodes { self.logs.values.define_value(n)?; }
         for n in &b.ref_nodes { self.logs.refs.define_ref(n, &mut self.logs.values)?; }
         for (a, c) in &b.redirects {
@@ -82,6 +94,8 @@ impl Writer {
             self.st.hot_qualifiers += s.hot_qualifiers.len() as u64; self.st.cold_qualifiers += s.cold_qualifiers.len() as u64;
             self.st.references += s.references.len() as u64;
         }
+        self.ms[1] += t.elapsed().as_micros();
+        let t = std::time::Instant::now();
         let set = self.cold(&e) as usize;
         self.st.entities[set] += 1; self.st.statements[set] += e.statements.len() as u64; self.st.names += e.names.len() as u64;
         if set == 0 {
@@ -89,6 +103,7 @@ impl Writer {
             for (k, rs) in crate::names::rows(&e).into_iter().enumerate() { for r in rs { self.runs[1 + k].push(r)?; } }
         }
         self.pending[set].push(e);
+        self.ms[2] += t.elapsed().as_micros();
         if self.pending[set].len() >= self.per_chunk { self.flush(set)?; }
         Ok(())
     }
@@ -96,6 +111,7 @@ impl Writer {
     fn flush(&mut self, set: usize) -> Result<(), String> {
         let mut ents = std::mem::take(&mut self.pending[set]);
         if ents.is_empty() { return Ok(()); }
+        let t = std::time::Instant::now();
         ents.sort_by_key(|e| e.id);
         let before = ents.len();
         ents.dedup_by_key(|e| e.id);
@@ -111,19 +127,24 @@ impl Writer {
             }
             self.lens[0] += 16;
         }
-        std::fs::write(format!("{}/{name}", self.out), &bytes).map_err(|e| format!("{name}: {e}"))?;
+        let dir = if set == 1 { cold_dir(&self.out) } else { self.out.clone() };
+        std::fs::write(format!("{dir}/{name}"), &bytes).map_err(|e| format!("{name}: {e}"))?;
         let line = format!("{{\"file\": {}, \"bytes\": {}, \"blake3\": {}, \"entities\": {}}}\n", j(&name), bytes.len(),
                            j(&blake3::hash(&bytes).to_hex().to_string()), ents.len());
         self.chunk_log.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         self.lens[2] += line.len() as u64;
         self.bytes[set] += bytes.len() as u64;
         self.chunks[set] += 1;
+        self.ms[3] += t.elapsed().as_micros();
         Ok(())
     }
 
     /// Ingests a text holding whole entity blocks, on `threads` threads, and adds the blocks in order.
     pub fn text(&mut self, text: &str, threads: usize) -> Result<(), String> {
-        for r in ingest_all(text, &self.prm, threads) {
+        let t = std::time::Instant::now();
+        let all = ingest_all(text, &self.prm, threads);
+        self.ms[0] += t.elapsed().as_micros();
+        for r in all {
             self.st.blocks += 1;
             match r { Ok(b) => self.add(b)?, Err(e) => { self.st.failed_n += 1; if self.st.failed.len() < 20 { self.st.failed.push(e); } } }
         }
@@ -133,12 +154,20 @@ impl Writer {
     /// Everything written through and synced, then the checkpoint saved: the text resumes at `bit`, `skip` bytes in.
     pub fn checkpoint(&mut self, key: &str, bit: u64, skip: u64, batches: u64) -> Result<(), String> {
         self.flush(0)?; self.flush(1)?;
+        let t = std::time::Instant::now();
         for w in [&mut self.ids, &mut self.redirects, &mut self.chunk_log] { sync(w)?; }
         let runs = [self.runs[0].state()?, self.runs[1].state()?, self.runs[2].state()?];
+        self.ms[4] += t.elapsed().as_micros();
         let c = Ckpt { key: key.into(), block_bit: bit, skip, batches, values: Some(self.logs.values.state()?), refs: Some(self.logs.refs.state()?),
                        ids: self.lens[0], redirects: self.lens[1], chunk_log: self.lens[2], chunks: self.chunks, bytes: self.bytes, runs,
                        stats: self.st.clone() };
         c.save(&self.out)
+    }
+
+    /// The time so far by phase (ms): ingest on every core, nodes, rows, chunks, checkpoints.
+    pub fn times(&self) -> String {
+        let [a, b, c, d, e] = self.ms.map(|x| x / 1000);
+        format!("ingest {a} ms, nodes {b}, rows {c}, chunks {d}, checkpoints {e}")
     }
 
     fn read_pairs(path: &str) -> Result<Vec<[u8; 16]>, String> {

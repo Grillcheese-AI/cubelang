@@ -93,8 +93,8 @@ pub fn build_batched(inputs: &[String], out: &str, scratch: &str, per_chunk: usi
         return w.finish(names, t0);
     }
     let sizes: Vec<u64> = inputs.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).map_err(|e| e.to_string())).collect::<Result<_, _>>()?;
-    let key = format!("code {} per_chunk {per_chunk} cold {:?} parts {} bytes {} batch {batch} every {every}", crate::code_hash(),
-                      cold.iter().map(|c| c.text()).collect::<Vec<_>>(), inputs.len(), sizes.iter().sum::<u64>());
+    let key = format!("code {} per_chunk {per_chunk} cold {:?} cold_dir {} parts {} bytes {} batch {batch} every {every}", crate::code_hash(),
+                      cold.iter().map(|c| c.text()).collect::<Vec<_>>(), crate::writer::cold_dir(out), inputs.len(), sizes.iter().sum::<u64>());
     let ck = Ckpt::load(out, &key)?;
     let (mut w, start_bit, mut skip, mut batches) = match &ck {
         Some(c) => { eprintln!("  resuming: {} batches done, from bit {}", c.batches, c.block_bit);
@@ -125,7 +125,7 @@ pub fn build_batched(inputs: &[String], out: &str, scratch: &str, per_chunk: usi
         if batches % every == 0 {
             let (b, _) = *held.front().ok_or("no block holds the next entity")?;
             w.checkpoint(&key, b, head as u64, batches)?;
-            eprintln!("  checkpoint: {batches} batches, {} entities, {} s", w.st.entities[0] + w.st.entities[1], t0.elapsed().as_secs());
+            eprintln!("  checkpoint: {batches} batches, {} entities, {} s; {}", w.st.entities[0] + w.st.entities[1], t0.elapsed().as_secs(), w.times());
             if stop_after.is_some_and(|s| batches >= s) { stopped = true; }
         }
         Ok(())

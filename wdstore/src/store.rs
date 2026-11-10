@@ -23,6 +23,11 @@ pub fn write_redirects(r: &[(Eid, Eid)]) -> Vec<u8> {
     b
 }
 
+/// Where a store's cold chunks are: the folder `cold_dir.txt` names, else the store's own.
+pub fn cold_of(dir: &str) -> String {
+    std::fs::read_to_string(format!("{dir}/cold_dir.txt")).map(|s| s.trim().to_string()).unwrap_or_else(|_| dir.to_string())
+}
+
 fn read(dir: &str, name: &str) -> Result<Buf, String> { Buf::map(&format!("{dir}/{name}")) }
 
 /// A sorted table of fixed rows whose first 8 bytes are a u64 key, searched in place.
@@ -44,8 +49,9 @@ impl Store {
     pub fn open(dir: &str) -> Result<Store, String> {
         let mut chunks = [Vec::new(), Vec::new()];
         for (s, set) in ["hot", "cold"].iter().enumerate() {
+            let base = if s == 1 { cold_of(dir) } else { dir.to_string() };
             for k in 0.. {
-                let p = format!("{dir}/chunk_{set}_{k:05}.wds");
+                let p = format!("{base}/chunk_{set}_{k:05}.wds");
                 if !std::path::Path::new(&p).exists() { break; }
                 chunks[s].push(Buf::map(&p)?);
             }
@@ -127,7 +133,8 @@ impl Store {
         let mut n = [0usize; 2];
         for (s, set) in ["hot", "cold"].iter().enumerate() {
             for (k, b) in self.chunks[s].iter().enumerate() {
-                has(&format!("chunk_{set}_{k:05}.wds"))?;
+                let h = blake3::hash(b).to_hex().to_string();
+                if !man.contains(&h) { return Err(format!("chunk_{set}_{k:05}.wds: hash {h} is not the manifest's")); }
                 let ents = chunk::Reader::open(b)?.read_all(&self.nodes)?;
                 if *chunk::write(&ents, &ix)? != **b { return Err(format!("chunk {set} {k}: re-writing differs")); }
                 n[s] += ents.len();

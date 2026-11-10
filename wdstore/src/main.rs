@@ -20,7 +20,7 @@ fn main() {
     let r = match a.first().map(String::as_str) {
         Some("build") => {
             let (mut out, mut scratch, mut per, mut cold, mut th, mut ins) = (None, None, 100_000usize, "Q13442814".to_string(), threads(), Vec::new());
-            let (mut every, mut stop) = (32u64, None);
+            let (mut every, mut stop) = (64u64, None);
             let mut it = a[1..].iter();
             while let Some(x) = it.next() {
                 match x.as_str() {

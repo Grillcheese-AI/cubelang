@@ -43,9 +43,9 @@ pub struct LogState { pub pos: u64, pub num_pos: u64, pub defined: u64, pub dict
 
 impl NodeLog {
     pub fn create(path: &str, kind: u8) -> Result<NodeLog, String> {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
+        let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
         f.write_all(&[0u8; HEAD]).map_err(|e| e.to_string())?;
-        let num = std::io::BufWriter::new(std::fs::File::create(format!("{path}.num")).map_err(|e| format!("{path}.num: {e}"))?);
+        let num = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(format!("{path}.num")).map_err(|e| format!("{path}.num: {e}"))?);
         Ok(NodeLog { kind, map: HashMap::new(), first: vec![], extras: vec![], dict: Dict::default(), f, pos: HEAD as u64,
                      defined: 0, num, num_pos: 0 })
     }
@@ -87,8 +87,8 @@ impl NodeLog {
         }
         if r.i != rb.len() { return Err(format!("{path}: a record cut at the checkpoint")); }
         f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?; nf.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
-        Ok(NodeLog { kind, map, first, extras, dict: Dict::from_list(st.dict.clone()), f: std::io::BufWriter::new(f), pos: st.pos,
-                     defined: st.defined, num: std::io::BufWriter::new(nf), num_pos: st.num_pos })
+        Ok(NodeLog { kind, map, first, extras, dict: Dict::from_list(st.dict.clone()), f: std::io::BufWriter::with_capacity(8 << 20, f), pos: st.pos,
+                     defined: st.defined, num: std::io::BufWriter::with_capacity(8 << 20, nf), num_pos: st.num_pos })
     }
 
     pub fn len(&self) -> usize { self.first.len() }
