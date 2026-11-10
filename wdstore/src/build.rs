@@ -39,14 +39,26 @@ pub fn blocks(text: &str) -> impl Iterator<Item = &str> {
     starts.into_iter().zip(ends).map(move |(a, b)| &text[a..b]).filter(|t| !t.trim().is_empty())
 }
 
-/// The blocks of `text` ingested on `threads` threads, in order.
+/// The blocks of `text` ingested on `threads` threads, in order. Each thread takes the next block when it is free
+/// (a shared counter): the dump's large items sit together, and fixed shares left one thread with all of them while
+/// the others waited (1.2 of 12 cores busy, 2026-11-10).
 pub fn ingest_all(text: &str, prm: &Params, threads: usize) -> Vec<Result<Block, String>> {
     let bl: Vec<&str> = blocks(text).collect();
-    let per = bl.len().div_ceil(threads.max(1)).max(1);
-    std::thread::scope(|s| {
-        let hs: Vec<_> = bl.chunks(per).map(|part| s.spawn(move || part.iter().map(|b| ingest::block(b, prm)).collect::<Vec<_>>())).collect();
-        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-    })
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<Vec<(usize, Result<Block, String>)>> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads.max(1)).map(|_| s.spawn(|| {
+            let mut mine = Vec::new();
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= bl.len() { return mine; }
+                mine.push((i, ingest::block(bl[i], prm)));
+            }
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut out: Vec<Option<Result<Block, String>>> = (0..bl.len()).map(|_| None).collect();
+    for (i, r) in done.into_iter().flatten() { out[i] = Some(r); }
+    out.into_iter().map(|r| r.unwrap()).collect()
 }
 
 /// The release the parts are, from the download's `manifest.json` beside them (name, size, hash, the record, its

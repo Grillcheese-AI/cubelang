@@ -13,6 +13,11 @@
 
 use wdstore::{build, model::Eid, store::Store};
 
+/// mimalloc, not the system heap: ingest's threads allocate many small strings, and Windows' heap serialized them
+/// (1.2 of 12 cores busy in the full build, 2026-11-10).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn threads() -> usize { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) }
 
 fn main() {
@@ -115,6 +120,32 @@ fn main() {
                 "{{\"snapshot\": \"{}\", \"manifest\": \"{}\", \"changes\": {}, \"head\": \"{}\"}}", s.hash, s.manifest, s.changes, s.head))
         }
         Some("serve") if a.len() == 2 => wdstore::serve::serve(&a[1], std::io::stdin().lock(), std::io::stdout().lock()),
+        Some("probe") if a.len() >= 2 => {
+            // the parts' entities ingested one at a time, timed: the slowest, with their sizes
+            let mut carry: Vec<u8> = Vec::new();
+            let mut times: Vec<(u128, usize, String)> = Vec::new();
+            let prm = wdstore::ingest::Params::default();
+            let r = wdstore::bz2par::decode_parts(&a[1..], threads(), 64 << 20, |t| {
+                carry.extend_from_slice(t);
+                if let Some(cut) = carry.windows(6).rposition(|x| x == b"\ndata:").map(|i| i + 1) {
+                    let text = String::from_utf8_lossy(&carry[..cut]).to_string();
+                    for b in wdstore::build::blocks(&text) {
+                        let t0 = std::time::Instant::now();
+                        let _ = wdstore::ingest::block(b, &prm);
+                        times.push((t0.elapsed().as_micros(), b.len(), b.chars().take(24).collect()));
+                    }
+                    carry.drain(..cut);
+                }
+                Ok(())
+            });
+            if let Err(e) = r { eprintln!("(decoding stopped: {e})"); }
+            let total: u128 = times.iter().map(|x| x.0).sum();
+            let bytes: usize = times.iter().map(|x| x.1).sum();
+            times.sort_by(|x, y| y.0.cmp(&x.0));
+            println!("{} entities, {} MB, {} ms in all (one thread)", times.len(), bytes >> 20, total / 1000);
+            for (us, b, head) in times.iter().take(12) { println!("  {:>8} ms  {:>9} bytes  {head}", us / 1000, b); }
+            Ok(())
+        }
         Some("bench") if a.len() == 2 => Store::open(&a[1]).and_then(|s| bench(&s)),
         Some("check") if a.len() == 2 => Store::open(&a[1]).and_then(|s| s.check()).map(|m| println!("{m}")),
         _ => Err("usage: see the head of src/main.rs".into()),
