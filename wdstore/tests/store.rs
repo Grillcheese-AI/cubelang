@@ -379,3 +379,18 @@ fn cue_words_are_cut_as_cubbyllms_and_the_pass_writes_its_tables() {
     assert!(std::fs::read_to_string(format!("{k}/fictional.tsv")).unwrap().lines().any(|l| l == "Q14897293"));
     assert!(std::fs::read_to_string(format!("{k}/meta.tsv")).unwrap().contains(&wdstore::snapshot::at(&out, None).unwrap().hash));
 }
+
+#[test]
+fn subclasses_writes_every_best_subclass_edge_and_the_snapshot() {
+    // Q50 is a subclass of Q5 (best) and of Q6 (deprecated: not written)
+    let class = "data:Q50 a schema:Dataset ;\n\tschema:about wd:Q50 ;\n\tschema:version \"7\"^^xsd:integer .\n\n\
+wd:Q50 a wikibase:Item ;\n\tp:P279 wds:Q50-1, wds:Q50-2 .\nwds:Q50-1 a wikibase:Statement, wikibase:BestRank ;\n\twikibase:rank wikibase:NormalRank ;\n\tps:P279 wd:Q5 .\n\
+wds:Q50-2 a wikibase:Statement ;\n\twikibase:rank wikibase:DeprecatedRank ;\n\tps:P279 wd:Q6 .\n";
+    let (out, _) = built_with("subclasses", &format!("{HUMANS}\n{class}"), vec![]);
+    let st = wdstore::store::Store::open(&out).unwrap();
+    let k = format!("{out}/_subclasses");
+    wdstore::classes::subclasses(&st, &k).unwrap();
+    assert_eq!(std::fs::read_to_string(format!("{k}/subclass.tsv")).unwrap().trim(), "Q50\tQ5");
+    let meta = std::fs::read_to_string(format!("{k}/meta.tsv")).unwrap();
+    assert!(meta.contains(&wdstore::snapshot::at(&out, None).unwrap().hash) && meta.contains("edges\t1"));
+}

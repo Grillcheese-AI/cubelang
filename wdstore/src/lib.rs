@@ -25,6 +25,7 @@ pub mod asof;
 pub mod build;
 pub mod bz2par;
 pub mod chunk;
+pub mod classes;
 pub mod codec;
 pub mod cues;
 pub mod export;
