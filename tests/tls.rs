@@ -246,6 +246,29 @@ fn garbage_and_plain_tcp_do_not_stop_the_host() {
 }
 
 #[test]
+fn a_port_check_is_logged_as_one_and_not_as_a_refusal() {
+    let dir = temp("portcheck");
+    let (host_key, host_pin) = identity(&dir, "Host", "model");
+    let (client_key, client_pin) = identity(&dir, "Bridge", "agent");
+    let host = Host::start(&host_key, &[&client_pin]);
+    // what a supervisor does to see that the port answers: connect, then close without a byte
+    drop(std::net::TcpStream::connect(&host.addr).unwrap());
+    let lines = host.lines();
+    assert!(lines.iter().any(|l| l.contains("closed before the handshake")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("refused")), "{lines:?}");
+    // bytes that are no handshake are still refused, and the host serves on
+    let mut s = std::net::TcpStream::connect(&host.addr).unwrap();
+    let _ = s.write_all(&[0x16, 0x03, 0x01, 0xff, 0xff, 1, 2, 3]);
+    drop(s);
+    let lines = host.lines();
+    assert!(lines.iter().any(|l| l.contains("refused")), "{lines:?}");
+    let (results, ok, err) = relay(&host.addr, &client_key, &host_pin, &[request("after")]);
+    assert!(ok, "{err}");
+    assert_eq!(symbol(&results[0]), "after");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_network_leg_without_tls_or_pins_does_not_start() {
     let dir = temp("cli");
     let (host_key, host_pin) = identity(&dir, "Host", "model");

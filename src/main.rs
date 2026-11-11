@@ -1031,6 +1031,14 @@ fn serve_connection(stream: std::net::TcpStream, cfg: std::sync::Arc<rustls::Ser
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+    // A peer that connects and closes without a byte is a port check (a supervisor asking "is it up?"), not a
+    // client that was turned away: say so, so that every "refused" line in the log is a real refusal. A peer
+    // that sends nothing within the handshake's time is refused here, without waiting a second time.
+    match stream.peek(&mut [0u8; 1]) {
+        Ok(0) => { eprintln!("run-proto: {} closed before the handshake (a port check)", peer); return; }
+        Err(e) => { eprintln!("run-proto: {} refused: {}", peer, e); return; }
+        Ok(_) => {}
+    }
     let conn = match rustls::ServerConnection::new(cfg) {
         Ok(c) => c,
         Err(e) => { eprintln!("run-proto: {}: {}", peer, e); return; }
