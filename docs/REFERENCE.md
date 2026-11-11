@@ -34,6 +34,31 @@ block inside them (`config`, `io`, `storage` at container scope, `programs`,
 produces zero bytecode, unconditionally, in both loose and `--strict` mode.
 See `docs/DRIFT.md` §C for the confirming run.
 
+> **Superseded 2026-10-24.** Top-level `struct`/`enum`/`type` are read (§4), and a
+> `container`/`world`/`modal`/`robot` compiles to a program of its own name:
+> - its functions are the program's; the VM boots it (`VM::boot`): each bound program's
+>   `constructor`, its own `constructor`, then `on_start`;
+> - `config { k: v; }` is an immutable storage field `config`, a map of constants
+>   (`self.config.k`); `storage { }` / `global storage { }` are its storage; `world { }` is a
+>   storage field `world`, a map of the world's fields (`self.world.time`), each `immutable` one
+>   written only by the constructor and `on_start`;
+> - `programs { b: deploy P(); }` binds the programs it runs (`P`, `P.new()` also bind), called as
+>   `self.programs.b.f(x)` or `b.f(x)`. A call into another program, `Other.f(x)` from any
+>   program, is a CALL of `Other.f`: the VM admits it with the calling program as the caller
+>   (`@internal`, `@restricted`, grants, `@ratelimit`) and runs it as `Other`;
+> - `permissions { grant b.f to c; revoke b.f from c; }` is installed on load (`c` is a binding's
+>   program, or any caller name, such as a registered key holder);
+> - `safety { }` takes `max_jumps`, `max_ops`, `max_queries`, `max_wall_ms`, `max_call_depth` and
+>   `deny: ["ask", ...]` (opcode names): each run entered through the container runs under them
+>   (they tighten the VM's own and come off on return); a denied opcode is a compile error in
+>   the code the container can reach and a run-time refusal in any code it reaches. Any other
+>   safety key (a robot's `max_velocity`) is an error in every mode: a safety setting that is not
+>   enforced is worse than none.
+>
+> What the VM cannot run (`io`, `agents`, `modalities`, `sensors`, `actuators`, `fusion`,
+> `extends` another container, top-level `event` and `extend`) is a strict error. A file with a
+> container runs its container (`cubelang run`, `run-proto`). Pinned by `tests/containers.rs`.
+
 ## 2. Engine-provided interfaces (`ISolve`/`ISolver`/`ISolverLearn`/`IAgent`)
 
 Source of truth: `src/vm/interfaces.rs` (185 lines), `InterfaceRegistry`.
@@ -170,6 +195,16 @@ handles). This is documented as intentionally not scaling to hot inner loops
 (full register-map clone per call) — v2 real call frames are still on the
 roadmap, not built. `call_depth` is capped (see `ASK inside a CALL` below).
 
+> **2026-10-24:** a callee's arguments now bind to its declared parameter names
+> (before, only `arg0..argN`, so `helper(x)` read an unbound `x` and returned
+> `Int(0)`), and an `ASK` inside a callee suspends with the waiting callers'
+> frames (docs/ASK_SUSPEND.md). Registers are still copied per call; that
+> performance note stands. Storage fields are no longer set aside with the
+> caller's locals: a callee's `self.x` is the program's `x` (it read a fresh,
+> empty scope). A chain hops to a fresh native stack every 8 levels, so the
+> 64-level limit holds on any thread (a 64-deep chain had outgrown a 2 MiB
+> test thread). `Other.f(x)` calls another program (§1).
+
 ### 3.4 QUERY is real, not trace-only — a documentation-vs-source gap in the repo's own docs
 
 [src, `src/vm/engine.rs:575-616`, code comment: *"Was: read a register,
@@ -183,6 +218,22 @@ error and never a nearest-neighbour guess. `docs/ASK_SUSPEND.md`'s own table
 (current on disk) still lists QUERY as "trace-only — no retrieval"; that line
 is now stale relative to the source it lives beside. See `docs/DRIFT.md` §A.
 
+> **2026-10-24.** The store is layered: immutable segments shared by every
+> request and branch, under a small top layer (`docs/STORE.md`). Lookups answer
+> as the map did; a fork costs a pointer instead of a copy (1.2 s → 0.05 µs at
+> a million facts). `knowledge_path` also takes a prebuilt `.cubeseg`
+> (`cubelang knowledge build`). The conversation history is searchable from a
+> program with `use history;` (exact, prefix or typo-tolerant), and over
+> run-proto with `history_path`. A history directory can be sealed to one
+> identity and signed by it (`cubelang history seal`, `run-proto --history-key`;
+> ML-KEM-1024 + X25519, AES-256-GCM): `docs/SEAL.md`.
+>
+> **2026-10-25.** A history's turns can carry tags and meta, so a store built on
+> a history (a person's model transcripts, filed by session) is searchable per
+> session from the index: `search_tagged(tag, words)` in a program,
+> `history search --tag` and `history tags` on the command line. A directory has
+> one writer at a time (its `LOCK` file). `docs/STORE.md`, "Tags and meta".
+
 ### 3.5 ASK / Suspend — the third `ExecResult`
 
 [src, `src/vm/engine.rs:88-124` (`ExecResult`, `Suspension`), `981-1020`
@@ -194,11 +245,23 @@ never a human, per the doc) answers via `VM::resume(susp, answer)`, which
 **rejects** any answer not `==` one of the original candidates
 (`same_selection`, Int/Str/Bool/Float only — `Value` has no `PartialEq`
 because it holds `Hvec`, and "equal hypervectors" is a similarity question).
-`ASK` inside a `CALL` is a hard error (not supported): by the time a
-callee's suspension reaches the `CALL` arm, the caller's registers are
-already restored and `call_depth` unwound.
+`ASK` inside a `CALL` works since 2026-10-24: the suspension carries the
+waiting callers' frames (docs/ASK_SUSPEND.md).
 
 ## 4. Types
+
+> **2026-10-24: types are checked now** (`src/types.rs` has the rules;
+> `tests/types.rs` pins them). At compile time, a literal where the compiler
+> sees it: a `return`, a typed `let`, a literal argument to one of the
+> program's own functions, a struct literal's fields. At run time, every
+> value crossing a function boundary: the host's arguments (text read as the
+> declared scalar first, so run-proto's "5" is an `i64`), every intra-program
+> call's arguments, every return. `null` is a value of every type; `number`,
+> `quantity`, `symbol`, `void`, `any` and the AI-native names check nothing,
+> on purpose; fixed-width ints carry their range; structs are structural.
+> Under strict (the default), a type name nothing declares (no struct, enum,
+> file-level or program-level `type` alias) is a compile error. The audit
+> text below describes the state before.
 
 Two entirely separate systems, and this split is the single largest
 undocumented gap in the type story:
@@ -258,6 +321,18 @@ before the target function, on both `cubelang run` and `run-proto`. There is
 no once-only guard at the VM level; `@once` (parsed, see §6) does not enforce
 this — calling `constructor` twice re-runs it twice.
 
+> **2026-10-24.** A storage field's default is its starting value: it must be a constant (a
+> literal, or an array, map or struct of literals; anything else is a compile error that says to
+> set it in the constructor), is type-checked against the field, and is set when the VM loads the
+> program, before any constructor. A map or array field with no default starts empty. `.cubebin`
+> carries them. A field declared `immutable` is written only by the constructor (a local of the
+> same name is the same register, so it counts). `@once` is enforced (§6). The host runs a
+> program through `VM::boot` (its constructor; a container's sequence, §1), and a constructor
+> that fails now stops the run instead of being dropped. Each program's registers are its own:
+> the VM parks a program's storage (and what its last run left in registers) while another
+> program runs, so two programs with a field of the same name never share it, and one cannot read
+> what another left behind (`VM::storage_value(program, field)` reads a parked program's field).
+
 **`use <module>;` / `ModuleRegistry`** [src, `src/vm/registry.rs`, full
 file]: a second, sibling registry to `InterfaceRegistry` — deny-by-default
 call resolution. `ModuleRegistry::resolve(used, name)` only finds a function
@@ -293,6 +368,11 @@ Call-resolution precedence at runtime, per `op::CALL`'s own doc comment
 implementation > plain program-local function > error.**
 
 ## 6. Attributes / permissions / modifiers — parsed, essentially all decorative
+
+> **Superseded 2026-10-24.** `@external`, `@internal`, `@system`, `@once`, `@restricted`,
+> `@ratelimit`, `@cron` and the `private` modifier are now enforced, and `.cubebin` v4 carries
+> them; see `docs/CONTRACTS.md`. `@hook`/`@before`/`@after` remain unenforced (strict errors).
+> The audit text below describes the state before that.
 
 [src, `src/ast.rs:184-206` `Permission` enum, `188-206` `Modifier` enum;
 `src/parser.rs:700-822` `parse_permissions`/parses modifiers into
@@ -358,6 +438,8 @@ cubelang compile   [--strict] <file.cube> [-o out.cubebin]
 cubelang run       <file.cube|file.cubebin> [--strict] [--fn name] [--trace]
                    [--json] [--arg VALUE]... [--knowledge facts.jsonl]
 cubelang run-proto                    # length-prefixed protobuf, stdin/stdout
+cubelang run-proto --listen ADDR ...  # the same over TLS 1.3, pinned clients (docs/CONTRACTS.md, "Over a network")
+cubelang run-proto --remote ADDR ...  # a stdin/stdout relay to such a host
 cubelang inspect   <file.cubebin>
 cubelang disasm    <file.cubebin>
 cubelang check     <file.cube>        # see note below — NOT parse-only
@@ -411,6 +493,8 @@ cubelang version
   similarity)`, QUERY gives an array of provenance-carrying maps).
 - `src/vm/knowledge.rs` (217 lines): exact-key `KnowledgeStore` (`.jsonl`
   facts with `key`/`text`/`source`, plus alias records) backing `QUERY`.
+  2026-10-24: layered over `src/vm/segment.rs` (FST segments); the history
+  store is `src/vm/history.rs`; both in `docs/STORE.md`.
 
 ## 11. Two ways to express the same thing (flagged per the task brief)
 

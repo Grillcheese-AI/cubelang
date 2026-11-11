@@ -22,6 +22,10 @@ message RunRequest {
   // pays for one parse, and the wire stays small. Empty => no knowledge,
   // every QUERY abstains (an empty chunk array) -- correct, not useful.
   string knowledge_path = 5;
+  // (2026-10-24: a `.cubeseg` file -- `cubelang knowledge build` -- is opened
+  // as a frozen segment, no parse at all; a `.jsonl` is parsed once and frozen.
+  // Either way every request shares the one copy: a branch forks it for the
+  // cost of a pointer, not a copy of the store.)
   // The branch (2026-09-28, the counterfactual fork at the wire): applied to
   // this request's CLONE of the knowledge store before the call, so "X did
   // not happen" lives in one branch's VM and nowhere else. The host
@@ -33,6 +37,36 @@ message RunRequest {
   // the VM default of 1,000,000, which is not a budget for a live turn).
   // Exceeding one is an error naming it, never a truncated answer.
   Budget budget = 7;
+  // The scheduler (2026-10-24): when set, `fn_name` is ignored and the VM runs
+  // every `@cron` function of the program that is due (the resident process
+  // keeps the cron clock and the `@ratelimit` windows across requests), each
+  // reported in `RunResult.crons`.
+  bool tick = 8;
+  // Who is calling (2026-10-24): checked against `@restricted(...)`. Honoured
+  // only with valid ML-DSA-87 AND Ed25519 signatures by a key in the keyring
+  // the process loaded at startup (`run-proto --keyring`); anything else is an
+  // anonymous caller, which no restricted function admits.
+  Caller caller = 9;
+  // The conversation so far (2026-10-24): a history directory (its
+  // MANIFEST.json and segment files, `cubelang history`), searched by the
+  // program through `use history;`. Opened once per process and shared by
+  // every request (re-opened when the manifest changes). Empty => no history.
+  string history_path = 10;
+}
+
+message Caller {
+  string name = 1;          // the keyring entry the caller claims to be
+  bytes ml_dsa = 2;         // ML-DSA-87 over `cubelang::auth::CallClaim::message()`
+  uint64 timestamp_ms = 3;  // Unix ms; outside the process's window => refused
+  uint64 nonce = 4;         // never accepted twice inside the window (no replays)
+  bytes ed25519 = 5;        // Ed25519 over the same bytes; BOTH must verify
+}
+
+message CronRun {
+  string function = 1;
+  bool ok = 2;
+  string value = 3;   // the result, as `RunResult.symbol` would carry it (empty for null)
+  string error = 4;
 }
 
 message Branch {
@@ -126,4 +160,6 @@ message RunResult {
   // and both `None` on a non-ok result, like `similarity`.
   optional double runner_up = 7;
   optional RecoverReason recover_reason = 8;
+  // A `tick` request's runs, in declaration order (2026-10-24).
+  repeated CronRun crons = 9;
 }

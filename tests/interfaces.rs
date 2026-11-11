@@ -297,7 +297,8 @@ fn gsm8k_cube_example_fails_on_the_c11_operand_bug() {
         msg
     );
     assert!(
-        ["BinOp", "MapLit", "StructLit", "UnaryOp", "Lambda"]
+        // (struct and map literals are built since 2026-10-24)
+        ["BinOp", "UnaryOp", "Lambda", "MethodCall", "Call", "Index"]
             .iter()
             .any(|f| msg.contains(f)),
         "error should name the offending expression form: {}",
@@ -333,7 +334,8 @@ fn conversation_agent_cube_example_fails_on_the_c11_operand_bug() {
         msg
     );
     assert!(
-        ["BinOp", "MapLit", "StructLit", "UnaryOp", "Lambda"]
+        // (struct and map literals are built since 2026-10-24)
+        ["BinOp", "UnaryOp", "Lambda", "MethodCall", "Call", "Index"]
             .iter()
             .any(|f| msg.contains(f)),
         "error should name the offending expression form: {}",

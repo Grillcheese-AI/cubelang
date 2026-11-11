@@ -17,6 +17,10 @@ pub mod compiler;
 pub mod validate;
 pub mod vm;
 pub mod loader;
+pub mod types;
+pub mod auth;
+pub mod seal;
+pub mod tls;
 
 pub mod reasoning {
     include!(concat!(env!("OUT_DIR"), "/reasoning.rs"));

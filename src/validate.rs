@@ -114,8 +114,18 @@ pub fn validate(source: &str) -> Result<ValidationReport, String> {
     let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
     let mut programs = Vec::new();
     for item in &ast.items {
-        if let TopLevel::Program(p) = item {
-            programs.push(validate_program(p));
+        match item {
+            TopLevel::Program(p) => programs.push(validate_program(p)),
+            // 2026-10-24: a container compiles to a program; its functions
+            // are checked like one's.
+            TopLevel::Container(c) => programs.push(ProgramReport {
+                name: c.name.clone(),
+                functions: c.body.iter().filter_map(|i| match i {
+                    crate::ast::ContainerItem::Function(f) => Some(validate_function(f)),
+                    _ => None,
+                }).collect(),
+            }),
+            _ => {}
         }
     }
     Ok(ValidationReport { programs })
