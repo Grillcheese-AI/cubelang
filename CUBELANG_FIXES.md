@@ -12,7 +12,20 @@ GLOBAL INVARIANT — apply to every task:
 - Do NOT change opcode byte values — they are synced across opcode-vsa-rs,
   cubelang, and the cubemind Python VM. Changing them breaks cross-repo sync.
 
-SAFE-SUBSET FENCE (the executing half — reference for P0 work):
+STATUS, CHECKED BY RUNNING (Cowork, 2026-11-11; Nick: "cubelang is turing complete and those
+function are done, the repo md files are not current"):
+  The fence below was written before P0 and P2 landed. They have landed. `for`, `match`, a call,
+  an early `return` and register-to-register `assign` all execute, on this line's release build
+  (2026-09-29) and on the cowork branch's (cowork/wd-store, 1bca597, built 2026-11-11). Each box
+  ticked below names the program that showed it. What still computes nothing is the trace-only
+  half (the extended reasoning opcodes, P5) and the forms P3 lists.
+  One difference between the two lines: here a called function reads its arguments as arg0, arg1,
+  and a declared parameter name is unbound (it reads 0, silently). The cowork branch binds the
+  declared names (its docs/REFERENCE.md 3.3, 2026-10-24).
+  The current reference and drift audit are the cowork branch's docs/REFERENCE.md and
+  docs/DRIFT.md (2026-10-24); the copies on this line date from 2026-09-14.
+
+SAFE-SUBSET FENCE, AS FIRST WRITTEN (kept for the record; it is no longer the limit):
   create, assign(literal), add, sub, mul, div, sum, push, pop, query,
   store, recall, remember, forget, compare, if/else, while. Flat operands only.
   Everything else (for, match, return-as-branch, call, and all extended
@@ -22,7 +35,9 @@ SAFE-SUBSET FENCE (the executing half — reference for P0 work):
 
 ## P0 — Safety: never silently no-op (do these first)
 
-- [ ] **P0-1: `--strict` compile mode that rejects non-executing constructs.**
+- [x] **P0-1: `--strict` compile mode that rejects non-executing constructs.**
+  *(Done. Checked 2026-11-11: strict is the default for `run`, `compile` and `check`, `--loose`
+  opts out, and `for`, `match` and a call are off its blocklist because they execute.)*
   - Files: `src/compiler.rs`, `src/main.rs` (wire the flag), `src/vm/engine.rs`
     (the opcodes routed to `trace_structural` are the authoritative non-executing
     list).
@@ -35,7 +50,8 @@ SAFE-SUBSET FENCE (the executing half — reference for P0 work):
   - Acceptance: `compile examples/qc_decision.cube --strict` succeeds; a program
     containing `match`/`for`/`predict` fails `--strict` with a clear named error.
 
-- [ ] **P0-2: Fix `assign` register-to-register.**
+- [x] **P0-2: Fix `assign` register-to-register.**
+  *(Done. Checked 2026-11-11 on both builds: `assign a = 5; assign b = a; sum b` returns 5.)*
   - Files: `src/vm/engine.rs` (the `op::ASSIGN` arm).
   - Problem: `assign x = y` (y a register) stores the register-NAME STRING, not
     y's value, because ASSIGN uses `to_value()` instead of `resolve_value()`.
@@ -47,7 +63,9 @@ SAFE-SUBSET FENCE (the executing half — reference for P0 work):
   - Acceptance: new test — `assign a = 5; assign b = a; sum b` returns 5
     (currently returns a string/0). All 96 existing tests stay green.
 
-- [ ] **P0-3: `validate` subcommand — report executing vs trace-only opcodes.**
+- [x] **P0-3: `validate` subcommand — report executing vs trace-only opcodes.**
+  *(Done. Checked 2026-11-11 on both builds: `validate examples/qc_decision.cube` prints "all
+  executing, no stubs".)*
   - Files: `src/main.rs`, plus `src/compiler.rs` or new `src/validate.rs`.
   - Problem: there is no way to confirm at a glance that a program is fully
     executable before shipping it.
@@ -101,20 +119,30 @@ SAFE-SUBSET FENCE (the executing half — reference for P0 work):
 Do these only after P0/P1. Each removes one item from the strict-mode blocklist
 in P0-1 once it genuinely executes — update P0-1's blocklist as each lands.
 
-- [ ] **P2-1: Real `for` iteration.** `src/vm/engine.rs` (`op::LOOP`) +
+- [x] **P2-1: Real `for` iteration.** `src/vm/engine.rs` (`op::LOOP`) +
   `src/compiler.rs` (`compile_for`). Currently emits a single-pass LOOP marker.
   Acceptance: `for x of [1,2,3] { add total, x }` yields total = 6.
+  *(Done. Checked 2026-11-11 on both builds: that loop returns 6; `examples/for_loop_min.cube`
+  returns 60. `for` lowers to a real loop; the `LOOP` opcode itself stays a marker.)*
 
-- [ ] **P2-2: `match` arm selection.** `src/compiler.rs` (`compile_match`) +
+- [x] **P2-2: `match` arm selection.** `src/compiler.rs` (`compile_match`) +
   engine. Currently compiles every arm body unconditionally. Acceptance: only
   the matching arm's body executes.
+  *(Done, 2026-09-14. Checked 2026-11-11 on both builds: a three-arm match on 2 runs the second
+  arm only; `examples/match_router.cube` runs.)*
 
-- [ ] **P2-3: Intra-program `CALL`.** `src/vm/engine.rs` (`op::CALL`). Currently
+- [x] **P2-3: Intra-program `CALL`.** `src/vm/engine.rs` (`op::CALL`). Currently
   trace-only. Acceptance: a function calling another runs the callee and returns.
+  *(Done. Checked 2026-11-11 on both builds: `examples/call_recursion_min.cube` returns 120, with
+  recursion. Still open on this line: a callee that reads a declared parameter name gets 0, with
+  no error; it must read arg0, arg1. A `twice(n)` probe returns 8 on the cowork branch and 0
+  here. The fix is the cowork branch's, 2026-10-24.)*
 
-- [ ] **P2-4: `return` early-exit.** `src/compiler.rs` + engine. Currently emits
+- [x] **P2-4: `return` early-exit.** `src/compiler.rs` + engine. Currently emits
   SKIP; the VM returns the accumulator regardless of where `return` appears.
   Acceptance: a `return` mid-function stops execution and returns that value.
+  *(Done. Checked 2026-11-11 on both builds: a `return` inside an `if` ends the function with
+  that value.)*
 
 ---
 
@@ -129,6 +157,23 @@ main `target/release` binary is not overwritten.
 The drafts are written to the full spec, while the compiler runs the safe subset above (flat operands, no `for`,
 `match`, `call` or early `return` yet). Most of what follows is the gap between the two. Which gaps to close first is
 CubbyLLM's call: orders 0062 (sandboxed helpers) and 0063 (split questions) say what they need.
+
+**Corrected 2026-11-11 (Cowork).** The sentence above is wrong about `for`, `match`, a call and an early `return`:
+they execute (P2, ticked). The four drafts were run again on the cowork branch's build of 2026-11-11 (1bca597),
+beside this line's build of 2026-09-29. What stops each today:
+- `orchestrator.cube`: 39:11, "expected identifier, got Star" (P3-2), on both builds.
+- `bridge_mesh.cube`: on this line it still passes `check` with 0 programs. On the cowork branch the container is
+  compiled, and the draft stops on a method call used as an operand (22:9) and on strict naming its `io` block.
+- `mowm_manager.cube`: 27:5, "expected 'function' or 'constructor', got At" (P3-6), on both builds.
+- `mowm_spawner.cube`: on this line, a map literal used as an operand (55:9). On the cowork branch that passes, and
+  the draft stops at 66:41 (a field read whose base is not a variable) and on `throw`.
+
+Item by item, on the cowork branch's build:
+- P3-1 is no longer silent there: a container is compiled, and strict names what it drops.
+- P3-9 is half done: a map literal passes; a method call's result does not, and the message says how to rewrite it.
+- P3-2, P3-3, P3-5, P3-6, P3-7 and P3-8 are open as written (each re-run with a small program).
+- P3-10: `throw` is refused by strict, and the ternary is not parsed. The rest was not reached.
+- P3-4 was not re-run.
 
 - [ ] **P3-1 (P0 class): a `container` compiles to nothing, silently.** `bridge_mesh.cube` passes `check`, but
   `compile` warns "no programs found". The `container`, its `config` and `io` blocks, `vm.start_from_file`,

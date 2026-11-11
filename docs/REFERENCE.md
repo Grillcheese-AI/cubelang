@@ -325,7 +325,8 @@ enforce no actual visibility restriction — a "private" helper is callable via
 ## 7. Statement forms the parser accepts (`Stmt`, `src/ast.rs:301-330`)
 
 `Let`, `Assign`, `If`, `For` (real, lowers to `while`+`LEN`/`INDEX`, §8),
-`While`, `Match` (parses; **non-executing**, §DRIFT-C), `Return`, `Throw`
+`While`, `Match` (real since 2026-09-14: it lowers to an if/else-if chain and
+only the matching arm runs, §DRIFT-C3; checked again by running, 2026-11-11), `Return`, `Throw`
 (parses; **never compiled at all**, any mode), `Emit`, `Opcode(OpcodeStmt)`
 (§3.1/3.2 surface forms: `create`/`assign`/`add`/`sub`/`mul`/`div`/`sum`/
 `push`/`pop`/`query`/`remember`/`store`/`recall`/`bind`/`unify`/`bind_role`/
