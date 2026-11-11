@@ -84,3 +84,19 @@ of rotting silently.
   snapshots, not re-verified by this audit beyond `cubelang inspect`/
   `disasm` sanity (they decode; see `docs/REFERENCE.md` for what `inspect`/
   `disasm` show).
+
+## Drafts (`examples/drafts/`)
+
+Four design drafts, written to the full specification and kept as targets.
+None compiles today, so they are not in the table above and the two "run
+everything" loops do not reach them. `tests/examples_pinned.rs` pins where
+each one stops now: when a feature lands and a draft gets further, its test
+fails, and the row below changes in the same change. The open item behind
+each stop is in `CUBELANG_FIXES.md` (P3).
+
+| Draft | Where it stops today (exit 1, nothing on stdout) |
+|---|---|
+| `drafts/bridge_mesh.cube` | strict compile: `implements` two interfaces that are declared nowhere (2:1, P3-8); a method call used as an operand (21:9 and 22:9, P3-9); its `io` block (line 8, P3-1) |
+| `drafts/mowm_manager.cube` | parse error at 27:5, "expected 'function' or 'constructor', got At": `@pure` written as an attribute (P3-6) |
+| `drafts/mowm_spawner.cube` | strict compile: the same two interfaces (11:1, P3-8); method calls and compound expressions used as operands (P3-9); a field read whose base is not a variable (66:41) and `throw` (line 41), both P3-10 |
+| `drafts/orchestrator.cube` | parse error at 39:11, "expected identifier, got Star": the wildcard in `@hook(*.error)` (P3-2) |

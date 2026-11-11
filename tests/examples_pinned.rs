@@ -271,6 +271,76 @@ fn match_router_selects_the_matching_string_arm() {
     );
 }
 
+// ── The four drafts under examples/drafts/ (pinned 2026-11-11) ──────────────
+//
+// `examples/drafts/` holds design drafts: programs written to the full
+// specification and kept as targets (`CUBELANG_FIXES.md`, P3). None compiles
+// today. Each test below pins where its draft stops NOW, on the same terms
+// as the two rejected examples above: exit 1, nothing on stdout, the stop
+// named on stderr. When a feature lands and a draft gets further, its test
+// fails: move the pin to the new stop (or to a real result), and update
+// `CUBELANG_FIXES.md` P3 and `examples/README.md` in the same change. The
+// line:column in an assertion is the draft's own, so editing a draft moves
+// it too.
+
+fn draft_stops(relative_path: &str, expected: &[&str]) {
+    let out = run_raw(relative_path, &["--json"]);
+    assert!(!out.status.success(), "{} is a draft: it must not run clean yet", relative_path);
+    assert!(out.stdout.is_empty(),
+        "a compile-time failure must emit nothing on stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for want in expected {
+        assert!(stderr.contains(want),
+            "{}: its stop must name {:?}, got: {}", relative_path, want, stderr);
+    }
+}
+
+#[test]
+fn draft_bridge_mesh_stops_on_method_call_operands_and_its_io_block() {
+    // The container parses and is compiled; strict refuses what it cannot run
+    // (P3-8 undeclared interfaces, P3-9 a method call as an operand, P3-1 the
+    // `io` block).
+    draft_stops("drafts/bridge_mesh.cube", &[
+        "strict compile",
+        "`IOrchestrator` is neither a VM interface nor an in-file `interface` declaration",
+        "21:9: expression form MethodCall cannot be encoded as an operand",
+        "22:9: expression form MethodCall cannot be encoded as an operand",
+        "an `io` block",
+    ]);
+}
+
+#[test]
+fn draft_mowm_manager_stops_at_pure_written_as_an_attribute() {
+    // Does not parse: `@pure` on the line after `@external` (P3-6; `pure` is
+    // a modifier).
+    draft_stops("drafts/mowm_manager.cube", &[
+        "27:5: expected 'function' or 'constructor', got At",
+    ]);
+}
+
+#[test]
+fn draft_mowm_spawner_stops_on_operands_a_field_read_base_and_throw() {
+    // Parses; strict refuses it (P3-8, P3-9, and the two P3-10 items it now
+    // reaches: a field read whose base is not a variable, and `throw`).
+    draft_stops("drafts/mowm_spawner.cube", &[
+        "strict compile",
+        "`IOrchestrator` is neither a VM interface nor an in-file `interface` declaration",
+        "expression form MethodCall cannot be encoded as an operand",
+        "expression form BinOp cannot be encoded as an operand",
+        "66:41: a field read needs a variable at its base",
+        "strict: throw",
+    ]);
+}
+
+#[test]
+fn draft_orchestrator_stops_at_the_wildcard_hook_target() {
+    // Does not parse: `@hook(*.error)` (P3-2).
+    draft_stops("drafts/orchestrator.cube", &[
+        "39:11: expected identifier, got Star",
+    ]);
+}
+
 // ── Coverage guard ───────────────────────────────────────────────────────────
 
 /// Every `.cube` file physically present under `examples/` must be named by
@@ -295,6 +365,10 @@ fn every_example_file_is_covered_by_a_pinned_test() {
         "for_loop_min.cube",
         "agent_min.cube",
         "match_router.cube",
+        "drafts/bridge_mesh.cube",
+        "drafts/mowm_manager.cube",
+        "drafts/mowm_spawner.cube",
+        "drafts/orchestrator.cube",
     ];
 
     let mut found: Vec<PathBuf> = Vec::new();

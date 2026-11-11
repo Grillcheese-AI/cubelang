@@ -70,6 +70,9 @@ Run again on 2026-11-11, on the build of this line's code (d25dbc5). Where each 
 - `mowm_manager.cube`: 27:5, "expected 'function' or 'constructor', got At" (P3-6).
 - `mowm_spawner.cube`: 66:41, a field read whose base is not a variable, and `throw` (P3-10).
 
+Each stop is pinned in `tests/examples_pinned.rs` (2026-11-11): when a draft gets further, its test fails, and
+this list, the pin and `examples/README.md` change together.
+
 - [ ] **P3-1: a container's `io` block.** A `container` is compiled now; it was dropped silently, and
   `bridge_mesh.cube` used to pass `check` with no program found. Strict names what it cannot run: the draft stops on
   its `io` block. Not checked again: `vm.start_from_file`, `vm.wire` and `vm.bridge` (see P5-7). Regression test:
