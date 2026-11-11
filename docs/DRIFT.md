@@ -6,6 +6,11 @@ by executing `$CUBELANG_EXE` or citing a passing/failing test. Each entry is
 tagged **[read]**, **[ran]**, or **[test]** for how it was verified. See
 `docs/REFERENCE.md` for the full inventory these findings are drawn from.
 
+> **2026-11-11:** `docs/SPEC.md` was an older copy of `README.md` and has been removed (a short note stands in
+> its place). Where an entry below cites `SPEC.md`, it means that copy's last version (`ea8f41e`). An entry
+> whose code has changed since carries a dated status line (A1, A7 and C3 do); the entries were not all checked
+> again on that day. The list of open work is `CUBELANG_FIXES.md`.
+
 ---
 
 ## A. Documented but wrong or absent
