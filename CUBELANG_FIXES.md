@@ -381,7 +381,18 @@ an index off by one can no longer make a wrong reply pass.
   - **Tests:** the smallest program above returns 0; the two pairs found compare unequal; two colliding variable names
     keep their own values.
 
-**Order:** P6-1 with P6-8 and P6-9, then P6-2, then the rest in any order. Each probe program that fails today becomes a
+- [ ] **P6-10: P6 without the slowdown** (found by CubbyLLM 0072's rerun, 2026-11-13). Every verdict stayed the same
+  on `676df1d` (47,000+ runs), but the same programs run 1.5 to 3.5 times slower than before (medians, same machine,
+  same day: a 50-item merge check 21.6 ms on main's September build against 76.8 ms; a sort check 18.0 against 63.1;
+  a one-pass replace check 0.7 against 1.7; CubbyLLM `validation/logs/verb_programs_2026-11-13_p6.json`). CubbyLLM
+  0072's line, p95 at most 50 ms at 50 items, held at 34 ms on `3f37515` and fails at 82.8 ms now.
+  - Profile first and name the cause (suspects: hashing an 8-byte key on every register access, the missing-value
+    bookkeeping, the collision check if it runs at run time instead of compile time).
+  - **Line:** on CubbyLLM's timing programs, `3f37515` rebuilt in its own target directory and the fixed build timed in
+    the same session: the fixed build no slower than `3f37515` by more than 10% at the median, with every P6 test green
+    and no verdict changed. Then CubbyLLM 0072's time line is read again on it.
+
+**Order:** P6-1 with P6-8 and P6-9, then P6-2, then P6-10 (before CubbyLLM 0069's latency part), then the rest in any order. Each probe program that fails today becomes a
 regression test with the value it should give. The global invariant holds.
 
 ## Notes
