@@ -77,13 +77,13 @@ fn a2_asm_compiles_to_the_same_bytecode_shape_as_the_hand_assembled_unbind_test(
     // Byte-exact check against the hand-assembled layout at engine.rs's
     // `unbind_opcode_recovers_filler_into_register`: BIND_ROLE (3 operands:
     // NAMED frame, ROLE SUBJECT, GLOBAL "cat") then UNBIND (2 operands:
-    // NAMED frame, ROLE SUBJECT). Operand tags per compiler.rs: NAMED=0x01,
-    // ROLE=0x04, GLOBAL=0x05.
+    // NAMED frame, ROLE SUBJECT). Operand tags per compiler.rs since P6-9 (2026-11-13): NAMED8=0x09,
+    // ROLE8=0x0B, GLOBAL8=0x0C, each followed by BLAKE3's first 8 bytes of the spelling (it was 2, under
+    // 0x01 / 0x04 / 0x05, and two spellings could share one).
     use cubelang::compiler::op;
 
-    fn h(s: &str) -> [u8; 2] {
-        let d = blake3::hash(s.as_bytes());
-        [d.as_bytes()[0], d.as_bytes()[1]]
+    fn h(s: &str) -> Vec<u8> {
+        blake3::hash(s.as_bytes()).as_bytes()[..8].to_vec()
     }
     let frame = h("frame");
     let subj = h("SUBJECT");
@@ -91,12 +91,12 @@ fn a2_asm_compiles_to_the_same_bytecode_shape_as_the_hand_assembled_unbind_test(
 
     let mut expected: Vec<u8> = Vec::new();
     expected.push(op::BIND_ROLE); expected.push(3);
-    expected.push(0x01); expected.push(frame[0]); expected.push(frame[1]);
-    expected.push(0x04); expected.push(subj[0]); expected.push(subj[1]);
-    expected.push(0x05); expected.push(cat[0]); expected.push(cat[1]);
+    expected.push(0x09); expected.extend(&frame);
+    expected.push(0x0B); expected.extend(&subj);
+    expected.push(0x0C); expected.extend(&cat);
     expected.push(op::UNBIND); expected.push(2);
-    expected.push(0x01); expected.push(frame[0]); expected.push(frame[1]);
-    expected.push(0x04); expected.push(subj[0]); expected.push(subj[1]);
+    expected.push(0x09); expected.extend(&frame);
+    expected.push(0x0B); expected.extend(&subj);
 
     let source = r#"
         program AsmBytecodeShape implements ISolve {

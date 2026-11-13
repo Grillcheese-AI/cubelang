@@ -8,6 +8,7 @@ use crate::compiler::{CompiledProgram, CompiledFunction, Access, op};
 use crate::vm::memory::HippocampalMemory;
 use crate::vm::codebook::Codebook;
 use crate::vm::hypervec::Hypervec;
+use crate::vm::key::Key;
 
 /// Hypervector dimension for the VM's hippocampal memory. This is CubeLang's
 /// own working value -- it does NOT match opcode-vsa-rs's own default (8192,
@@ -237,7 +238,9 @@ pub struct VM {
     /// Enable tracing.
     pub trace_enabled: bool,
     /// Name→hash mapping for reverse lookup.
-    name_table: HashMap<[u8; 2], String>,
+    name_table: HashMap<Key, String>,
+    /// P6-9: the programs loaded from a pre-v5 `.cubebin`, whose bytecode keys names by 2 bytes.
+    narrow: HashSet<String>,
     /// Plan-2: name of the program whose function is currently executing. Set
     /// by `call()`; consulted by op::CALL to resolve sibling-function names.
     current_program: Option<String>,
@@ -423,6 +426,7 @@ impl VM {
             trace: Vec::new(),
             trace_enabled: false,
             name_table: HashMap::new(),
+            narrow: HashSet::new(),
             current_program: None,
             call_depth: 0,
             resume_state: None,
@@ -537,7 +541,7 @@ impl VM {
     /// A program's storage field as it stands, whether or not the program
     /// is the active one (for a host reading a program's state).
     pub fn storage_value(&self, program: &str, field: &str) -> Option<&Value> {
-        let key = Self::register_key(field);
+        let key = self.register_key_in(program, field);
         if self.active.as_deref() == Some(program) {
             self.registers.get(&key)
         } else {
@@ -792,6 +796,12 @@ impl VM {
     /// Load a compiled program into the VM.
     pub fn load(&mut self, prog: CompiledProgram) {
         // Pre-populate name table for reverse lookups
+        if prog.narrow_keys {
+            self.narrow.insert(prog.name.clone());
+        } else {
+            self.narrow.remove(&prog.name);
+        }
+        let wide = !prog.narrow_keys;
         self.register_name(&prog.name);
         for iface in &prog.implements {
             self.register_name(iface);
@@ -817,7 +827,7 @@ impl VM {
         // in place across its calls, and set to its declared starting value
         // (a constant) unless it already holds one -- before any constructor
         // runs (DRIFT B11).
-        let keys: HashSet<String> = prog.storage_fields.iter().map(|f| Self::register_key(f)).collect();
+        let keys: HashSet<String> = prog.storage_fields.iter().map(|f| format!("r_{}", Key::of(f, wide).hex())).collect();
         if self.active.as_deref() == Some(prog.name.as_str()) {
             self.storage_keys = keys.clone();
         }
@@ -829,7 +839,7 @@ impl VM {
             } else {
                 &mut self.parked.entry(prog.name.clone()).or_default().registers
             };
-            regs.entry(Self::register_key(field)).or_insert_with(|| json_to_value(value));
+            regs.entry(format!("r_{}", Key::of(field, wide).hex())).or_insert_with(|| json_to_value(value));
         }
         // A container's `permissions { }`, in the order it wrote them.
         if let Some(meta) = &prog.container {
@@ -966,11 +976,11 @@ impl VM {
         for (i, arg) in args.into_iter().enumerate() {
             if let Some(param) = func.params.get(i) {
                 self.register_name(param);
-                self.registers.insert(Self::register_key(param), arg.clone());
+                self.registers.insert(self.register_key_in(program, param), arg.clone());
             }
             let alias = format!("arg{}", i);
             self.register_name(&alias);
-            self.registers.insert(Self::register_key(&alias), arg);
+            self.registers.insert(self.register_key_in(program, &alias), arg);
         }
 
         // Plan-2: remember which program owns the running function so an
@@ -1264,10 +1274,7 @@ impl VM {
                         Some(Operand::Type(h)) => Some(*h),
                         _ => None,
                     };
-                    let is = |t: &str| {
-                        let h = blake3::hash(t.as_bytes());
-                        ty_hash == Some([h.as_bytes()[0], h.as_bytes()[1]])
-                    };
+                    let is = |t: &str| ty_hash.is_some_and(|k| k == Key::of(t, k.wide));
                     let init = if is("map") {
                         Value::Map(HashMap::new())
                     } else if is("array") {
@@ -1591,7 +1598,11 @@ impl VM {
 
                 op::STORE => {
                     let reg = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                    let key = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
+                    // P6-9: the memory is keyed by the key's spelling. It was keyed by the operand's display token
+                    // (`g_<key>` for `store x, "estimate"`, `r_<key>` for `recall estimate`), two strings with
+                    // unrelated vectors, so a 1-arg recall found its value only when the nearest-key search happened
+                    // to land on it.
+                    let key = self.resolve_symbol_name(operands.get(1));
                     let val = self.registers.get(&reg).cloned().unwrap_or(Value::Null);
                     self.trace_op(pc, &format!("STORE {} → {}", reg, key));
                     // Associative store: key-hypervector addresses the payload.
@@ -1610,11 +1621,11 @@ impl VM {
                     // way STORE does rather than always reading operand0.
                     let (dest, key) = if operands.len() >= 2 {
                         let dest = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                        let key = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
-                        (dest, key)
+                        (dest, self.resolve_symbol_name(operands.get(1)))
                     } else {
-                        let key = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
-                        (key.clone(), key)
+                        // the recalled value parks in the register the key names; the memory is keyed by the spelling
+                        let dest = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                        (dest, self.resolve_symbol_name(operands.get(0)))
                     };
                     // Associative cleanup: nearest stored key by cosine similarity.
                     match self.memory.recall(&key) {
@@ -1630,7 +1641,7 @@ impl VM {
                 }
 
                 op::FORGET => {
-                    let key = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
+                    let key = self.resolve_symbol_name(operands.get(0));
                     let dropped = self.memory.forget(&key);
                     self.storage.remove(&key);
                     self.trace_op(pc, &format!("FORGET {} ({})", key, if dropped { "dropped" } else { "absent" }));
@@ -2198,11 +2209,11 @@ impl VM {
         for (i, v) in arg_values.into_iter().enumerate() {
             if let Some(param) = callee.params.get(i) {
                 self.register_name(param);
-                self.registers.insert(Self::register_key(param), v.clone());
+                self.registers.insert(self.register_key_in(&program, param), v.clone());
             }
             let alias = format!("arg{}", i);
             self.register_name(&alias);
-            self.registers.insert(Self::register_key(&alias), v);
+            self.registers.insert(self.register_key_in(&program, &alias), v);
         }
 
         self.call_depth += 1;
@@ -2359,8 +2370,8 @@ impl VM {
     /// `base.f1.f2...`: the base register's value, then each field in turn.
     /// A missing field, or a field of something that is not a map (a struct
     /// value is a map), reads as Null -- the same as an index past the end.
-    fn read_field(&self, base: &[u8; 2], path: &[String]) -> Value {
-        let mut v = self.registers.get(&format!("r_{:02x}{:02x}", base[0], base[1])).cloned().unwrap_or(Value::Null);
+    fn read_field(&self, base: &Key, path: &[String]) -> Value {
+        let mut v = self.registers.get(&format!("r_{}", base.hex())).cloned().unwrap_or(Value::Null);
         for key in path {
             v = match v {
                 Value::Map(mut m) => m.remove(key).unwrap_or(Value::Null),
@@ -2429,16 +2440,28 @@ impl VM {
     }
 
     fn register_name(&mut self, name: &str) {
-        let h = blake3::hash(name.as_bytes());
-        self.name_table.insert([h.as_bytes()[0], h.as_bytes()[1]], name.to_string());
+        // P6-9: both widths, so a pre-v5 program's 2-byte keys still read back; a 2-byte key two names share keeps
+        // the first (it is only ever read for such a program).
+        self.name_table.insert(Key::wide(name), name.to_string());
+        self.name_table.entry(Key::narrow(name)).or_insert_with(|| name.to_string());
     }
 
-    /// The register key a symbol compiles to: `r_` + the first two bytes of its
-    /// blake3 hash, matching `Operand::Named(h).as_name()`. Hosts must use this
-    /// to reach a register the bytecode refers to by name.
+    /// The register key a symbol compiles to: `r_` + the hex of its key (BLAKE3's
+    /// first 8 bytes since P6-9), matching `Operand::Named(h).as_name()`. Hosts
+    /// must use this to reach a register the bytecode refers to by name.
     pub fn register_key(name: &str) -> String {
-        let h = blake3::hash(name.as_bytes());
-        format!("r_{:02x}{:02x}", h.as_bytes()[0], h.as_bytes()[1])
+        format!("r_{}", Key::wide(name).hex())
+    }
+
+    /// `register_key` for `program`: the 2-byte key for a program from a pre-v5 `.cubebin` (P6-9).
+    pub fn register_key_in(&self, program: &str, name: &str) -> String {
+        format!("r_{}", Key::of(name, !self.narrow.contains(program)).hex())
+    }
+
+    /// `register_key_in` for the program running now.
+    pub(crate) fn register_key_here(&self, name: &str) -> String {
+        let p = self.current_program.clone().or_else(|| self.active.clone()).unwrap_or_default();
+        self.register_key_in(&p, name)
     }
 
     /// Reverse a Named/Role/Global operand's 2-byte hash to the original symbol
@@ -2517,7 +2540,7 @@ impl VM {
         for (name, p) in &self.programs {
             let regs = &mut self.parked.entry(name.clone()).or_default().registers;
             for (field, value) in &p.storage_defaults {
-                regs.insert(Self::register_key(field), json_to_value(value));
+                regs.insert(format!("r_{}", Key::of(field, !p.narrow_keys).hex()), json_to_value(value));
             }
         }
     }
@@ -2584,11 +2607,8 @@ impl VM {
     fn readable_reg(&self, reg: &str) -> String {
         let hex = reg.strip_prefix("r_").or_else(|| reg.strip_prefix("g_"));
         let Some(hex) = hex else { return reg.to_string() };
-        if hex.len() != 4 { return reg.to_string() }
-        let (Ok(a), Ok(b)) = (u8::from_str_radix(&hex[..2], 16), u8::from_str_radix(&hex[2..], 16)) else {
-            return reg.to_string();
-        };
-        self.name_table.get(&[a, b]).cloned().unwrap_or_else(|| reg.to_string())
+        let Some(k) = Key::from_hex(hex) else { return reg.to_string() };
+        self.name_table.get(&k).cloned().unwrap_or_else(|| reg.to_string())
     }
 
     fn record_recover(&mut self, reg: &str, role: &str, winner: Option<&str>,
@@ -2728,16 +2748,17 @@ impl VM {
 
 #[derive(Debug, Clone)]
 enum Operand {
-    Named([u8; 2]),
+    // P6-9: a name's key, 8 bytes since P6-9 (2 in a pre-v5 `.cubebin`; see `vm::key`)
+    Named(Key),
     Imm(i64),
     FloatImm(f64),
-    Type([u8; 2]),
-    Role([u8; 2]),
-    Global([u8; 2]),
+    Type(Key),
+    Role(Key),
+    Global(Key),
     /// A field read (2026-10-24): the base register's hash and the field
     /// path, spelled out (`p.x`, `a.b.c`). The keys travel as text, not as
     /// hashes, so a read never depends on reversing a 2-byte hash.
-    Field([u8; 2], Vec<String>),
+    Field(Key, Vec<String>),
     /// The `null` literal (2026-10-24; it used to compile to the integer 0).
     Null,
     None,
@@ -2746,13 +2767,13 @@ enum Operand {
 impl Operand {
     fn as_name(&self) -> String {
         match self {
-            Operand::Named(h) => format!("r_{:02x}{:02x}", h[0], h[1]),
-            Operand::Global(h) => format!("g_{:02x}{:02x}", h[0], h[1]),
-            Operand::Type(h) => format!("t_{:02x}{:02x}", h[0], h[1]),
-            Operand::Role(h) => format!("role_{:02x}{:02x}", h[0], h[1]),
+            Operand::Named(h) => format!("r_{}", h.hex()),
+            Operand::Global(h) => format!("g_{}", h.hex()),
+            Operand::Type(h) => format!("t_{}", h.hex()),
+            Operand::Role(h) => format!("role_{}", h.hex()),
             Operand::Imm(n) => format!("imm_{}", n),
             Operand::FloatImm(f) => format!("fimm_{}", f),
-            Operand::Field(h, path) => format!("field_{:02x}{:02x}.{}", h[0], h[1], path.join(".")),
+            Operand::Field(h, path) => format!("field_{}.{}", h.hex(), path.join(".")),
             Operand::Null => "null".into(),
             Operand::None => "_".into(),
         }
@@ -2762,15 +2783,15 @@ impl Operand {
         match self {
             Operand::Imm(n) => Value::Int(*n),
             Operand::FloatImm(f) => Value::Float(*f),
-            Operand::Named(h) => Value::Str(format!("r_{:02x}{:02x}", h[0], h[1])),
-            Operand::Global(h) => Value::Str(format!("g_{:02x}{:02x}", h[0], h[1])),
+            Operand::Named(h) => Value::Str(format!("r_{}", h.hex())),
+            Operand::Global(h) => Value::Str(format!("g_{}", h.hex())),
             _ => Value::Null,
         }
     }
 
-    /// The raw 2-byte hash key for a Global/Named operand (used as a label /
-    /// jump-target identifier). `None` for immediates and absent operands.
-    fn label_key(&self) -> Option<[u8; 2]> {
+    /// The key of a Global/Named operand (used as a label / jump-target
+    /// identifier). `None` for immediates and absent operands.
+    fn label_key(&self) -> Option<Key> {
         match self {
             Operand::Global(h) | Operand::Named(h) => Some(*h),
             _ => None,
@@ -2871,7 +2892,7 @@ fn coerce_host_arg(spec: &crate::types::TypeSpec, v: Value, decls: &crate::types
 /// to the byte offset of the LABEL instruction itself. JMP/COND resolve their
 /// target label through this map. Mirrors the main loop's opcode/operand
 /// stride so offsets line up exactly.
-fn scan_labels(bc: &[u8]) -> std::collections::HashMap<[u8; 2], usize> {
+fn scan_labels(bc: &[u8]) -> std::collections::HashMap<Key, usize> {
     let mut map = std::collections::HashMap::new();
     let mut pc = 0usize;
     while pc < bc.len() {
@@ -2882,7 +2903,7 @@ fn scan_labels(bc: &[u8]) -> std::collections::HashMap<[u8; 2], usize> {
         }
         if pc >= bc.len() { break; }
         let n_ops = bc[pc] as usize; pc += 1;
-        let mut first_key: Option<[u8; 2]> = None;
+        let mut first_key: Option<Key> = None;
         for i in 0..n_ops {
             if pc >= bc.len() { break; }
             let (operand, consumed) = decode_operand(&bc[pc..]);
@@ -2904,7 +2925,7 @@ fn scan_labels(bc: &[u8]) -> std::collections::HashMap<[u8; 2], usize> {
 /// hash its first operand names, when that operand is a name (the function
 /// a CALL calls). For a compile-time look over the code (2026-10-24: a
 /// container's denied opcodes).
-pub(crate) fn instructions(bc: &[u8]) -> Vec<(u8, Option<[u8; 2]>)> {
+pub(crate) fn instructions(bc: &[u8]) -> Vec<(u8, Option<Key>)> {
     let mut out = Vec::new();
     let mut pc = 0usize;
     while pc < bc.len() {
@@ -2932,6 +2953,20 @@ pub(crate) fn instructions(bc: &[u8]) -> Vec<(u8, Option<[u8; 2]>)> {
     out
 }
 
+/// A field operand's path: at `at`, its length (1 byte), then each key as (len, utf-8 bytes). (path, end) or None.
+fn field_path(bytes: &[u8], at: usize) -> Option<(Vec<String>, usize)> {
+    let n = *bytes.get(at)? as usize;
+    let mut at = at + 1;
+    let mut path = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = *bytes.get(at)? as usize;
+        let raw = bytes.get(at + 1..at + 1 + len)?;
+        path.push(String::from_utf8_lossy(raw).into_owned());
+        at += 1 + len;
+    }
+    Some((path, at))
+}
+
 fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
     if bytes.is_empty() {
         return (Operand::None, 0);
@@ -2939,7 +2974,7 @@ fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
     match bytes[0] {
         0x01 => { // Named
             if bytes.len() >= 3 {
-                (Operand::Named([bytes[1], bytes[2]]), 3)
+                (Operand::Named(Key::from_narrow([bytes[1], bytes[2]])), 3)
             } else {
                 (Operand::None, 1)
             }
@@ -2957,21 +2992,21 @@ fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
         }
         0x03 => { // Type
             if bytes.len() >= 3 {
-                (Operand::Type([bytes[1], bytes[2]]), 3)
+                (Operand::Type(Key::from_narrow([bytes[1], bytes[2]])), 3)
             } else {
                 (Operand::None, 1)
             }
         }
         0x04 => { // Role
             if bytes.len() >= 3 {
-                (Operand::Role([bytes[1], bytes[2]]), 3)
+                (Operand::Role(Key::from_narrow([bytes[1], bytes[2]])), 3)
             } else {
                 (Operand::None, 1)
             }
         }
         0x05 => { // Global
             if bytes.len() >= 3 {
-                (Operand::Global([bytes[1], bytes[2]]), 3)
+                (Operand::Global(Key::from_narrow([bytes[1], bytes[2]])), 3)
             } else {
                 (Operand::None, 1)
             }
@@ -2991,17 +3026,30 @@ fn decode_operand(bytes: &[u8]) -> (Operand, usize) {
             if bytes.len() < 4 {
                 return (Operand::None, bytes.len());
             }
-            let base = [bytes[1], bytes[2]];
-            let n = bytes[3] as usize;
-            let mut at = 4;
-            let mut path = Vec::with_capacity(n);
-            for _ in 0..n {
-                let Some(&len) = bytes.get(at) else { return (Operand::None, bytes.len()) };
-                let len = len as usize;
-                let Some(raw) = bytes.get(at + 1..at + 1 + len) else { return (Operand::None, bytes.len()) };
-                path.push(String::from_utf8_lossy(raw).into_owned());
-                at += 1 + len;
+            let base = Key::from_narrow([bytes[1], bytes[2]]);
+            let Some((path, at)) = field_path(bytes, 3) else { return (Operand::None, bytes.len()) };
+            (Operand::Field(base, path), at)
+        }
+        // P6-9: the same operands with an 8-byte key
+        0x09 | 0x0A | 0x0B | 0x0C => {
+            if bytes.len() < 1 + crate::vm::key::WIDE {
+                return (Operand::None, bytes.len());
             }
+            let k = Key::from_wide(&bytes[1..1 + crate::vm::key::WIDE]);
+            let op = match bytes[0] {
+                0x09 => Operand::Named(k),
+                0x0A => Operand::Type(k),
+                0x0B => Operand::Role(k),
+                _ => Operand::Global(k),
+            };
+            (op, 1 + crate::vm::key::WIDE)
+        }
+        0x0D => {
+            if bytes.len() < 2 + crate::vm::key::WIDE {
+                return (Operand::None, bytes.len());
+            }
+            let base = Key::from_wide(&bytes[1..1 + crate::vm::key::WIDE]);
+            let Some((path, at)) = field_path(bytes, 1 + crate::vm::key::WIDE) else { return (Operand::None, bytes.len()) };
             (Operand::Field(base, path), at)
         }
         0x08 => (Operand::Null, 1), // the `null` literal
@@ -4034,6 +4082,8 @@ mod vsa_opcode_wiring_tests {
             types: Default::default(),
             container: None,
             storage_defaults: Vec::new(),
+            // hand-assembled with the 2-byte tags: a pre-v5 program (P6-9), which still decodes and runs
+            narrow_keys: true,
         };
 
         let mut vm = VM::new();

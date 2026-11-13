@@ -319,7 +319,7 @@ fn turn_value(t: Turn) -> Value {
 /// A text argument: a variable holding text, or the text itself.
 fn text_arg(vm: &VM, v: Option<&Value>) -> Option<String> {
     match v? {
-        Value::Str(s) => match vm.get(&VM::register_key(s)) {
+        Value::Str(s) => match vm.get(&vm.register_key_here(s)) {
             Some(Value::Str(held)) => Some(held.clone()),
             _ => Some(s.clone()),
         },
@@ -331,7 +331,7 @@ fn text_arg(vm: &VM, v: Option<&Value>) -> Option<String> {
 fn count_arg(vm: &VM, v: Option<&Value>) -> Option<i64> {
     match v? {
         Value::Int(n) => Some(*n),
-        Value::Str(s) => match vm.get(&VM::register_key(s)) {
+        Value::Str(s) => match vm.get(&vm.register_key_here(s)) {
             Some(Value::Int(n)) => Some(*n),
             _ => None,
         },

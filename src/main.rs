@@ -378,6 +378,30 @@ fn disasm_bytecode(bc: &[u8]) {
                     }
                 }
                 0x08 => operands.push("null".into()),
+                // P6-9: the same operands with an 8-byte key
+                0x09..=0x0C => {
+                    if pos + 8 <= bc.len() {
+                        let key: String = bc[pos..pos + 8].iter().map(|b| format!("{:02x}", b)).collect();
+                        let kind = match op_type { 0x09 => "named", 0x0A => "type", 0x0B => "role", _ => "global" };
+                        operands.push(format!("{}({})", kind, key));
+                        pos += 8;
+                    }
+                }
+                0x0D => {
+                    if pos + 8 < bc.len() {
+                        let base: String = bc[pos..pos + 8].iter().map(|b| format!("{:02x}", b)).collect();
+                        let n = bc[pos + 8] as usize;
+                        pos += 9;
+                        let mut keys = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            let Some(&len) = bc.get(pos) else { break };
+                            let end = (pos + 1 + len as usize).min(bc.len());
+                            keys.push(String::from_utf8_lossy(&bc[pos + 1..end]).into_owned());
+                            pos = end;
+                        }
+                        operands.push(format!("field(named({}).{})", base, keys.join(".")));
+                    }
+                }
                 0x00 => { // None
                     if pos + 1 < bc.len() {
                         pos += 2;
