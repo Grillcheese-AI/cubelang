@@ -146,6 +146,7 @@ pub enum TokenKind {
     AtOnce,         // @once
     AtRestricted,   // @restricted(...)
     AtRatelimit,    // @ratelimit(...)
+    AtInputs,       // @inputs(a, b): registers the host sets before the call (P6-1)
 
     // ── Keywords: opcodes (compile directly to bytecodes) ────
     OpCreate,
@@ -281,7 +282,7 @@ impl TokenKind {
             TokenKind::AtExternal | TokenKind::AtInternal | TokenKind::AtSystem |
             TokenKind::AtHook | TokenKind::AtBefore | TokenKind::AtAfter |
             TokenKind::AtCron | TokenKind::AtOnce | TokenKind::AtRestricted |
-            TokenKind::AtRatelimit
+            TokenKind::AtRatelimit | TokenKind::AtInputs
         )
     }
 

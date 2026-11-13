@@ -319,6 +319,58 @@ those steps is recorded, so a world decision is as checkable as an answer.
 
 The global invariant holds: `cargo test` green, a regression test per fix, opcode byte values unchanged.
 
+## P6 — Comparisons that cannot pass by accident, and the forms a generated program needs (Cowork, 2026-11-13; Nick's yes)
+
+Found by CubbyLLM's order 0067, which will have a model write CubeLang programs that check replies against rules.
+Its probe ran 71 small programs on a release build of this line (3f37515): 37 gave the value wanted, 29 failed to
+compile or run, 5 gave a wrong value with no error. They are in CubbyLLM's `validation/logs/vm_ops_probe_2026-11-13.json`,
+each with its source, the value wanted and the value got.
+
+**Today:**
+- A missing value (null: an index past a list's end, an index into a string, a misspelled name) or the number 0
+  **compares equal to any string literal** (`==` true, `!=` false), and against a number it acts as 0 (`< 7` true).
+  In the probe this gave four wrong values with no error: a prefix miss (`"hx"` in `"hello"`) and a suffix miss both
+  pass, two different strings' characters compare equal, and a count of capitals in `"HeLLo"` comes out 130 (wanted 3).
+- `"hello"[1]` returns null, silently.
+- No `&&`, `||`, `!` or `else if` in a condition; no call, index, method call or arithmetic inside an expression (only
+  as a `let`'s right side); no `break`; `div` gives 3.5 for 7 / 2 and there is no `%`; no string helpers.
+
+**In plain words:** a check a model writes either runs on real values or stops and says it could not check. A typo or
+an index off by one can no longer make a wrong reply pass.
+- **Over a conventional model:** a model judging its own reply gives a sampled verdict that nobody can replay. Here the
+  verdict is a program run, and since P6-1 it cannot come from a value that was never there.
+
+- [ ] **P6-1: a missing value never compares** (blocks CubbyLLM 0067's second reader; first).
+  - Comparing null with anything, or a string with a number, fails the run with a new code, `TypeMismatch` (added to
+    P4-4's list). It never returns true or false.
+  - An index past a list's end fails with `IndexOutOfRange`, never null.
+  - A name that was never declared is a compile error in strict mode.
+  - **Tests:** the four probe programs above fail with their codes; `0 == "x"` and `null != "x"` fail; `"x" == "x"`
+    is true and `"x" == "y"` false, as today; number comparisons unchanged; `examples/qc_decision.cube` still passes
+    `validate`.
+- [ ] **P6-2: indexing a string gives its character.** `s[i]` returns the i-th character (Unicode scalar values, the
+  way the host counts them); past the end fails with `IndexOutOfRange`. Tests: `"hello"[1] == "e"`; the probe's
+  composed prefix and suffix programs give 1 on a hit and 0 on a miss.
+- [ ] **P6-3: `&&`, `||`, `!` and `else if` in conditions,** short-circuit. Tests: both sides of each, and a three-way
+  `else if`.
+- [ ] **P6-4: expressions as operands:** calls, method calls, indexes and arithmetic inside a condition, a `return`
+  or an argument (`if (xs.len() > 3)`, `return a + b * 2`). Tests: the probe's failing spellings now give the values
+  wanted.
+- [ ] **P6-5: whole-number division and `%`.** `div` keeps its meaning. If a new form needs a new opcode, it takes a
+  free byte and the cross-repo sync note; no existing byte changes. Tests: 7 // 2 is 3, 7 % 2 is 1, a negative case.
+- [ ] **P6-6: `break`** in `for` and `while`. Test: a loop that stops at its fourth turn.
+- [ ] **P6-7: string helpers:** `starts_with`, `ends_with`, `upper`, `lower`, `contains`, and `+` for concatenation.
+  Tests: a hit and a miss for each, in English and French (accents kept).
+
+- [ ] **P6-8: long lists fail loudly** (found by CubbyLLM 0067's step 2, 2026-11-13; with P6-1). As Code A reported
+  it: a list literal of 254 or more strings makes the run return nothing, and one of exactly 255 numbers errors. The
+  first test reproduces both and pins the exact edge. A list longer than the VM can hold fails with a code that names
+  the limit (`TooLong`), never an empty result. Raising the limit is a separate choice, made only if the bytecode
+  format allows it without changing an opcode byte. Until then CubbyLLM's views refuse more than 250 rows.
+
+**Order:** P6-1 with P6-8, then P6-2, then the rest in any order. Each probe program that fails today becomes a
+regression test with the value it should give. The global invariant holds.
+
 ## Notes
 - `examples/qc_decision.cube` stays compiling and passing `validate`: it is the guardrail for the executing half.
 - The tree holds 499 test functions (2026-11-11). The "96 tests" this file used to name was June's count.

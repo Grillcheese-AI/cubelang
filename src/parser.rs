@@ -871,6 +871,19 @@ impl Parser {
                     }
                     perms.push(Permission::Restricted(names));
                 }
+                // `@inputs(in_class, in_conf)` (P6-1): registers the host injects before the call.
+                TokenKind::AtInputs => {
+                    self.advance();
+                    self.expect(&TokenKind::LParen)?;
+                    let mut names = Vec::new();
+                    loop {
+                        self.skip_newlines();
+                        names.push(self.expect_ident()?);
+                        if !self.eat(&TokenKind::Comma) { break; }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    perms.push(Permission::Inputs(names));
+                }
                 // `@ratelimit(100, "1m")`: at most 100 calls from outside per minute.
                 TokenKind::AtRatelimit => {
                     self.advance();

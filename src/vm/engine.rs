@@ -1302,7 +1302,9 @@ impl VM {
                     let arr = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
                     let len = match self.registers.get(&arr) {
                         Some(Value::Array(v)) => v.len() as i64,
-                        Some(Value::Str(s)) => s.len() as i64,
+                        // P6-2 (2026-11-13): characters (Unicode scalar values, as the host counts them), the same
+                        // unit `s[i]` indexes by; it was bytes, so "été" had length 5
+                        Some(Value::Str(s)) => s.chars().count() as i64,
                         // 2026-10-24: a map's (or struct's) entries; it used to read 0
                         Some(Value::Map(m)) => m.len() as i64,
                         _ => 0,
@@ -1322,8 +1324,34 @@ impl VM {
                     // array indexing is unchanged.
                     let key = self.resolve_value(operands.get(2));
                     let i = key.as_i64();
+                    // P6-1 (2026-11-13): an index past a list's end, or one that is not a whole number, fails with
+                    // IndexOutOfRange / TypeMismatch; it used to give null, which then compared equal to any string.
+                    // P6-2 (2026-11-13): a string's i-th character (Unicode scalar values); it used to be null.
+                    if let Some(Value::Str(s)) = self.registers.get(&arr) {
+                        let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
+                        if !whole {
+                            return ExecResult::Error(format!("TypeMismatch: a string is indexed by a whole number, not {}", key));
+                        }
+                        let n = s.chars().count();
+                        if i < 0 || (i as usize) >= n {
+                            return ExecResult::Error(format!(
+                                "IndexOutOfRange: index {} of a string of {} characters in `{}`", i, n, arr));
+                        }
+                    }
+                    if let Some(Value::Array(v)) = self.registers.get(&arr) {
+                        let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
+                        if !whole {
+                            return ExecResult::Error(format!("TypeMismatch: a list is indexed by a whole number, not {}", key));
+                        }
+                        if i < 0 || (i as usize) >= v.len() {
+                            return ExecResult::Error(format!(
+                                "IndexOutOfRange: index {} of a list of {} items in `{}`", i, v.len(), arr));
+                        }
+                    }
                     let val = match self.registers.get(&arr) {
                         Some(Value::Array(v)) if i >= 0 && (i as usize) < v.len() => v[i as usize].clone(),
+                        // P6-2: in range, checked above
+                        Some(Value::Str(s)) => s.chars().nth(i as usize).map(|c| Value::Str(c.to_string())).unwrap_or(Value::Null),
                         // A map read was previously impossible: this arm did
                         // not exist, so `m["k"]` fell through to Null even
                         // when the key was present. Writing to a map was
@@ -1665,13 +1693,45 @@ impl VM {
                     // different blast radius, and the test that would cover it
                     // (`str_contains_evaluates_on_a_register_string`) is
                     // blocked on `str.contains` being a stub, not on this.
-                    let va = self.resolve_value(operands.get(0));
+                    // P6-1: a register nothing ever wrote is a missing value here (null), not the 0 that
+                    // `resolve_value` gives it elsewhere: an input the host never injected, or a name read
+                    // before anything set it, cannot pass a comparison.
+                    let compared = |op: Option<&Operand>| match op {
+                        Some(o @ Operand::Named(_)) if kind != 6 && !self.registers.contains_key(&o.as_name()) => Value::Null,
+                        other => self.resolve_value(other),
+                    };
+                    let va = compared(operands.get(0));
                     let vb = if kind == 6 {
                         Value::Int(0)
                     } else {
-                        self.resolve_value(operands.get(1))
+                        compared(operands.get(1))
                     };
 
+                    // P6-1 (2026-11-13): a missing value (null), a string against a number, or a list / map / hypervector
+                    // never compares: the run fails with TypeMismatch. A null used to read as 0 and an absent string
+                    // compared equal to any string literal, so a check on a value that was never there passed.
+                    // Truthiness (kind 6) is not a comparison and keeps its meaning.
+                    if kind != 6 {
+                        let class = |v: &Value| match v {
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_) => "number",
+                            Value::Str(_) => "string",
+                            Value::Null => "null",
+                            Value::Array(_) => "list",
+                            Value::Map(_) => "map",
+                            Value::Hvec(_) => "hypervector",
+                        };
+                        let (ca, cb) = (class(&va), class(&vb));
+                        if ca != cb || ca == "null" || !(ca == "number" || ca == "string") {
+                            let side = |c: &str, v: &Value| {
+                                if c == "null" { "a missing value (null)".to_string() } else { format!("{} `{}`", c, v) }
+                            };
+                            let msg = format!(
+                                "TypeMismatch: cannot compare {} with {}: a missing value, or a string against a \
+                                 number, never compares", side(ca, &va), side(cb, &vb));
+                            self.trace_op(pc, &format!("COMPARE {}", msg));
+                            return ExecResult::Error(msg);
+                        }
+                    }
                     let cmp_word;
                     match (&va, &vb) {
                         (Value::Str(x), Value::Str(y)) => {
@@ -3323,8 +3383,9 @@ mod tests {
     }
 
     #[test]
-    fn array_index_out_of_range_is_null() {
-        // Out-of-range indexing produces Null; sum yields 0 (as_i64 of Null).
+    fn array_index_out_of_range_fails() {
+        // P6-1 (2026-11-13): out-of-range indexing fails with IndexOutOfRange. It used to give Null (whose sum was
+        // 0), and a Null compared equal to any string.
         let mut vm = compile_and_load(r#"
             program T implements ISolve {
                 public function solve(input: str): void {
@@ -3335,9 +3396,8 @@ mod tests {
             }
         "#);
         match vm.call("T", "solve", Vec::new()) {
-            ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 0,
-                "out-of-range index must be Null, not panic"),
-            other => panic!("unexpected: {:?}", other),
+            ExecResult::Error(e) => assert!(e.starts_with("IndexOutOfRange"), "got {}", e),
+            other => panic!("an index past the end must fail, got {:?}", other),
         }
     }
 

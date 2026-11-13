@@ -20,6 +20,9 @@ use crate::vm::interfaces::InterfaceRegistry;
 
 // ── Opcode constants (match opcode-vsa-rs ir.rs) ────────────────────────────
 
+/// The most operands one instruction carries: its count is one byte (P6-8).
+pub const MAX_OPERANDS: usize = 255;
+
 pub mod op {
     pub const CREATE: u8    = 0x00;
     pub const DESTROY: u8   = 0x01;
@@ -768,7 +771,7 @@ pub fn contract_of(sig: &FunctionSig) -> (FnContract, Vec<String>) {
                 Ok(d) => c.cron = Some(d.as_millis() as u64),
                 Err(e) => errors.push(format!("@cron on {}: {}", sig.name, e)),
             },
-            Permission::Hook(_) | Permission::Before(_) | Permission::After(_) => {}
+            Permission::Hook(_) | Permission::Before(_) | Permission::After(_) | Permission::Inputs(_) => {}
         }
     }
     if sig.modifiers.contains(&Modifier::Private) {
@@ -910,6 +913,9 @@ pub struct Compiler {
     units: HashMap<String, Vec<FunctionSig>>,
     /// The current container's `programs { b: deploy P(); }`: binding -> P.
     bindings: HashMap<String, String>,
+    /// P6-1: the names the current program's functions may read without declaring them: its storage, the
+    /// file's functions, programs, containers, structs, enums, aliases, `use`d modules, the container's bindings.
+    known_names: std::collections::HashSet<String>,
     /// The current program's immutable storage: `(field, None)` for a whole
     /// field, `(field, Some(sub))` for one field of a container's `world`.
     /// Only the constructor (and a container's `on_start`) may write them.
@@ -945,6 +951,7 @@ impl Compiler {
             current_return: crate::types::TypeSpec::Any,
             units: HashMap::new(),
             bindings: HashMap::new(),
+            known_names: std::collections::HashSet::new(),
             immutable: Vec::new(),
             storage_defaults: Vec::new(),
             in_container: false,
@@ -1123,6 +1130,17 @@ impl Compiler {
                 storage_fields.push(name.clone());
             }
         }
+        // P6-1: what a function may read without declaring it (strict mode's undeclared-name check).
+        self.known_names = storage_fields.iter().cloned()
+            .chain(self.signatures.keys().cloned())
+            .chain(self.units.keys().cloned())
+            .chain(self.used_modules.iter().cloned())
+            .chain(self.struct_decls.keys().cloned())
+            .chain(self.types.structs.keys().cloned())
+            .chain(self.types.enums.keys().cloned())
+            .chain(self.types.aliases.keys().cloned())
+            .chain(self.bindings.keys().cloned())
+            .collect();
         for item in &prog.body {
             if let ProgramItem::Function(f) | ProgramItem::Constructor(f) = item {
                 functions.push(self.compile_function(f));
@@ -1623,6 +1641,27 @@ impl Compiler {
         }
         self.current_return = return_type.clone();
 
+        // P6-1: a name read as a value that nothing declares is a compile error under strict: it would read a
+        // register nothing wrote (null), and a null used to compare equal to any string.
+        if self.strict {
+            let mut known = self.known_names.clone();
+            for p in &func.sig.permissions {
+                if let Permission::Inputs(names) = p {
+                    known.extend(names.iter().cloned());
+                }
+            }
+            let registry = ModuleRegistry::new();
+            let used = self.used_modules.clone();
+            let own: std::collections::HashSet<String> = self.signatures.keys().cloned().collect();
+            let symbolic = |n: &str| !own.contains(n) && registry.resolve(&used, n).is_some();
+            for name in crate::names::undeclared(func, &known, &symbolic) {
+                self.strict_errors.push(format!(
+                    "strict: `{}` is read in {}::{} but never declared (UndeclaredName) -- declare it with `let`, \
+                     `create` or `@inputs(...)`, or check its spelling",
+                    name, self.current_program, self.current_function));
+            }
+        }
+
         for stmt in &func.body {
             self.compile_stmt(stmt);
         }
@@ -1670,7 +1709,7 @@ impl Compiler {
                 Permission::After(f) => format!("@after({})", f),
                 Permission::Cron(_) | Permission::Restricted(_) | Permission::Ratelimit(..)
                 | Permission::External | Permission::Internal
-                | Permission::System | Permission::Once => continue,
+                | Permission::System | Permission::Once | Permission::Inputs(_) => continue,
             };
             self.strict_violation(
                 &format!("attribute {} on function {} (parsed, not enforced by the VM)", what, sig.name),
@@ -2182,7 +2221,7 @@ impl Compiler {
             self.emit_debug(opcode, &format!(
                 "asm {} ({} operand(s))", instr.mnemonic, instr.operands.len()));
             self.emit_byte(opcode);
-            self.emit_byte(instr.operands.len() as u8);
+            self.emit_count(instr.operands.len(), "an asm instruction's operands");
             for operand in &instr.operands {
                 match operand {
                     AsmOperand::Named(name) => self.emit_named(name),
@@ -2365,7 +2404,7 @@ impl Compiler {
                 let code = ext_bytecode(*ext);
                 self.emit_debug(code, &format!("{:?} ({} args)", ext, args.len()));
                 self.emit_byte(code);
-                self.emit_byte(args.len() as u8);
+                self.emit_count(args.len(), "an extended opcode's arguments");
                 for arg in args {
                     match arg {
                         ExtArg::Reg(name) => self.emit_named(name),
@@ -2768,7 +2807,7 @@ impl Compiler {
                 self.emit_debug(op::MAKE_ARRAY,
                     &format!("make_array {} (n={})", let_stmt.name, elems.len()));
                 self.emit_byte(op::MAKE_ARRAY);
-                self.emit_byte((elems.len() as u8).saturating_add(2));
+                self.emit_count(elems.len() + 2, "a list literal");
                 self.emit_named(&let_stmt.name);
                 self.emit_imm(elems.len() as i64);
                 for e in elems { self.compile_expr_operand(e); }
@@ -2839,14 +2878,14 @@ impl Compiler {
             Expr::Ident(name) => {
                 self.emit_debug(op::CALL, &format!("call {}({})", name, args.len()));
                 self.emit_byte(op::CALL);
-                self.emit_byte((args.len() + 1) as u8);
+                self.emit_count(args.len() + 1, "a call's arguments");
                 self.emit_global(name);
                 for a in args { self.compile_expr_operand(a); }
             }
             _ => {
                 self.emit_debug(op::CALL, "call <expr>");
                 self.emit_byte(op::CALL);
-                self.emit_byte((args.len() + 1) as u8);
+                self.emit_count(args.len() + 1, "a call's arguments");
                 self.emit_byte(OP_NONE);
                 self.emit_byte(0x00);
                 self.emit_byte(0x00);
@@ -2944,7 +2983,7 @@ impl Compiler {
                 // (Full method dispatch is a later refinement.)
                 self.emit_debug(op::CALL, &format!(".{}()", method));
                 self.emit_byte(op::CALL);
-                self.emit_byte((args.len() + 1) as u8);
+                self.emit_count(args.len() + 1, "a call's arguments");
                 self.emit_global(method);
                 for a in args { self.compile_expr_operand(a); }
                 self.emit_byte(op::POP);
@@ -2962,6 +3001,26 @@ impl Compiler {
 
     fn emit_byte(&mut self, b: u8) {
         self.bytecode.push(b);
+    }
+
+    /// An instruction's operand count, one byte (P6-8, 2026-11-13). A count over 255 used to wrap or saturate, so
+    /// the operands written no longer matched the count read: a list literal of 254+ items ran as nothing, one of
+    /// 255 numbers misread its last operands. Now it is a compile error naming the limit (`TooLong`); a list
+    /// literal holds at most `MAX_OPERANDS - 2` items (its register and its length take two operands).
+    fn emit_count(&mut self, n: usize, what: &str) {
+        if n > MAX_OPERANDS {
+            let items = if what == "a list literal" { format!("{} items; at most {}", n - 2, MAX_OPERANDS - 2) }
+                        else { format!("{} operands; at most {}", n, MAX_OPERANDS) };
+            self.operand_errors.push(ParseError {
+                message: format!("TooLong: {} has {} fit one instruction{}", what, items,
+                    if self.current_function.is_empty() { String::new() }
+                    else { format!(" (in {}::{})", self.current_program, self.current_function) }),
+                span: self.current_span.unwrap_or(Span { line: 0, col: 0, offset: 0 }),
+            });
+            self.emit_byte(MAX_OPERANDS as u8);
+            return;
+        }
+        self.emit_byte(n as u8);
     }
 
     fn emit_named(&mut self, name: &str) {
@@ -3105,7 +3164,7 @@ impl Compiler {
                 self.emit_named(&tmp);
                 self.emit_type("auto");
                 self.emit_byte(op::MAKE_ARRAY);
-                self.emit_byte((elems.len() as u8).saturating_add(2));
+                self.emit_count(elems.len() + 2, "a list literal");
                 self.emit_named(&tmp);
                 self.emit_imm(elems.len() as i64);
                 for x in &elems {
@@ -3377,10 +3436,13 @@ impl Compiler {
             }
         }
         // Fallback: truthiness test of a single expression (kind = 6).
+        // P6 (2026-11-13): the kind goes in the THIRD operand, where COMPARE reads it. It was emitted second, so
+        // COMPARE took the 2-operand statement form (equality) and `if (t)` ran as `if (t == 6)`.
         self.emit_debug(op::COMPARE, "cond truthy");
         self.emit_byte(op::COMPARE);
-        self.emit_byte(2);
+        self.emit_byte(3);
         self.compile_expr_operand(cond);
+        self.emit_imm(0);
         self.emit_imm(6);
     }
 
