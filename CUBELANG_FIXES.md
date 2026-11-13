@@ -381,7 +381,7 @@ an index off by one can no longer make a wrong reply pass.
   - **Tests:** the smallest program above returns 0; the two pairs found compare unequal; two colliding variable names
     keep their own values.
 
-- [ ] **P6-10: P6 without the slowdown** (found by CubbyLLM 0072's rerun, 2026-11-13). Every verdict stayed the same
+- [x] **P6-10: P6 without the slowdown** (found by CubbyLLM 0072's rerun, 2026-11-13). Every verdict stayed the same
   on `676df1d` (47,000+ runs), but the same programs run 1.5 to 3.5 times slower than before (medians, same machine,
   same day: a 50-item merge check 21.6 ms on main's September build against 76.8 ms; a sort check 18.0 against 63.1;
   a one-pass replace check 0.7 against 1.7; CubbyLLM `validation/logs/verb_programs_2026-11-13_p6.json`). CubbyLLM
@@ -417,3 +417,4 @@ The items as first written, with the fence, are in this file's history (a6f2362)
 - **P6-2:** `"hello"[1] == "e"` is true; `len()` counts characters ("été" is 3).
 - **P6-9:** `"thing" == "government"` returns 0 on 8-byte keys; two colliding names keep their own values (`tests/p6_keys.rs`).
 - **Found and fixed with them:** a bare `if (t)` ran as `if (t == 6)`; STORE / RECALL keyed the memory by display tokens (`recall_min`'s 65 was nearest-key luck).
+- **P6-10 (2026-11-13, Code B, `b3b3360`):** a register's name built in one allocation, COMPARE and INDEX look a name up once. On CubbyLLM's timing programs, alternated in one session with `3f37515` and `676df1d`: 0.74x to 0.97x of `3f37515`'s median on every program of 1 ms or more (merge at 50 items 20.13 ms against 24.44 and 90.16); 525 of 525 verdicts agree (CubbyLLM `validation/logs/vm_p610_timing_2026-11-13.json`). The cowork build is rebuilt from it.
