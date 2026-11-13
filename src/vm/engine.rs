@@ -1302,7 +1302,9 @@ impl VM {
                     let arr = operands.get(1).map(|o| o.as_name()).unwrap_or_default();
                     let len = match self.registers.get(&arr) {
                         Some(Value::Array(v)) => v.len() as i64,
-                        Some(Value::Str(s)) => s.len() as i64,
+                        // P6-2 (2026-11-13): characters (Unicode scalar values, as the host counts them), the same
+                        // unit `s[i]` indexes by; it was bytes, so "été" had length 5
+                        Some(Value::Str(s)) => s.chars().count() as i64,
                         // 2026-10-24: a map's (or struct's) entries; it used to read 0
                         Some(Value::Map(m)) => m.len() as i64,
                         _ => 0,
@@ -1324,6 +1326,18 @@ impl VM {
                     let i = key.as_i64();
                     // P6-1 (2026-11-13): an index past a list's end, or one that is not a whole number, fails with
                     // IndexOutOfRange / TypeMismatch; it used to give null, which then compared equal to any string.
+                    // P6-2 (2026-11-13): a string's i-th character (Unicode scalar values); it used to be null.
+                    if let Some(Value::Str(s)) = self.registers.get(&arr) {
+                        let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
+                        if !whole {
+                            return ExecResult::Error(format!("TypeMismatch: a string is indexed by a whole number, not {}", key));
+                        }
+                        let n = s.chars().count();
+                        if i < 0 || (i as usize) >= n {
+                            return ExecResult::Error(format!(
+                                "IndexOutOfRange: index {} of a string of {} characters in `{}`", i, n, arr));
+                        }
+                    }
                     if let Some(Value::Array(v)) = self.registers.get(&arr) {
                         let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
                         if !whole {
@@ -1336,6 +1350,8 @@ impl VM {
                     }
                     let val = match self.registers.get(&arr) {
                         Some(Value::Array(v)) if i >= 0 && (i as usize) < v.len() => v[i as usize].clone(),
+                        // P6-2: in range, checked above
+                        Some(Value::Str(s)) => s.chars().nth(i as usize).map(|c| Value::Str(c.to_string())).unwrap_or(Value::Null),
                         // A map read was previously impossible: this arm did
                         // not exist, so `m["k"]` fell through to Null even
                         // when the key was present. Writing to a map was

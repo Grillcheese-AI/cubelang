@@ -59,17 +59,45 @@ const CAPITALS: &str = r#"create caps: number; assign caps = 0; let s = "HeLLo";
     if (c == u) { add caps, 1; } } add i, 1; } return caps;"#;
 
 #[test]
-fn the_probe_s_four_wrong_values_no_longer_come_out() {
-    // 3f37515 gave 1, 1, 1 and 130 (wanted 0, 0, 0 and 3), every one from a null that compared equal to a string.
-    for body in [PREFIX_MISS, SUFFIX_MISS, CHARS_UNEQUAL, CAPITALS] {
-        let r = run(body);
-        if let ExecResult::Error(e) = &r {
-            assert!(e.starts_with("TypeMismatch") || e.starts_with("IndexOutOfRange"), "{}", e);
-        } else {
-            let v = value(r);
-            assert!(v == 0 || v == 3, "a wrong value came out again: {} for {}", v, body);
-        }
-    }
+fn the_probe_s_four_wrong_values_are_now_right() {
+    // 3f37515 gave 1, 1, 1 and 130 (wanted 0, 0, 0 and 3), every one from `s[i]` reading null and a null comparing
+    // equal to any string. With P6-1 alone they stopped with TypeMismatch; with P6-2 `s[i]` is the character.
+    assert_eq!(value(run(PREFIX_MISS)), 0);
+    assert_eq!(value(run(SUFFIX_MISS)), 0);
+    assert_eq!(value(run(CHARS_UNEQUAL)), 0);
+    assert_eq!(value(run(CAPITALS)), 3);
+}
+
+// ── P6-2: a string's character ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn indexing_a_string_gives_its_character() {
+    assert_eq!(value(run(&format!("{} let s = \"hello\"; let c = s[1]; if (c == \"e\") {{ assign r = 1; }} return r;", N))), 1);
+    assert_eq!(value(run(&format!("{} let s = \"hello\"; let c = s[0]; if (c == \"e\") {{ assign r = 1; }} return r;", N))), 0);
+    // Unicode scalar values, as the host counts them; the length counts the same unit
+    assert_eq!(value(run(&format!("{} let s = \"été\"; let c = s[1]; if (c == \"t\") {{ assign r = 1; }} return r;", N))), 1);
+    assert_eq!(value(run(&format!("{} let s = \"été\"; let c = s[2]; if (c == \"é\") {{ assign r = 1; }} return r;", N))), 1);
+    assert_eq!(value(run("let s = \"été\"; let n = s.len(); return n;")), 3);
+    assert_eq!(value(run("let s = \"hello\"; let n = s.len(); return n;")), 5);
+    let e = error(run("let s = \"hello\"; let c = s[5]; return 0;"));
+    assert!(e.starts_with("IndexOutOfRange"), "{}", e);
+}
+
+#[test]
+fn the_probe_s_composed_prefix_and_suffix_give_1_on_a_hit_and_0_on_a_miss() {
+    let hit_prefix = PREFIX_MISS.replace("\"hx\"", "\"he\"");
+    let hit_suffix = SUFFIX_MISS.replace("\"xo\"", "\"lo\"");
+    assert_eq!(value(run(&hit_prefix)), 1);
+    assert_eq!(value(run(PREFIX_MISS)), 0);
+    assert_eq!(value(run(&hit_suffix)), 1);
+    assert_eq!(value(run(SUFFIX_MISS)), 0);
+    // French, accents kept: "école" starts with "éc" and ends with "le", not "lé"
+    let fr = |p: &str, suffix: bool| {
+        let base = if suffix { SUFFIX_MISS.replace("\"xo\"", &format!("\"{}\"", p)) }
+                   else { PREFIX_MISS.replace("\"hx\"", &format!("\"{}\"", p)) };
+        value(run(&base.replace("\"hello\"", "\"école\"")))
+    };
+    assert_eq!((fr("éc", false), fr("ec", false), fr("le", true), fr("lé", true)), (1, 0, 1, 0));
 }
 
 // ── P6-1: null, 0 and strings ─────────────────────────────────────────────────────────────────────────────
