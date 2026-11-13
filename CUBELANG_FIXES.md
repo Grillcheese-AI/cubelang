@@ -362,8 +362,14 @@ an index off by one can no longer make a wrong reply pass.
 - [ ] **P6-7: string helpers:** `starts_with`, `ends_with`, `upper`, `lower`, `contains`, and `+` for concatenation.
   Tests: a hit and a miss for each, in English and French (accents kept).
 
-**Order:** P6-1, then P6-2, then the rest in any order. Each probe program that fails today becomes a regression
-test with the value it should give. The global invariant holds.
+- [ ] **P6-8: long lists fail loudly** (found by CubbyLLM 0067's step 2, 2026-11-13; with P6-1). As Code A reported
+  it: a list literal of 254 or more strings makes the run return nothing, and one of exactly 255 numbers errors. The
+  first test reproduces both and pins the exact edge. A list longer than the VM can hold fails with a code that names
+  the limit (`TooLong`), never an empty result. Raising the limit is a separate choice, made only if the bytecode
+  format allows it without changing an opcode byte. Until then CubbyLLM's views refuse more than 250 rows.
+
+**Order:** P6-1 with P6-8, then P6-2, then the rest in any order. Each probe program that fails today becomes a
+regression test with the value it should give. The global invariant holds.
 
 ## Notes
 - `examples/qc_decision.cube` stays compiling and passing `validate`: it is the guardrail for the executing half.
