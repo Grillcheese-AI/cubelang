@@ -37,6 +37,7 @@ fn main() {
         "compile"  | "c" => cmd_compile(&args[2..]),
         "inspect"  | "i" => cmd_inspect(&args[2..]),
         "disasm"   | "d" => cmd_disasm(&args[2..]),
+        "keys"           => cmd_keys(),
         "check"    | "k" => cmd_check(&args[2..]),
         "validate" | "vd" => cmd_validate(&args[2..]),
         "run"      | "r" => cmd_run(&args[2..]),
@@ -283,6 +284,35 @@ fn cmd_inspect(args: &[String]) {
 }
 
 // ── disasm ──────────────────────────────────────────────────────────────────
+
+/// `cubelang keys` (fix list P6-9's cross-check): reads JSONL `{"id", "source"}` on stdin and writes, for each
+/// program, every spelling the compiler keys (names, string literals, its own labels) as JSONL
+/// `{"id", "spellings", "error"}`. A compile error is reported, never hidden; the spellings keyed before it are kept.
+fn cmd_keys() {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(out, "{}", serde_json::json!({"id": null, "spellings": [], "error": format!("bad line: {}", e)}));
+                continue;
+            }
+        };
+        let id = row.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let source = row.get("source").and_then(|s| s.as_str()).unwrap_or("");
+        let (spellings, error) = match compiler::keyed_spellings(source) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let _ = writeln!(out, "{}", serde_json::json!({"id": id, "spellings": spellings, "error": error}));
+    }
+}
 
 fn cmd_disasm(args: &[String]) {
     if args.is_empty() {

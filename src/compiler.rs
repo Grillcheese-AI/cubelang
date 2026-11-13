@@ -3662,6 +3662,17 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 /// doesn't recognize is a compile error here too (`asm_mnemonic_to_op`,
 /// always checked -- see `Compiler::asm_errors`'s doc), folded in after
 /// `interface_errors`.
+/// Every spelling one compilation of `source` keys -- names, string literals, the compiler's own labels -- sorted
+/// (P6-9's cross-check: `cubelang keys`). A parse error is the Err; compile errors do not stop the list.
+pub fn keyed_spellings(source: &str) -> Result<Vec<String>, String> {
+    let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
+    let mut c = Compiler::new();
+    c.compile(&ast);
+    let mut v: Vec<String> = c.keyed.values().cloned().collect();
+    v.sort();
+    Ok(v)
+}
+
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
     compile_ast(&ast)
