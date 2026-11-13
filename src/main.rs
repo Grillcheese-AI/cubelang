@@ -37,6 +37,7 @@ fn main() {
         "compile"  | "c" => cmd_compile(&args[2..]),
         "inspect"  | "i" => cmd_inspect(&args[2..]),
         "disasm"   | "d" => cmd_disasm(&args[2..]),
+        "keys"           => cmd_keys(),
         "check"    | "k" => cmd_check(&args[2..]),
         "validate" | "vd" => cmd_validate(&args[2..]),
         "run"      | "r" => cmd_run(&args[2..]),
@@ -284,6 +285,35 @@ fn cmd_inspect(args: &[String]) {
 
 // ── disasm ──────────────────────────────────────────────────────────────────
 
+/// `cubelang keys` (fix list P6-9's cross-check): reads JSONL `{"id", "source"}` on stdin and writes, for each
+/// program, every spelling the compiler keys (names, string literals, its own labels) as JSONL
+/// `{"id", "spellings", "error"}`. A compile error is reported, never hidden; the spellings keyed before it are kept.
+fn cmd_keys() {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(out, "{}", serde_json::json!({"id": null, "spellings": [], "error": format!("bad line: {}", e)}));
+                continue;
+            }
+        };
+        let id = row.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let source = row.get("source").and_then(|s| s.as_str()).unwrap_or("");
+        let (spellings, error) = match compiler::keyed_spellings(source) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let _ = writeln!(out, "{}", serde_json::json!({"id": id, "spellings": spellings, "error": error}));
+    }
+}
+
 fn cmd_disasm(args: &[String]) {
     if args.is_empty() {
         eprintln!("usage: cubelang disasm <file.cubebin>");
@@ -378,6 +408,30 @@ fn disasm_bytecode(bc: &[u8]) {
                     }
                 }
                 0x08 => operands.push("null".into()),
+                // P6-9: the same operands with an 8-byte key
+                0x09..=0x0C => {
+                    if pos + 8 <= bc.len() {
+                        let key: String = bc[pos..pos + 8].iter().map(|b| format!("{:02x}", b)).collect();
+                        let kind = match op_type { 0x09 => "named", 0x0A => "type", 0x0B => "role", _ => "global" };
+                        operands.push(format!("{}({})", kind, key));
+                        pos += 8;
+                    }
+                }
+                0x0D => {
+                    if pos + 8 < bc.len() {
+                        let base: String = bc[pos..pos + 8].iter().map(|b| format!("{:02x}", b)).collect();
+                        let n = bc[pos + 8] as usize;
+                        pos += 9;
+                        let mut keys = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            let Some(&len) = bc.get(pos) else { break };
+                            let end = (pos + 1 + len as usize).min(bc.len());
+                            keys.push(String::from_utf8_lossy(&bc[pos + 1..end]).into_owned());
+                            pos = end;
+                        }
+                        operands.push(format!("field(named({}).{})", base, keys.join(".")));
+                    }
+                }
                 0x00 => { // None
                     if pos + 1 < bc.len() {
                         pos += 2;

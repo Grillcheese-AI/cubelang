@@ -24,6 +24,7 @@ pub mod lev;
 pub mod typo_index;
 pub mod history;
 pub mod engine;
+pub mod key;
 pub mod registry;
 pub mod interfaces;
 pub mod governor;

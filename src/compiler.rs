@@ -116,12 +116,18 @@ const OP_FLOAT: u8  = 0x06;
 const OP_FIELD: u8  = 0x07;
 /// The `null` literal (2026-10-24). It used to compile to the integer 0.
 const OP_NULL: u8   = 0x08;
+// P6-9: Named / Type / Role / Global / Field with an 8-byte key (the 2-byte tags above still decode)
+const OP_NAMED8: u8  = 0x09;
+const OP_TYPE8: u8   = 0x0A;
+const OP_ROLE8: u8   = 0x0B;
+const OP_GLOBAL8: u8 = 0x0C;
+const OP_FIELD8: u8  = 0x0D;
 const OP_NONE: u8   = 0x00;
 
 /// BLAKE3 2-byte prefix of a string (deterministic hash).
-fn name_hash(s: &str) -> [u8; 2] {
-    let h = blake3::hash(s.as_bytes());
-    [h.as_bytes()[0], h.as_bytes()[1]]
+/// A name's key (P6-9: BLAKE3's first 8 bytes; it was 2, and two spellings shared one). See `vm::key`.
+fn name_hash(s: &str) -> crate::vm::key::Key {
+    crate::vm::key::Key::wide(s)
 }
 
 /// Map an extended reasoning opcode to its canonical bytecode (opcode-vsa-rs ir.rs).
@@ -261,7 +267,8 @@ pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
 /// u32 LE length, then JSON (`ProgramMeta`): `used_modules`, the file's
 /// types, and per function its override flag, access, `@once`,
 /// `@restricted`, `@ratelimit`, `@cron` and declared types.
-pub const CUBEBIN_VERSION: u8 = 4;
+/// v5 (P6-9): names and literals keyed by 8 bytes in the bytecode (operand tags 0x09..0x0D).
+pub const CUBEBIN_VERSION: u8 = 5;
 
 /// The v4 contract trailer (see `CUBEBIN_VERSION`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -410,6 +417,8 @@ pub struct CompiledProgram {
     /// before any constructor runs. A container's `config` and `world` are
     /// two of these.
     pub storage_defaults: Vec<(String, serde_json::Value)>,
+    /// P6-9: the bytecode keys names by 2 bytes (a `.cubebin` before version 5). Everything compiled now keys by 8.
+    pub narrow_keys: bool,
 }
 
 impl CompiledProgram {
@@ -499,7 +508,8 @@ impl CompiledProgram {
         // v3: + per-function declared parameter names. All three still load;
         // older files simply carry no params and fall back to `argN` binding.
         // v4: + the contract trailer (see `to_cubebin`).
-        if !(1..=4).contains(&version) {
+        // v5 (P6-9): the same layout, names keyed by 8 bytes in the bytecode.
+        if !(1..=5).contains(&version) {
             return Err(format!("unsupported .cubebin version: {}", version));
         }
 
@@ -621,7 +631,7 @@ impl CompiledProgram {
             storage_defaults = meta.storage_defaults;
         }
         Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules, types, container,
-                             storage_defaults })
+                             storage_defaults, narrow_keys: version < 5 })
     }
 
     /// Save to a `.cubebin` file.
@@ -916,6 +926,8 @@ pub struct Compiler {
     /// P6-1: the names the current program's functions may read without declaring them: its storage, the
     /// file's functions, programs, containers, structs, enums, aliases, `use`d modules, the container's bindings.
     known_names: std::collections::HashSet<String>,
+    /// P6-9: every key this compilation emitted, with its spelling (a second spelling on one key is an error).
+    keyed: HashMap<crate::vm::key::Key, String>,
     /// The current program's immutable storage: `(field, None)` for a whole
     /// field, `(field, Some(sub))` for one field of a container's `world`.
     /// Only the constructor (and a container's `on_start`) may write them.
@@ -952,6 +964,7 @@ impl Compiler {
             units: HashMap::new(),
             bindings: HashMap::new(),
             known_names: std::collections::HashSet::new(),
+            keyed: HashMap::new(),
             immutable: Vec::new(),
             storage_defaults: Vec::new(),
             in_container: false,
@@ -1161,6 +1174,7 @@ impl Compiler {
             types,
             container,
             storage_defaults: std::mem::take(&mut self.storage_defaults),
+            narrow_keys: false,
         }
     }
 
@@ -1543,7 +1557,7 @@ impl Compiler {
     /// name, transitively. (The VM refuses a denied opcode at run time too:
     /// this is the early, readable error.)
     fn check_denied(&mut self, programs: &[CompiledProgram]) {
-        let mut names: HashMap<[u8; 2], String> = HashMap::new();
+        let mut names: HashMap<crate::vm::key::Key, String> = HashMap::new();
         for p in programs {
             for s in &p.symbol_names {
                 names.insert(name_hash(s), s.clone());
@@ -3024,18 +3038,34 @@ impl Compiler {
     }
 
     fn emit_named(&mut self, name: &str) {
-        self.emit_byte(OP_NAMED);
-        let hash = name_hash(name);
-        self.emit_byte(hash[0]);
-        self.emit_byte(hash[1]);
+        self.emit_byte(OP_NAMED8);
+        self.emit_key(name);
+    }
+
+    /// A name's 8-byte key (P6-9), checked against every other spelling this compilation keyed: two spellings with
+    /// one key would read as one, so that is a compile error naming both (`KeyCollision`).
+    fn emit_key(&mut self, name: &str) {
+        let key = name_hash(name);
+        match self.keyed.get(&key) {
+            Some(other) if other != name => {
+                let msg = format!("KeyCollision: `{}` and `{}` share the key {}; rename one", other, name, key.hex());
+                self.operand_errors.push(ParseError {
+                    message: msg,
+                    span: self.current_span.unwrap_or(Span { line: 0, col: 0, offset: 0 }),
+                });
+            }
+            Some(_) => {}
+            None => { self.keyed.insert(key, name.to_string()); }
+        }
+        for b in key.as_slice().to_vec() {
+            self.emit_byte(b);
+        }
     }
 
     /// `base.k1.k2...` as one operand (the caller checked the lengths fit a byte).
     fn emit_field(&mut self, base: &str, path: &[String]) {
-        self.emit_byte(OP_FIELD);
-        let hash = name_hash(base);
-        self.emit_byte(hash[0]);
-        self.emit_byte(hash[1]);
+        self.emit_byte(OP_FIELD8);
+        self.emit_key(base);
         self.emit_byte(path.len() as u8);
         for key in path {
             self.emit_byte(key.len() as u8);
@@ -3357,17 +3387,13 @@ impl Compiler {
     }
 
     fn emit_type(&mut self, ty: &str) {
-        self.emit_byte(OP_TYPE);
-        let hash = name_hash(ty);
-        self.emit_byte(hash[0]);
-        self.emit_byte(hash[1]);
+        self.emit_byte(OP_TYPE8);
+        self.emit_key(ty);
     }
 
     fn emit_role(&mut self, role: &str) {
-        self.emit_byte(OP_ROLE);
-        let hash = name_hash(role);
-        self.emit_byte(hash[0]);
-        self.emit_byte(hash[1]);
+        self.emit_byte(OP_ROLE8);
+        self.emit_key(role);
     }
 
     fn emit_global(&mut self, name: &str) {
@@ -3377,10 +3403,8 @@ impl Compiler {
         // text -- the very thing the trunk is supposed to render into language
         // for the user -- comes back as `g_e009`.
         self.record_symbol(name);
-        self.emit_byte(OP_GLOBAL);
-        let hash = name_hash(name);
-        self.emit_byte(hash[0]);
-        self.emit_byte(hash[1]);
+        self.emit_byte(OP_GLOBAL8);
+        self.emit_key(name);
     }
 
     fn emit_label(&mut self, name: &str) {
@@ -3638,6 +3662,17 @@ pub fn ext_name(o: ExtOp) -> &'static str {
 /// doesn't recognize is a compile error here too (`asm_mnemonic_to_op`,
 /// always checked -- see `Compiler::asm_errors`'s doc), folded in after
 /// `interface_errors`.
+/// Every spelling one compilation of `source` keys -- names, string literals, the compiler's own labels -- sorted
+/// (P6-9's cross-check: `cubelang keys`). A parse error is the Err; compile errors do not stop the list.
+pub fn keyed_spellings(source: &str) -> Result<Vec<String>, String> {
+    let ast = crate::parser::parse(source).map_err(|e| format!("parse error: {}", e))?;
+    let mut c = Compiler::new();
+    c.compile(&ast);
+    let mut v: Vec<String> = c.keyed.values().cloned().collect();
+    v.sort();
+    Ok(v)
+}
+
 pub fn compile(source: &str) -> Result<Vec<CompiledProgram>, crate::parser::ParseError> {
     let ast = crate::parser::parse(source)?;
     compile_ast(&ast)
@@ -4036,6 +4071,19 @@ mod tests {
     }
 
     // ── P0-1: --strict compile mode ──────────────────────────────────
+
+    #[test]
+    fn two_spellings_on_one_key_are_a_compile_error() {
+        // P6-9: no 8-byte collision is known, so one is planted: `y`'s key already belongs to `x`.
+        let mut c = Compiler::new();
+        c.keyed.insert(crate::vm::key::Key::wide("y"), "x".to_string());
+        let ast = crate::parser::parse(
+            "program P implements ISolve { public function solve(mention: str): number { let y = 1; return y; } }",
+        ).unwrap();
+        c.compile(&ast);
+        assert!(c.operand_errors.iter().any(|e| e.message.starts_with("KeyCollision") && e.message.contains("`x`")
+            && e.message.contains("`y`")), "{:?}", c.operand_errors);
+    }
 
     #[test]
     fn strict_qc_decision_compiles() {
