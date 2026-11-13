@@ -340,7 +340,7 @@ an index off by one can no longer make a wrong reply pass.
 - **Over a conventional model:** a model judging its own reply gives a sampled verdict that nobody can replay. Here the
   verdict is a program run, and since P6-1 it cannot come from a value that was never there.
 
-- [ ] **P6-1: a missing value never compares** (blocks CubbyLLM 0067's second reader; first).
+- [x] **P6-1: a missing value never compares** (blocks CubbyLLM 0067's second reader; first).
   - Comparing null with anything, or a string with a number, fails the run with a new code, `TypeMismatch` (added to
     P4-4's list). It never returns true or false.
   - An index past a list's end fails with `IndexOutOfRange`, never null.
@@ -348,7 +348,7 @@ an index off by one can no longer make a wrong reply pass.
   - **Tests:** the four probe programs above fail with their codes; `0 == "x"` and `null != "x"` fail; `"x" == "x"`
     is true and `"x" == "y"` false, as today; number comparisons unchanged; `examples/qc_decision.cube` still passes
     `validate`.
-- [ ] **P6-2: indexing a string gives its character.** `s[i]` returns the i-th character (Unicode scalar values, the
+- [x] **P6-2: indexing a string gives its character.** `s[i]` returns the i-th character (Unicode scalar values, the
   way the host counts them); past the end fails with `IndexOutOfRange`. Tests: `"hello"[1] == "e"`; the probe's
   composed prefix and suffix programs give 1 on a hit and 0 on a miss.
 - [ ] **P6-3: `&&`, `||`, `!` and `else if` in conditions,** short-circuit. Tests: both sides of each, and a three-way
@@ -362,13 +362,13 @@ an index off by one can no longer make a wrong reply pass.
 - [ ] **P6-7: string helpers:** `starts_with`, `ends_with`, `upper`, `lower`, `contains`, and `+` for concatenation.
   Tests: a hit and a miss for each, in English and French (accents kept).
 
-- [ ] **P6-8: long lists fail loudly** (found by CubbyLLM 0067's step 2, 2026-11-13; with P6-1). As Code A reported
+- [x] **P6-8: long lists fail loudly** (found by CubbyLLM 0067's step 2, 2026-11-13; with P6-1). As Code A reported
   it: a list literal of 254 or more strings makes the run return nothing, and one of exactly 255 numbers errors. The
   first test reproduces both and pins the exact edge. A list longer than the VM can hold fails with a code that names
   the limit (`TooLong`), never an empty result. Raising the limit is a separate choice, made only if the bytecode
   format allows it without changing an opcode byte. Until then CubbyLLM's views refuse more than 250 rows.
 
-- [ ] **P6-9: two different strings never share a key** (found by CubbyLLM 0067's step 2, 2026-11-13; Nick: "should
+- [x] **P6-9: two different strings never share a key** (found by CubbyLLM 0067's step 2, 2026-11-13; Nick: "should
   be fixed in Code B cubelang version"). The compiler keys every identifier and string literal by BLAKE3's first two
   bytes (`compiler.rs` `name_hash`, `engine.rs` `name_table`), so two spellings with one key read as one:
   `"thing" == "government"` is true (both `15d0`; also `"eptwcv"` / `"rmcens"`), and two variables with one key would
@@ -399,3 +399,10 @@ regression test with the value it should give. The global invariant holds.
 - **P2-4, an early `return`:** a `return` inside an `if` ends the function with that value.
 
 The items as first written, with the fence, are in this file's history (a6f2362).
+
+## Closed 2026-11-13, each checked by running (Code B, `676df1d`; the cowork build rebuilt from it)
+- **P6-1:** a compare that meets a missing value fails: `let v = xs[5]; if (v == "a")` on a list of 2 gives `IndexOutOfRange`; `0 == "x"` gives `TypeMismatch`; an undeclared name is `UndeclaredName` (`tests/p6_compare.rs`).
+- **P6-8:** a list literal of 254 items or more is `TooLong` at compile time; 253 run (`tests/p6_compare.rs`).
+- **P6-2:** `"hello"[1] == "e"` is true; `len()` counts characters ("été" is 3).
+- **P6-9:** `"thing" == "government"` returns 0 on 8-byte keys; two colliding names keep their own values (`tests/p6_keys.rs`).
+- **Found and fixed with them:** a bare `if (t)` ran as `if (t == 6)`; STORE / RECALL keyed the memory by display tokens (`recall_min`'s 65 was nearest-key luck).
