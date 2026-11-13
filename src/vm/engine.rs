@@ -827,7 +827,7 @@ impl VM {
         // in place across its calls, and set to its declared starting value
         // (a constant) unless it already holds one -- before any constructor
         // runs (DRIFT B11).
-        let keys: HashSet<String> = prog.storage_fields.iter().map(|f| format!("r_{}", Key::of(f, wide).hex())).collect();
+        let keys: HashSet<String> = prog.storage_fields.iter().map(|f| Key::of(f, wide).named("r_")).collect();
         if self.active.as_deref() == Some(prog.name.as_str()) {
             self.storage_keys = keys.clone();
         }
@@ -839,7 +839,7 @@ impl VM {
             } else {
                 &mut self.parked.entry(prog.name.clone()).or_default().registers
             };
-            regs.entry(format!("r_{}", Key::of(field, wide).hex())).or_insert_with(|| json_to_value(value));
+            regs.entry(Key::of(field, wide).named("r_")).or_insert_with(|| json_to_value(value));
         }
         // A container's `permissions { }`, in the order it wrote them.
         if let Some(meta) = &prog.container {
@@ -1334,31 +1334,30 @@ impl VM {
                     // P6-1 (2026-11-13): an index past a list's end, or one that is not a whole number, fails with
                     // IndexOutOfRange / TypeMismatch; it used to give null, which then compared equal to any string.
                     // P6-2 (2026-11-13): a string's i-th character (Unicode scalar values); it used to be null.
-                    if let Some(Value::Str(s)) = self.registers.get(&arr) {
-                        let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
-                        if !whole {
-                            return ExecResult::Error(format!("TypeMismatch: a string is indexed by a whole number, not {}", key));
-                        }
-                        let n = s.chars().count();
-                        if i < 0 || (i as usize) >= n {
-                            return ExecResult::Error(format!(
-                                "IndexOutOfRange: index {} of a string of {} characters in `{}`", i, n, arr));
-                        }
-                    }
-                    if let Some(Value::Array(v)) = self.registers.get(&arr) {
-                        let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
-                        if !whole {
-                            return ExecResult::Error(format!("TypeMismatch: a list is indexed by a whole number, not {}", key));
-                        }
-                        if i < 0 || (i as usize) >= v.len() {
-                            return ExecResult::Error(format!(
-                                "IndexOutOfRange: index {} of a list of {} items in `{}`", i, v.len(), arr));
-                        }
-                    }
+                    // (P6-10: one lookup of the container, not three.)
+                    let whole = matches!(key, Value::Int(_)) || matches!(key, Value::Float(f) if f.fract() == 0.0);
                     let val = match self.registers.get(&arr) {
-                        Some(Value::Array(v)) if i >= 0 && (i as usize) < v.len() => v[i as usize].clone(),
-                        // P6-2: in range, checked above
-                        Some(Value::Str(s)) => s.chars().nth(i as usize).map(|c| Value::Str(c.to_string())).unwrap_or(Value::Null),
+                        Some(Value::Array(v)) => {
+                            if !whole {
+                                return ExecResult::Error(format!("TypeMismatch: a list is indexed by a whole number, not {}", key));
+                            }
+                            if i < 0 || (i as usize) >= v.len() {
+                                return ExecResult::Error(format!(
+                                    "IndexOutOfRange: index {} of a list of {} items in `{}`", i, v.len(), arr));
+                            }
+                            v[i as usize].clone()
+                        }
+                        Some(Value::Str(s)) => {
+                            if !whole {
+                                return ExecResult::Error(format!("TypeMismatch: a string is indexed by a whole number, not {}", key));
+                            }
+                            let c = if i < 0 { None } else { s.chars().nth(i as usize) };
+                            match c {
+                                Some(c) => Value::Str(c.to_string()),
+                                None => return ExecResult::Error(format!(
+                                    "IndexOutOfRange: index {} of a string of {} characters in `{}`", i, s.chars().count(), arr)),
+                            }
+                        }
                         // A map read was previously impossible: this arm did
                         // not exist, so `m["k"]` fell through to Null even
                         // when the key was present. Writing to a map was
@@ -1708,7 +1707,8 @@ impl VM {
                     // `resolve_value` gives it elsewhere: an input the host never injected, or a name read
                     // before anything set it, cannot pass a comparison.
                     let compared = |op: Option<&Operand>| match op {
-                        Some(o @ Operand::Named(_)) if kind != 6 && !self.registers.contains_key(&o.as_name()) => Value::Null,
+                        // (P6-10: one name built and one lookup, not two of each)
+                        Some(o @ Operand::Named(_)) if kind != 6 => self.registers.get(&o.as_name()).cloned().unwrap_or(Value::Null),
                         other => self.resolve_value(other),
                     };
                     let va = compared(operands.get(0));
@@ -2371,7 +2371,7 @@ impl VM {
     /// A missing field, or a field of something that is not a map (a struct
     /// value is a map), reads as Null -- the same as an index past the end.
     fn read_field(&self, base: &Key, path: &[String]) -> Value {
-        let mut v = self.registers.get(&format!("r_{}", base.hex())).cloned().unwrap_or(Value::Null);
+        let mut v = self.registers.get(&base.named("r_")).cloned().unwrap_or(Value::Null);
         for key in path {
             v = match v {
                 Value::Map(mut m) => m.remove(key).unwrap_or(Value::Null),
@@ -2450,7 +2450,7 @@ impl VM {
     /// first 8 bytes since P6-9), matching `Operand::Named(h).as_name()`. Hosts
     /// must use this to reach a register the bytecode refers to by name.
     pub fn register_key(name: &str) -> String {
-        format!("r_{}", Key::wide(name).hex())
+        Key::wide(name).named("r_")
     }
 
     /// `register_key` for `program`: the 2-byte key for a program from a pre-v5 `.cubebin` (P6-9).
@@ -2540,7 +2540,7 @@ impl VM {
         for (name, p) in &self.programs {
             let regs = &mut self.parked.entry(name.clone()).or_default().registers;
             for (field, value) in &p.storage_defaults {
-                regs.insert(format!("r_{}", Key::of(field, !p.narrow_keys).hex()), json_to_value(value));
+                regs.insert(Key::of(field, !p.narrow_keys).named("r_"), json_to_value(value));
             }
         }
     }
@@ -2767,10 +2767,10 @@ enum Operand {
 impl Operand {
     fn as_name(&self) -> String {
         match self {
-            Operand::Named(h) => format!("r_{}", h.hex()),
-            Operand::Global(h) => format!("g_{}", h.hex()),
-            Operand::Type(h) => format!("t_{}", h.hex()),
-            Operand::Role(h) => format!("role_{}", h.hex()),
+            Operand::Named(h) => h.named("r_"),
+            Operand::Global(h) => h.named("g_"),
+            Operand::Type(h) => h.named("t_"),
+            Operand::Role(h) => h.named("role_"),
             Operand::Imm(n) => format!("imm_{}", n),
             Operand::FloatImm(f) => format!("fimm_{}", f),
             Operand::Field(h, path) => format!("field_{}.{}", h.hex(), path.join(".")),
@@ -2783,7 +2783,7 @@ impl Operand {
         match self {
             Operand::Imm(n) => Value::Int(*n),
             Operand::FloatImm(f) => Value::Float(*f),
-            Operand::Named(h) => Value::Str(format!("r_{}", h.hex())),
+            Operand::Named(h) => Value::Str(h.named("r_")),
             Operand::Global(h) => Value::Str(format!("g_{}", h.hex())),
             _ => Value::Null,
         }

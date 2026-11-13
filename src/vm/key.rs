@@ -60,7 +60,26 @@ impl Key {
 
     /// Lower-case hex of the bytes (4 digits narrow, 16 wide): what a register name carries.
     pub fn hex(&self) -> String {
-        self.as_slice().iter().map(|b| format!("{:02x}", b)).collect()
+        let mut s = String::with_capacity(16);
+        self.push_hex(&mut s);
+        s
+    }
+
+    /// `prefix` + `hex()` in one allocation (P6-10: a register's name is built on every operand of every
+    /// instruction; eight `format!` calls and a collect per name made the VM 1.5-3.5x slower than the 2-byte keys).
+    pub fn named(&self, prefix: &str) -> String {
+        let mut s = String::with_capacity(prefix.len() + 16);
+        s.push_str(prefix);
+        self.push_hex(&mut s);
+        s
+    }
+
+    fn push_hex(&self, s: &mut String) {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        for b in self.as_slice() {
+            s.push(DIGITS[(b >> 4) as usize] as char);
+            s.push(DIGITS[(b & 15) as usize] as char);
+        }
     }
 
     /// Parse the hex back (the inverse of `hex`), or None.
