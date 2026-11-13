@@ -14,6 +14,7 @@ pub mod lexer;
 pub mod ast;
 pub mod parser;
 pub mod compiler;
+pub mod names;
 pub mod validate;
 pub mod vm;
 pub mod loader;

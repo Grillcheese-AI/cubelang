@@ -538,6 +538,7 @@ program B implements ISolve {
         self.count += 1;
         return self.count;
     }
+    @inputs(leftover)
     public function peek(): str { return leftover; }
 }
 container C {

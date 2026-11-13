@@ -234,6 +234,9 @@ pub enum Permission {
     Once,
     Restricted(Vec<String>),
     Ratelimit(i64, String),
+    /// `@inputs(a, b)` (fix list P6-1): the registers the host sets before it calls the function, so strict
+    /// mode's undeclared-name check counts them as declared. A declaration only: the VM checks nothing more.
+    Inputs(Vec<String>),
 }
 
 // ── Storage, IO, Config ─────────────────────────────────────────────────────

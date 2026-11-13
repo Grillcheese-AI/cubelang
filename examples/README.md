@@ -38,7 +38,7 @@ of rotting silently.
 | `ground_min.cube` | `ISolve`, real QUERY (not trace-only — see DRIFT §A3), LEN, ASK | `run examples/ground_min.cube --json` | `{"result":0,...}` (no `--knowledge`: QUERY finds nothing → gap) |
 | `gsm8k.cube` | **Aspirational / no longer compiles at all** — struct/map/typed surface; a `BinOp`/`StructLit`/`MapLit`/`MethodCall`/`Index` used as an operand is now a hard compile error in every mode (`docs/DRIFT.md` §C11), on top of map-index assigns (see header, `docs/DRIFT.md` "Bugs found" #1) | `run examples/gsm8k.cube --json` | compile error (exit 1, nothing on stdout); stderr names `BinOp`/`MapLit`/... — see `tests/examples_pinned.rs` |
 | `loop_min.cube` | `ISolver`, real `while`, store/remember | `run examples/loop_min.cube --json` | `{"result":42,...}` |
-| `qc_decision.cube` | `ISolver`, the host-injects-registers pattern (see header WARNING) | `run examples/qc_decision.cube --json` | `{"result":2,...}` (REVIEW — no registers injected on this plain invocation) |
+| `qc_decision.cube` | `ISolver`, the host-injects-registers pattern (see header WARNING) | `run examples/qc_decision.cube --json` | `{"ok":false,"error":"TypeMismatch: ..."}` (no registers injected on this plain invocation: a missing value never compares, P6-1) |
 | `recall_min.cube` | `ISolver`, STORE overwrite + RECALL (cosine cleanup) | `run examples/recall_min.cube --json` | `{"result":65,...}` |
 | `conversation_agent/conversation_agent.cube` | **Broken — no longer compiles at all** (previously failed only at runtime; now fails earlier and more honestly at compile time for the same C11 reason as `gsm8k.cube` — see header, `docs/DRIFT.md` "Bugs found" #2) | `run examples/conversation_agent/conversation_agent.cube --json` | compile error (exit 1, nothing on stdout); stderr names `BinOp`/... — see `tests/examples_pinned.rs` |
 | `conversation_agent/conversation_min.cube` | `ISolver`, the working minimal conversational shape | `run examples/conversation_agent/conversation_min.cube --json` | `{"result":10,...}` |
@@ -78,7 +78,7 @@ of rotting silently.
 - `qc_decision.cube` is only meaningful when a host injects `in_class`/
   `in_conf` registers before calling `solve` (see its header's HOST SHIM
   CONTRACT). Running it plainly, as the table above does, is a valid but
-  different scenario (no registers set → always REVIEW) — both are real,
+  different scenario (no registers set → TypeMismatch since P6-1; it used to read 0 and always answer REVIEW) — both are real,
   both are documented, neither is a bug.
 - `.cubebin` files (`gsm8k.cubebin`, `qc_decision.cubebin`) are pre-compiled
   snapshots, not re-verified by this audit beyond `cubelang inspect`/

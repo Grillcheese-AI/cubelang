@@ -139,12 +139,14 @@ fn loop_min_accumulates_six_sevens() {
 }
 
 #[test]
-fn qc_decision_reviews_when_no_registers_are_injected() {
-    // Plain `run`, no --arg: in_conf/in_class are unset (resolve to 0), so
-    // 0 < min_confidence(70) is always true -> REVIEW (2). See the file's
-    // own header WARNING and docs/DRIFT.md "Bugs found" #4 -- this is the
-    // documented behavior of the plain invocation, not a bug in itself.
-    assert_ok_result("qc_decision.cube", &[], 2);
+fn qc_decision_fails_when_no_registers_are_injected() {
+    // Plain `run`, no --arg: in_conf/in_class are unset. Until fix list P6-1
+    // (2026-11-13) they read as 0, so 0 < min_confidence(70) was always true
+    // and the answer was always REVIEW (2), a disposition nothing measured.
+    // A missing value now never compares: the run fails with TypeMismatch.
+    let json = run_json("qc_decision.cube", &[]);
+    assert_eq!(json["ok"], false, "{}", json);
+    assert!(json["error"].as_str().unwrap_or("").starts_with("TypeMismatch"), "{}", json);
 }
 
 #[test]

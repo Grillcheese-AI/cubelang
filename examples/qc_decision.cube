@@ -26,15 +26,16 @@
 # WARNING (see docs/DRIFT.md "Bugs found" #4): plain `cubelang run
 # examples/qc_decision.cube --json`, with no register injection, does NOT
 # exercise the host shim contract above — `in_class`/`in_conf` are simply
-# unset (resolve to 0), so `in_conf < min_confidence` (0 < 70) is always
-# true and the disposition is always REVIEW. That is expected given the
-# missing injection, not a VM bug.
+# unset. Since fix list P6-1 (2026-11-13) a missing value never compares:
+# `in_conf < min_confidence` fails the run with TypeMismatch instead of
+# reading 0 and always answering REVIEW. That is expected given the missing
+# injection: the program says it could not decide.
 #
 # Demonstrates: ISolver, storage+constructor, the host-injects-registers
 # pattern (a case where the model/program does NOT own all its own inputs).
 # Run:    $CUBELANG_EXE run examples/qc_decision.cube --json
-# Expect: {"result":2,...}  (REVIEW — see WARNING above; this is the plain
-#          `run` invocation, not the host-shim-injected one)
+# Expect: {"ok":false,"error":"TypeMismatch: ..."}  (see WARNING above; this is
+#          the plain `run` invocation, not the host-shim-injected one)
 
 program QCDecision implements ISolver {
     type Input = number;
@@ -62,8 +63,10 @@ program QCDecision implements ISolver {
         return raw;
     }
 
+    @inputs(in_class, in_conf)
     function solve(input: Input): Output {
-        # in_class / in_conf are injected as registers by the host shim.
+        # in_class / in_conf are injected as registers by the host shim (`@inputs` declares them; P6-1:
+        # without them, `in_conf < min_confidence` fails with TypeMismatch instead of reading 0).
         create decision : number;
         assign decision = 0;            # default PASS
 

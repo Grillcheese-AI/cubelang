@@ -225,6 +225,7 @@ impl<'a> Lexer<'a> {
             "once"       => Token { kind: TokenKind::AtOnce, span },
             "restricted" => Token { kind: TokenKind::AtRestricted, span },
             "ratelimit"  => Token { kind: TokenKind::AtRatelimit, span },
+            "inputs"     => Token { kind: TokenKind::AtInputs, span },
             _            => Token { kind: TokenKind::At, span }, // bare @
         }
     }
