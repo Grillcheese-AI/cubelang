@@ -368,7 +368,20 @@ an index off by one can no longer make a wrong reply pass.
   the limit (`TooLong`), never an empty result. Raising the limit is a separate choice, made only if the bytecode
   format allows it without changing an opcode byte. Until then CubbyLLM's views refuse more than 250 rows.
 
-**Order:** P6-1 with P6-8, then P6-2, then the rest in any order. Each probe program that fails today becomes a
+- [ ] **P6-9: two different strings never share a key** (found by CubbyLLM 0067's step 2, 2026-11-13; Nick: "should
+  be fixed in Code B cubelang version"). The compiler keys every identifier and string literal by BLAKE3's first two
+  bytes (`compiler.rs` `name_hash`, `engine.rs` `name_table`), so two spellings with one key read as one:
+  `"thing" == "government"` is true (both `15d0`; also `"eptwcv"` / `"rmcens"`), and two variables with one key would
+  share a register. 121 of 500 generated programs carried such a pair.
+  - Two different strings compare unequal and two names never share a register, whatever their hash. Interning by
+    the whole string (a program's own table, the operand an index into it) keeps a two-byte operand without a hash;
+    a wider key is the other way. Either way no opcode byte changes, and the cubemind and opcode-vsa-rs VMs get the
+    sync note if the operand's meaning changes.
+  - If any key stays a hash, a collision inside one program is a compile error naming both spellings.
+  - **Tests:** the smallest program above returns 0; the two pairs found compare unequal; two colliding variable names
+    keep their own values.
+
+**Order:** P6-1 with P6-8 and P6-9, then P6-2, then the rest in any order. Each probe program that fails today becomes a
 regression test with the value it should give. The global invariant holds.
 
 ## Notes
