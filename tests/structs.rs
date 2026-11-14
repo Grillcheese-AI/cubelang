@@ -227,17 +227,37 @@ fn a_malformed_struct_literal_does_not_compile() {
 }
 
 #[test]
-fn a_field_of_something_that_is_not_a_variable_is_refused() {
+fn a_field_of_a_call_reads_the_field_of_what_it_returns() {
+    // `let a = f().x;` used to read a register named "x" (silently 0), then was refused; since P6-4 (2026-11-13) the
+    // call runs first and the field is read from its result.
     let src = r#"
+struct Point { x: i64; y: i64 = 0; }
 program P implements ISolve {
-    public function f(): number { return 1; }
+    public function f(): Point { let p = Point { x: 3 }; return p; }
+    public function g(): number { return 1; }
     @external
     public function solve(input: str): number {
         let a = f().x;
         return a;
     }
+    @external
+    public function on_a_number(input: str): number {
+        create r: number; assign r = 0;
+        if (g().x == 1) { assign r = 1; }
+        return r;
+    }
 }
 "#;
-    // `let a = f().x;` used to read a register named "x" (silently 0)
-    assert!(compiler::compile(src).is_err());
+    let prog = compiler::compile_strict(src).unwrap().pop().unwrap();
+    let mut vm = VM::new();
+    vm.load(prog);
+    match vm.call("P", "solve", vec![Value::Str("x".into())]) {
+        ExecResult::Return(v) | ExecResult::Ok(v) => assert_eq!(int(v), 3),
+        other => panic!("{other:?}"),
+    }
+    // a number has no field: the read is null, and a null never compares (P6-1)
+    match vm.call("P", "on_a_number", vec![Value::Str("x".into())]) {
+        ExecResult::Error(e) => assert!(e.contains("TypeMismatch"), "{}", e),
+        other => panic!("expected TypeMismatch, got {:?}", other),
+    }
 }

@@ -282,6 +282,7 @@ impl<'a> Lexer<'a> {
             "else"         => TokenKind::Else,
             "for"          => TokenKind::For,
             "while"        => TokenKind::While,
+            "break"        => TokenKind::Break,
             "match"        => TokenKind::Match,
             "in"           => TokenKind::In,
             "of"           => TokenKind::Of,
@@ -537,6 +538,10 @@ impl<'a> Lexer<'a> {
                 if self.peek() == b'=' {
                     self.advance();
                     TokenKind::SlashEq
+                } else if self.peek() == b'/' {
+                    // P6-5: `//` is whole-number division (comments start with `#`)
+                    self.advance();
+                    TokenKind::SlashSlash
                 } else {
                     TokenKind::Slash
                 }

@@ -548,6 +548,16 @@ every mode**, not just `--strict` — a mode flag was not an acceptable gate
 for the one silent-garbage path `--strict` structurally could not catch.
 The diagnostic names the form and the `Program::function` it occurred in.
 
+#### Status 2026-11-13 — P6-4: compound operands are computed, not refused
+`src/lower.rs` is the lowering pass the paragraph below says this compiler
+lacks: a compound operand (arithmetic, a call, a method call, an index, a
+condition used as a value, a field read of any of them) is computed into a
+fresh register just before the instruction that reads it, and that register
+is the operand. The probe above now returns `4`. C11's line holds -- no
+operand is ever silent garbage -- and a form with no computation (`await`, for
+one) is still a hard compile error in every mode
+(`tests/operand_errors.rs`). The paragraph below is the history.
+
 The structural fact behind C11, which the entry above stops short of
 stating: **there is no expression-lowering pass in this compiler, and no
 temporary-register allocator.** `compile_expr_operand` encodes *atoms* and

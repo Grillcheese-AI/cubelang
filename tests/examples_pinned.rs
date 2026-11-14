@@ -190,40 +190,29 @@ fn conversation_min_scores_a_generic_reply() {
 // instead of `run_json` here.
 
 #[test]
-fn gsm8k_no_longer_compiles_a_non_encodable_operand_is_now_a_hard_error() {
-    let out = run_raw("gsm8k.cube", &["--json"]);
-    assert!(!out.status.success(), "gsm8k.cube must no longer compile");
-    assert!(out.stdout.is_empty(),
-        "a compile-time failure must emit nothing on stdout: {:?}",
-        String::from_utf8_lossy(&out.stdout));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("BinOp"),
-        "expected a BinOp operand-encoding error (learn()'s `expected.result - actual.result`): {}",
-        stderr);
-    // The `match` assertion that used to live here was removed 2026-09-14:
-    // `match` is no longer a strict violation, because `compile_match` now
-    // emits a real COMPARE/COND arm-selection chain (DRIFT.md C3/A7, pinned
-    // by tests/match_arms.rs). gsm8k.cube still fails to compile -- on the
-    // C11 operand errors above, and on its unsupported `regs[reg] = ...`
-    // assign target (C4) -- just no longer on `match`.
+fn gsm8k_compiles_since_p6_4_and_stops_at_run_time_on_a_method_it_calls() {
+    // Until P6-4 (2026-11-13) this file did not compile: its compound operands (C11). They are now computed into
+    // registers, so it compiles strict and runs -- and stops loudly, ok:false, on `steps.last()`, a method the VM has
+    // no function for. (The `match` assertion that lived here went on 2026-09-14: `match` runs, DRIFT.md C3/A7.)
+    let json = run_json("gsm8k.cube", &[]);
+    assert_eq!(json["ok"], false, "{}", json);
+    let err = json["error"].as_str().unwrap_or_default();
+    assert!(err.contains("function `last` not found"), "{}", json);
 }
 
 #[test]
-fn conversation_agent_no_longer_compiles_a_non_encodable_operand_is_now_a_hard_error() {
-    // Previously failed only at RUNTIME ("CALL: unresolved function name"),
-    // and only under `run --json`'s ok:false JSON shape. It now fails at
-    // COMPILE time instead -- earlier and more honestly -- for the same
-    // C11 reason as gsm8k.cube above (this file is full of `BinOp`/
-    // `StructLit`/`MethodCall` RHS's, e.g. `build_state`'s string
-    // concatenation and `Reply { ... }` struct literals).
+fn conversation_agent_stops_at_compile_time_on_its_events() {
+    // Previously failed only at RUNTIME ("CALL: unresolved function name"), then at compile time on its compound
+    // operands (C11). Since P6-4 (2026-11-13) those compile; strict now stops it on its two `event` declarations
+    // (the VM has no event bus).
     let out = run_raw("conversation_agent/conversation_agent.cube", &["--json"]);
-    assert!(!out.status.success(), "conversation_agent.cube must no longer compile");
+    assert!(!out.status.success(), "conversation_agent.cube must not compile strict");
     assert!(out.stdout.is_empty(),
         "a compile-time failure must emit nothing on stdout: {:?}",
         String::from_utf8_lossy(&out.stdout));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("BinOp"),
-        "expected a BinOp operand-encoding error: {}", stderr);
+    assert!(!stderr.contains("cannot be encoded as an operand"), "{}", stderr);
+    assert!(stderr.contains("event ReplyGenerated") && stderr.contains("no event bus"), "{}", stderr);
 }
 
 // ── The 4 new examples added by this audit ──────────────────────────────────
@@ -299,16 +288,15 @@ fn draft_stops(relative_path: &str, expected: &[&str]) {
 }
 
 #[test]
-fn draft_bridge_mesh_stops_on_method_call_operands_and_its_io_block() {
-    // The container parses and is compiled; strict refuses what it cannot run
-    // (P3-8 undeclared interfaces, P3-9 a method call as an operand, P3-1 the
-    // `io` block).
+fn draft_bridge_mesh_stops_on_its_interfaces_its_io_block_and_vm() {
+    // The container parses and is compiled; strict refuses what it cannot run (P3-8 undeclared interfaces, P3-1 the
+    // `io` block, and `vm`, read but declared nowhere). Its method calls as operands (21:9, 22:9; P3-9) compile since
+    // P6-4.
     draft_stops("drafts/bridge_mesh.cube", &[
         "strict compile",
         "`IOrchestrator` is neither a VM interface nor an in-file `interface` declaration",
-        "21:9: expression form MethodCall cannot be encoded as an operand",
-        "22:9: expression form MethodCall cannot be encoded as an operand",
         "an `io` block",
+        "`vm` is read in SwarmNetworkGateway::on_start but never declared (UndeclaredName)",
     ]);
 }
 
@@ -322,16 +310,14 @@ fn draft_mowm_manager_stops_at_pure_written_as_an_attribute() {
 }
 
 #[test]
-fn draft_mowm_spawner_stops_on_operands_a_field_read_base_and_throw() {
-    // Parses; strict refuses it (P3-8, P3-9, and the two P3-10 items it now
-    // reaches: a field read whose base is not a variable, and `throw`).
+fn draft_mowm_spawner_stops_on_its_interfaces_throw_and_vm() {
+    // Parses; strict refuses it (P3-8, `throw` from P3-10, and `vm`, read but declared nowhere). Its operands (P3-9)
+    // and the field read whose base is not a variable (66:41) compile since P6-4.
     draft_stops("drafts/mowm_spawner.cube", &[
         "strict compile",
         "`IOrchestrator` is neither a VM interface nor an in-file `interface` declaration",
-        "expression form MethodCall cannot be encoded as an operand",
-        "expression form BinOp cannot be encoded as an operand",
-        "66:41: a field read needs a variable at its base",
         "strict: throw",
+        "`vm` is read in MoWMSubworldManager::spawn_child_node but never declared (UndeclaredName)",
     ]);
 }
 

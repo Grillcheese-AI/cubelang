@@ -1,27 +1,35 @@
-//! Regression tests for the DRIFT.md §C11 fix.
+//! Regression tests for the DRIFT.md §C11 fix, as P6-4 changed it (2026-11-13).
 //!
-//! `Compiler::compile_expr_operand` (src/compiler.rs) only has a real
-//! encoding for a literal, a bare identifier, `self.field`, and a simple
-//! `expr.field`. Every other expression shape used as an operand -- a
-//! `BinOp` chief among them -- used to silently fall through to an opaque
-//! `OP_NONE` placeholder (the exact bug `docs/DRIFT.md` reproduces with
-//! `double_it(x - y)` returning 0 instead of 4, undetected even by
-//! `cubelang check`). It is now a hard compile error in EVERY mode -- not
-//! just `--strict` -- since this is the one silent-garbage path strict mode
-//! itself could never catch (it inspects statement shapes, never descends
-//! into an individual operand).
+//! `Compiler::compile_expr_operand` (src/compiler.rs) only has a real encoding for a literal, a bare identifier,
+//! `self.field`, and a simple `expr.field`. Every other expression shape used as an operand -- a `BinOp` chief among
+//! them -- used to silently fall through to an opaque `OP_NONE` placeholder (the exact bug `docs/DRIFT.md` reproduces
+//! with `double_it(x - y)` returning 0 instead of 4). C11 made it a hard compile error in every mode.
 //!
-//! One test per path named in the task brief: `emit_call`'s argument loop,
-//! array-literal elements, index expressions, and `let`/`assign` RHS.
+//! P6-4 (fix list, 2026-11-13): such an expression is now computed into a register first (`src/lower.rs`), so each
+//! program below compiles and gives the value it means -- the DRIFT.md reproduction returns 4. C11's line holds: no
+//! operand is ever silent garbage. A form that still has no computation (`await` as a value) stays a hard compile
+//! error naming the form, in every mode.
+//!
+//! One test per path named in C11's brief: `emit_call`'s argument loop, array-literal elements, index expressions,
+//! and `let`/`assign` RHS.
 
 use cubelang::compiler;
+use cubelang::vm::{ExecResult, Value, VM};
 
-fn assert_binop_operand_error(source: &str, expect_missing_ok: &str) {
-    let err = compiler::compile(source).expect_err(expect_missing_ok);
-    let msg = err.to_string();
-    assert!(msg.contains("BinOp"), "error should name the offending expression form: {}", msg);
-    assert!(msg.contains("cannot be encoded as an operand"),
-        "error should explain why: {}", msg);
+fn solve(source: &str, strict: bool) -> i64 {
+    let mut progs = if strict {
+        compiler::compile_strict(source).unwrap_or_else(|e| panic!("compiles strict: {}", e))
+    } else {
+        compiler::compile(source).unwrap_or_else(|e| panic!("compiles: {}", e))
+    };
+    let prog = progs.pop().unwrap();
+    let name = prog.name.clone();
+    let mut vm = VM::new();
+    vm.load(prog);
+    match vm.call(&name, "solve", vec![Value::Str("x".into())]) {
+        ExecResult::Ok(v) | ExecResult::Return(v) => v.as_i64(),
+        other => panic!("expected a value, got {:?}", other),
+    }
 }
 
 // ── (a) call argument: the DRIFT.md reproduction itself ─────────────────────
@@ -47,21 +55,14 @@ program DoubleIt implements ISolve {
 "#;
 
 #[test]
-fn a_binop_call_argument_is_a_hard_compile_error_in_loose_mode() {
-    assert_binop_operand_error(
-        CALL_ARGUMENT_BINOP,
-        "double_it(x - y) must not compile -- BinOp cannot be encoded as a call argument",
-    );
+fn a_binop_call_argument_gives_its_value_in_loose_mode() {
+    // DRIFT.md's reproduction: 0 before C11, a compile error after it, 4 since P6-4
+    assert_eq!(solve(CALL_ARGUMENT_BINOP, false), 4);
 }
 
 #[test]
-fn a_binop_call_argument_is_also_rejected_under_strict() {
-    // Unconditional: --strict must reject it too (it already did in
-    // effect, since compile_ast_strict folds operand_errors in), not just
-    // loose `compile()`.
-    let err = compiler::compile_strict(CALL_ARGUMENT_BINOP)
-        .expect_err("double_it(x - y) must not compile under --strict either");
-    assert!(err.contains("BinOp"), "error should name BinOp: {}", err);
+fn a_binop_call_argument_gives_its_value_under_strict() {
+    assert_eq!(solve(CALL_ARGUMENT_BINOP, true), 4);
 }
 
 // ── (b) array-literal element ────────────────────────────────────────────────
@@ -74,17 +75,14 @@ program ArrLit implements ISolve {
         create y: number;
         assign y = 3;
         let xs = [1, x - y, 3];
-        return xs[0];
+        return xs[1];
     }
 }
 "#;
 
 #[test]
-fn b_binop_array_literal_element_is_a_hard_compile_error() {
-    assert_binop_operand_error(
-        ARRAY_LITERAL_ELEMENT_BINOP,
-        "[1, x - y, 3] must not compile -- BinOp cannot be encoded as an array element",
-    );
+fn b_binop_array_literal_element_gives_its_value() {
+    assert_eq!(solve(ARRAY_LITERAL_ELEMENT_BINOP, true), 2);
 }
 
 // ── (c) index expression ─────────────────────────────────────────────────────
@@ -104,11 +102,8 @@ program IndexExpr implements ISolve {
 "#;
 
 #[test]
-fn c_binop_index_expression_is_a_hard_compile_error() {
-    assert_binop_operand_error(
-        INDEX_EXPRESSION_BINOP,
-        "xs[x - y] must not compile -- BinOp cannot be encoded as an index expression",
-    );
+fn c_binop_index_expression_gives_its_value() {
+    assert_eq!(solve(INDEX_EXPRESSION_BINOP, true), 20);
 }
 
 // ── (d) `let` RHS ─────────────────────────────────────────────────────────────
@@ -127,11 +122,8 @@ program LetRhs implements ISolve {
 "#;
 
 #[test]
-fn d_binop_let_rhs_is_a_hard_compile_error() {
-    assert_binop_operand_error(
-        LET_RHS_BINOP,
-        "let diff = x - y must not compile -- BinOp cannot be encoded as a let RHS",
-    );
+fn d_binop_let_rhs_gives_its_value() {
+    assert_eq!(solve(LET_RHS_BINOP, true), 2);
 }
 
 // ── (e) `assign` RHS ──────────────────────────────────────────────────────────
@@ -152,14 +144,29 @@ program AssignRhs implements ISolve {
 "#;
 
 #[test]
-fn e_binop_assign_rhs_is_a_hard_compile_error() {
-    assert_binop_operand_error(
-        ASSIGN_RHS_BINOP,
-        "z = x - y must not compile -- BinOp cannot be encoded as an assign RHS",
-    );
+fn e_binop_assign_rhs_gives_its_value() {
+    assert_eq!(solve(ASSIGN_RHS_BINOP, true), 2);
 }
 
-// ── The workaround the error message itself recommends must still work ──────
+// ── A form with no computation is still a hard error, in every mode ─────────────
+
+const AWAIT_OPERAND: &str = r#"
+program AwaitOperand implements ISolve {
+    public function solve(input: str): number {
+        let v = await input;
+        return 0;
+    }
+}
+"#;
+
+#[test]
+fn an_await_as_a_value_is_still_a_hard_compile_error() {
+    let msg = compiler::compile(AWAIT_OPERAND).expect_err("an await has no operand form").to_string();
+    assert!(msg.contains("Await") && msg.contains("cannot be encoded as an operand"), "{}", msg);
+    assert!(compiler::compile_strict(AWAIT_OPERAND).is_err());
+}
+
+// ── The workaround C11's error message recommended still works ──────────────
 
 const WORKAROUND_COMPUTE_INTO_A_REGISTER_FIRST: &str = r#"
 program Workaround implements ISolve {
@@ -186,6 +193,5 @@ program Workaround implements ISolve {
 
 #[test]
 fn the_recommended_workaround_still_compiles_clean() {
-    compiler::compile(WORKAROUND_COMPUTE_INTO_A_REGISTER_FIRST)
-        .expect("computing the BinOp into a register first, then passing the register, must still compile");
+    assert_eq!(solve(WORKAROUND_COMPUTE_INTO_A_REGISTER_FIRST, true), 4);
 }

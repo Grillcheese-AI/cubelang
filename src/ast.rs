@@ -378,6 +378,8 @@ pub enum Stmt {
     While(WhileStmt),
     Match(MatchStmt),
     Return(Option<Expr>),
+    /// `break;` leaves the innermost `for` or `while` (P6-6).
+    Break,
     Throw(Expr),
     Emit(EmitStmt),
     Opcode(OpcodeStmt),
@@ -616,6 +618,8 @@ pub enum Expr {
 #[derive(Debug, Clone, Copy)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Mod,
+    /// `//`: whole-number (floor) division (P6-5); `Mod` is its remainder, so `a == (a // b) * b + a % b`.
+    IntDiv,
     Eq, NotEq, Lt, Gt, LtEq, GtEq,
     And, Or,
 }

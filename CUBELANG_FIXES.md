@@ -65,10 +65,12 @@ call: orders 0062 (sandboxed helpers) and 0063 (split questions) say what they n
 
 Run again on 2026-11-11, on the build of this line's code (d25dbc5). Where each draft stops today:
 - `orchestrator.cube`: 39:11, "expected identifier, got Star" (P3-2).
-- `bridge_mesh.cube`: the container is compiled; the draft stops on a method call used as an operand (22:9, P3-9)
-  and on strict naming its `io` block (P3-1).
+- `bridge_mesh.cube`: the container is compiled; strict stops it on its undeclared interfaces (P3-8), its `io`
+  block (P3-1) and `vm`, read but declared nowhere. (Its method calls as operands, 21:9 and 22:9, compile since P6-4,
+  2026-11-13.)
 - `mowm_manager.cube`: 27:5, "expected 'function' or 'constructor', got At" (P3-6).
-- `mowm_spawner.cube`: 66:41, a field read whose base is not a variable, and `throw` (P3-10).
+- `mowm_spawner.cube`: strict stops it on its undeclared interfaces (P3-8), `throw` (P3-10) and `vm`, read but
+  declared nowhere. (Its operands and the field read whose base is not a variable, 66:41, compile since P6-4.)
 
 Each stop is pinned in `tests/examples_pinned.rs` (2026-11-11): when a draft gets further, its test fails, and
 this list, the pin and `examples/README.md` change together.
@@ -91,11 +93,13 @@ this list, the pin and `examples/README.md` change together.
   LBracket"). Support them, or document that they are not supported.
 - [ ] **P3-8: undeclared interfaces.** `implements IOrchestrator, IDeployable` fails: "neither a VM interface nor an
   in-file `interface` declaration". Ship these as VM interfaces, or document the in-file declaration they need.
-- [ ] **P3-9: operands.** A method call's result can't be an operand ("cannot be encoded as an operand ... compute
+- [x] **P3-9: operands.** A method call's result can't be an operand ("cannot be encoded as an operand ... compute
   it into a register first"); the message points to the rewrite. A map literal passes now. Lift the rule for a
-  method call, or keep it as the stated rule.
+  method call, or keep it as the stated rule. **Lifted by P6-4 (2026-11-13):** calls, method calls, indexes,
+  arithmetic and a field read of any of them are computed into registers first.
 - [ ] **P3-10: not reached yet**, to check once the drafts get further:
   - `throw` (strict rejects it, per the CLI help);
+  - (a field read whose base is not a variable, `f().x`: compiles since P6-4, reading the field of what `f` returns);
   - the ternary `?:`;
   - named arguments (`embed(input, model: ...)`);
   - `emit` with a struct literal;
@@ -351,16 +355,32 @@ an index off by one can no longer make a wrong reply pass.
 - [x] **P6-2: indexing a string gives its character.** `s[i]` returns the i-th character (Unicode scalar values, the
   way the host counts them); past the end fails with `IndexOutOfRange`. Tests: `"hello"[1] == "e"`; the probe's
   composed prefix and suffix programs give 1 on a hit and 0 on a miss.
-- [ ] **P6-3: `&&`, `||`, `!` and `else if` in conditions,** short-circuit. Tests: both sides of each, and a three-way
-  `else if`.
-- [ ] **P6-4: expressions as operands:** calls, method calls, indexes and arithmetic inside a condition, a `return`
+- [x] **P6-3: `&&`, `||`, `!` and `else if` in conditions,** short-circuit. Tests: both sides of each, and a three-way
+  `else if`. *Done (Code B, 2026-11-13; `src/lower.rs`'s `branch`):* the right side runs only when the left side did
+  not decide (`i < n && s[i] == "x"` never indexes past the end); a condition used as a value is 1 or 0.
+- [x] **P6-4: expressions as operands:** calls, method calls, indexes and arithmetic inside a condition, a `return`
   or an argument (`if (xs.len() > 3)`, `return a + b * 2`). Tests: the probe's failing spellings now give the values
-  wanted.
-- [ ] **P6-5: whole-number division and `%`.** `div` keeps its meaning. If a new form needs a new opcode, it takes a
+  wanted. *Done:* `src/lower.rs` computes a compound operand into a fresh register just before the instruction that
+  reads it (in a `let`, an assignment, a `return`, a call's arguments, an opcode statement's value, a condition --
+  recomputed on each turn of a `while` -- and a `match` subject, once). `x.m(args)` calls `m` with `x` first. A form
+  with no computation (`await`, for one) is still a hard compile error (C11). Programs that compiled before compile
+  to the same bytes (every example and fixture, checked against `main`'s build).
+- [x] **P6-5: whole-number division and `%`.** `div` keeps its meaning. If a new form needs a new opcode, it takes a
   free byte and the cross-repo sync note; no existing byte changes. Tests: 7 // 2 is 3, 7 % 2 is 1, a negative case.
-- [ ] **P6-6: `break`** in `for` and `while`. Test: a loop that stops at its fourth turn.
-- [ ] **P6-7: string helpers:** `starts_with`, `ends_with`, `upper`, `lower`, `contains`, and `+` for concatenation.
-  Tests: a hit and a miss for each, in English and French (accents kept).
+  *Done:* no new opcode. `a // b` and `a % b` compile to DIV with a **third operand**, an immediate: 1 = floor
+  division, 2 = its remainder (Python's convention: `-7 // 2` is -4, `-7 % 2` is 1, `a == (a // b) * b + a % b`).
+  DIV with two operands is unchanged (7 / 2 is 3.5). Numbers only (`TypeMismatch` otherwise); 0 is "division by
+  zero". **Sync note:** opcode-vsa-rs and the cubemind Python VM read DIV's operands 0 and 1 only; a program using
+  `//` or `%` run there would get true division. Neither runs CubeLang-compiled programs today; if one does, it reads
+  operand 2 as above.
+- [x] **P6-6: `break`** in `for` and `while`. Test: a loop that stops at its fourth turn. *Done:* `break` is a
+  keyword; it leaves the innermost loop (a JMP to its end label); outside a loop it is a compile error.
+- [x] **P6-7: string helpers:** `starts_with`, `ends_with`, `upper`, `lower`, `contains`, and `+` for concatenation.
+  Tests: a hit and a miss for each, in English and French (accents kept). *Done (`src/vm/strings.rs`):* called as
+  `f(s, p)` or `s.f(p)`; the predicates give 1 or 0. They are the VM's last resort for a CALL: a program's own
+  function, or a `use`d module's, of the same name wins. Strings only (`TypeMismatch` otherwise). ADD on two strings
+  joins them; a string and anything else is a `TypeMismatch` (it was read as a number, silently). Only these spellings:
+  the probe's `to_upper`, `toUpperCase`, `startsWith` and `len(s)` stay unknown names (a loud CALL error).
 
 - [x] **P6-8: long lists fail loudly** (found by CubbyLLM 0067's step 2, 2026-11-13; with P6-1). As Code A reported
   it: a list literal of 254 or more strings makes the run return nothing, and one of exactly 255 numbers errors. The

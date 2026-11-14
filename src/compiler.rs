@@ -18,6 +18,10 @@ use crate::vm::registry::ModuleRegistry;
 // callable impls), consulted to validate `implements` declarations.
 use crate::vm::interfaces::InterfaceRegistry;
 
+// P6-3 / P6-4: conditions with &&, ||, ! and else if; expressions as operands.
+#[path = "lower.rs"]
+mod lower;
+
 // ── Opcode constants (match opcode-vsa-rs ir.rs) ────────────────────────────
 
 /// The most operands one instruction carries: its count is one byte (P6-8).
@@ -820,6 +824,8 @@ pub struct Compiler {
     labels: Vec<(String, usize)>,
     debug_lines: Vec<DebugLine>,
     label_counter: u32,
+    /// The end label of each enclosing `for` / `while`, innermost last: where `break` jumps (P6-6).
+    loop_ends: Vec<String>,
     /// Strict mode: rejects non-executing constructs (P0-1). Errors accumulate
     /// in `strict_errors`; the public `compile_strict` API surfaces them.
     strict: bool,
@@ -945,6 +951,7 @@ impl Compiler {
             labels: Vec::new(),
             debug_lines: Vec::new(),
             label_counter: 0,
+            loop_ends: Vec::new(),
             strict: false,
             strict_errors: Vec::new(),
             current_program: String::new(),
@@ -1980,7 +1987,7 @@ impl Compiler {
             // all, every instruction here is real bytecode. No separate
             // strict-mode check is needed on top of that.
             Stmt::Let(_) | Stmt::If(_) | Stmt::For(_) | Stmt::While(_)
-            | Stmt::Return(_) | Stmt::Atomic(_) | Stmt::Emit(_) | Stmt::Asm(_) => {}
+            | Stmt::Return(_) | Stmt::Atomic(_) | Stmt::Emit(_) | Stmt::Asm(_) | Stmt::Break => {}
             // try/catch/finally bodies are all real (LABEL/JMP scaffolding,
             // and -- DRIFT.md §C8 fix -- `finally_body`'s statements are now
             // compiled onto the shared try/catch convergence point too);
@@ -2069,9 +2076,10 @@ impl Compiler {
         // `Program.function`.
         let routed = self.route_calls(stmt);
         let stmt = routed.as_ref().unwrap_or(stmt);
-        // 2026-10-24: struct, map and array literals in operand positions are
-        // built into temporaries first (this compiler has no other lowering
-        // pass; see C11).
+        // P6-4 (2026-11-13): compound expressions in operand positions (a literal's fields among them) are computed
+        // into registers first; the literals left are then built by `hoist_literals`, as before.
+        let lowered = self.lower_stmt(stmt);
+        let stmt = lowered.as_ref().unwrap_or(stmt);
         let hoisted = self.hoist_literals(stmt);
         let stmt = hoisted.as_ref().unwrap_or(stmt);
         match stmt {
@@ -2081,6 +2089,14 @@ impl Compiler {
             Stmt::For(f) => self.compile_for(f),
             Stmt::While(w) => self.compile_while(w),
             Stmt::Match(m) => self.compile_match(m),
+            // P6-6: leave the innermost loop; outside any loop it is a compile error
+            Stmt::Break => match self.loop_ends.last().cloned() {
+                Some(end) => {
+                    self.emit_debug(op::JMP, "break");
+                    self.emit_jmp(&end);
+                }
+                None => self.literal_error("`break` outside a `for` or `while`".to_string()),
+            },
             Stmt::Return(value) => {
                 // Plan-1: real early return. Bare `return;` → 0 operands.
                 // `return <expr>;` → 1 operand resolved at runtime.
@@ -2435,10 +2451,9 @@ impl Compiler {
         let else_label = self.fresh_label("else");
         let end_label = self.fresh_label("endif");
 
-        // Evaluate condition → sets the VM comparison flag.
-        self.compile_condition(&if_stmt.condition);
-        // COND: jump to else_label if the flag is FALSE (skip the then-body).
-        self.emit_cond_jump(&else_label);
+        // Evaluate the condition; jump to else_label when it is FALSE (skip the then-body). P6-3: `&&`, `||`, `!`
+        // short-circuit through `branch`.
+        self.branch(&if_stmt.condition, &else_label);
 
         // Then body
         for s in &if_stmt.then_body {
@@ -2528,10 +2543,12 @@ impl Compiler {
         self.emit_named(&arr_name);
         self.emit_named(&i_var);
 
-        // body
+        // body (P6-6: `break` jumps to end_label)
+        self.loop_ends.push(end_label.clone());
         for s in &for_stmt.body {
             self.compile_stmt(s);
         }
+        self.loop_ends.pop();
 
         // ADD __i, 1
         self.emit_byte(op::ADD);     self.emit_byte(2);
@@ -2548,14 +2565,15 @@ impl Compiler {
 
         // loop_top:
         self.emit_label(&loop_label);
-        // Evaluate condition → flag; COND jumps to end_label if false.
-        self.compile_condition(&while_stmt.condition);
-        self.emit_cond_jump(&end_label);
+        // Evaluate the condition; jump to end_label when it is false (P6-3: through `branch`, recomputed each turn).
+        self.branch(&while_stmt.condition, &end_label);
 
-        // body
+        // body (P6-6: `break` jumps to end_label)
+        self.loop_ends.push(end_label.clone());
         for s in &while_stmt.body {
             self.compile_stmt(s);
         }
+        self.loop_ends.pop();
 
         // jump back to re-test the condition
         self.emit_jmp(&loop_label);
@@ -2604,6 +2622,8 @@ impl Compiler {
     /// emitting dead bytecode.
     fn compile_match(&mut self, match_stmt: &MatchStmt) {
         let end_label = self.fresh_label("endmatch");
+        // P6-4: a compound subject is computed once, before the first arm's test
+        let subject = self.lower(&match_stmt.expr);
 
         for arm in &match_stmt.arms {
             if is_wildcard_pattern(&arm.pattern) {
@@ -2623,7 +2643,7 @@ impl Compiler {
             self.emit_debug(op::COMPARE, "match arm ==");
             self.emit_byte(op::COMPARE);
             self.emit_byte(3);
-            self.compile_expr_operand(&match_stmt.expr);
+            self.compile_expr_operand(&subject);
             self.compile_expr_operand(&arm.pattern);
             self.emit_imm(0);
             // COND jumps when the flag is FALSE, i.e. on a non-match, so it
@@ -2888,6 +2908,9 @@ impl Compiler {
                 }
             }
         }
+        // P6-4: compound arguments are computed into registers before the CALL
+        let args: Vec<Expr> = args.iter().map(|a| self.lower(a)).collect();
+        let args = &args[..];
         match callee {
             Expr::Ident(name) => {
                 self.emit_debug(op::CALL, &format!("call {}({})", name, args.len()));
@@ -2995,11 +3018,12 @@ impl Compiler {
             Expr::MethodCall(_obj, method, args) => {
                 // v1: method becomes the fn name; receiver becomes arg0.
                 // (Full method dispatch is a later refinement.)
+                let args: Vec<Expr> = args.iter().map(|a| self.lower(a)).collect();
                 self.emit_debug(op::CALL, &format!(".{}()", method));
                 self.emit_byte(op::CALL);
                 self.emit_count(args.len() + 1, "a call's arguments");
                 self.emit_global(method);
-                for a in args { self.compile_expr_operand(a); }
+                for a in &args { self.compile_expr_operand(a); }
                 self.emit_byte(op::POP);
                 self.emit_byte(1);
                 self.emit_named("__call_discard");
@@ -3450,11 +3474,14 @@ impl Compiler {
                 _ => None, // And/Or/arithmetic: fall through to truthy below
             };
             if let Some(k) = kind {
+                // P6-4: `xs.len() > 3`, `s[i] == "x"`, `a + b < c`: each side computed into a register first
+                let lo = self.lower(lhs);
+                let ro = self.lower(rhs);
                 self.emit_debug(op::COMPARE, &format!("cond {:?}", bop));
                 self.emit_byte(op::COMPARE);
                 self.emit_byte(3);
-                self.compile_expr_operand(lhs);
-                self.compile_expr_operand(rhs);
+                self.compile_expr_operand(&lo);
+                self.compile_expr_operand(&ro);
                 self.emit_imm(k);
                 return;
             }
@@ -3462,10 +3489,11 @@ impl Compiler {
         // Fallback: truthiness test of a single expression (kind = 6).
         // P6 (2026-11-13): the kind goes in the THIRD operand, where COMPARE reads it. It was emitted second, so
         // COMPARE took the 2-operand statement form (equality) and `if (t)` ran as `if (t == 6)`.
+        let o = self.lower(cond);
         self.emit_debug(op::COMPARE, "cond truthy");
         self.emit_byte(op::COMPARE);
         self.emit_byte(3);
-        self.compile_expr_operand(cond);
+        self.compile_expr_operand(&o);
         self.emit_imm(0);
         self.emit_imm(6);
     }
@@ -3534,7 +3562,7 @@ fn stmt_span(stmt: &Stmt) -> Option<Span> {
         Stmt::Atomic(a) => Some(a.span),
         Stmt::Asm(b) => Some(b.span),
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Opcode(_) | Stmt::Expr(_)
-        | Stmt::Commit | Stmt::Rollback => None,
+        | Stmt::Commit | Stmt::Rollback | Stmt::Break => None,
     }
 }
 
@@ -3928,32 +3956,16 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_gsm8k_now_fails_even_loose_on_the_c11_operand_bug() {
-        // FIXED 2026-09-14 (DRIFT.md §C11): this test used to assert
-        // gsm8k.cube compiled clean under loose `compile()` and inspect its
-        // bytecode. It no longer can: `learn()`'s
-        // `let diff = expected.result - actual.result;` is a `BinOp` used
-        // directly as a `let` RHS, which `compile_expr_operand` cannot
-        // encode -- previously a silent OP_NONE placeholder, now a hard
-        // compile error in EVERY mode (not just `--strict`), per the C11
-        // fix. This is the correct, honest outcome: a program that could
-        // only ever silently return a meaningless answer (docs/DRIFT.md
-        // "Bugs found" #1) should not compile at all. See
-        // `tests/examples_pinned.rs` for the CLI-level pin of this same
-        // outcome.
+    fn test_compile_gsm8k_compiles_loose_since_p6_4() {
+        // 2026-09-14 (DRIFT.md C11) to 2026-11-13 this file did not compile: its compound operands (`learn()`'s
+        // `let diff = expected.result - actual.result;`, method calls, indexes) had no encoding, and C11 made that a
+        // hard error rather than a silent placeholder. P6-4 computes them into registers, so it compiles again --
+        // and runs to a loud stop, not a meaningless answer (`tests/examples_pinned.rs`).
         let source = include_str!("../examples/gsm8k.cube");
-        let err = compile(source).expect_err(
-            "gsm8k.cube uses un-encodable expression operands -- must be a compile error now");
-        // WHICH violation fires first is traversal order, not a contract: the
-        // constructor's `MapLit` is reached before `learn()`'s `BinOp`. Assert the
-        // shape of the diagnostic, not the identity of whichever one is hit first,
-        // or this test breaks every time an unrelated statement moves.
-        let msg = err.to_string();
-        assert!(msg.contains("cannot be encoded as an operand"),
-            "error should be the C11 operand diagnostic: {}", msg);
-        // (Struct and map literals are built since 2026-10-24, so they no longer appear here.)
-        assert!(["BinOp", "UnaryOp", "Lambda", "MethodCall", "Call", "Index"].iter().any(|f| msg.contains(f)),
-            "error should name the offending expression form: {}", msg);
+        let programs = compile(source).expect("gsm8k.cube compiles loose since P6-4");
+        assert_eq!(programs.len(), 1);
+        let learn = programs[0].functions.iter().find(|f| f.name == "learn").expect("learn");
+        assert!(learn.bytecode.contains(&op::SUB), "learn() computes `expected.result - actual.result`");
     }
 
     #[test]
@@ -4384,17 +4396,15 @@ mod tests {
     }
 
     #[test]
-    fn test_cubebin_gsm8k_full_now_fails_to_compile_on_the_c11_operand_bug() {
-        // FIXED 2026-09-14 (DRIFT.md §C11): this test used to compile
-        // gsm8k.cube whole and roundtrip it through .cubebin. It can no
-        // longer compile at all -- see
-        // `test_compile_gsm8k_now_fails_even_loose_on_the_c11_operand_bug`
-        // above for why (a `BinOp` used directly as a `let` RHS in
-        // `learn()`). Nothing left to roundtrip; this test now just pins
-        // the same honest failure so a future change that silently starts
-        // tolerating the bug again is caught here too.
+    fn test_cubebin_gsm8k_full_roundtrip() {
+        // Compiles again since P6-4 (see `test_compile_gsm8k_compiles_loose_since_p6_4`): the whole file round-trips
+        // through .cubebin, function by function, byte for byte.
         let source = include_str!("../examples/gsm8k.cube");
-        compile(source).expect_err(
-            "gsm8k.cube must not compile -- see the C11 operand-encoding fix");
+        let prog = compile(source).expect("gsm8k.cube compiles loose").pop().unwrap();
+        let back = CompiledProgram::from_cubebin(&prog.to_cubebin()).expect("reads back");
+        assert_eq!(back.functions.len(), prog.functions.len());
+        for (a, b) in prog.functions.iter().zip(&back.functions) {
+            assert_eq!((a.name.as_str(), &a.bytecode), (b.name.as_str(), &b.bytecode));
+        }
     }
 }

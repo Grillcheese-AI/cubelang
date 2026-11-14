@@ -1468,7 +1468,12 @@ impl VM {
                     let name = operands.get(0).map(|o| o.as_name()).unwrap_or_default();
                     let rhs = self.resolve_value(operands.get(1));
                     let cur = self.registers.get(&name).cloned().unwrap_or(Value::Int(0));
-                    let out = num_binop(&cur, &rhs, '+');
+                    // P6-7 (2026-11-13): two strings join; a string and anything else is a TypeMismatch
+                    let out = match super::strings::concat(&cur, &rhs) {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return ExecResult::Error(e),
+                        None => num_binop(&cur, &rhs, '+'),
+                    };
                     self.trace_op(pc, &format!("ADD {} {} → {}", name, rhs, out));
                     self.registers.insert(name, out);
                 }
@@ -1499,7 +1504,15 @@ impl VM {
                         return ExecResult::Error("division by zero".into());
                     }
                     let cur = self.registers.get(&name).cloned().unwrap_or(Value::Int(0));
-                    let out = num_binop(&cur, &rhs, '/');
+                    // P6-5 (2026-11-13): a third operand asks for whole-number division (1) or its remainder (2);
+                    // without it DIV keeps its meaning
+                    let out = match operands.get(2) {
+                        Some(m) => match super::strings::whole_div(&cur, &rhs, self.resolve_value(Some(m)).as_i64()) {
+                            Ok(v) => v,
+                            Err(e) => return ExecResult::Error(e),
+                        },
+                        None => num_binop(&cur, &rhs, '/'),
+                    };
                     self.trace_op(pc, &format!("DIV {} {} → {}", name, rhs, out));
                     self.registers.insert(name, out);
                 }
@@ -1974,6 +1987,15 @@ impl VM {
                             None => {}
                             Some(ExecResult::Suspend(s)) => return self.caller_waits(s, func, pc, flag, jump_budget),
                             Some(other) => return other,
+                        }
+                    } else if let Some(r) = super::strings::helper(&fn_name, &arg_values) {
+                        // P6-7 (2026-11-13): the string helpers, after the program's own functions and its modules
+                        match r {
+                            Ok(v) => {
+                                self.trace_op(pc, &format!("CALL {} (string helper) → {}", fn_name, v));
+                                self.stack.push(v);
+                            }
+                            Err(e) => return ExecResult::Error(format!("{}: {}", fn_name, e)),
                         }
                     } else {
                         return ExecResult::Error(format!(

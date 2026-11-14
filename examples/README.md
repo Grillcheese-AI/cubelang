@@ -36,11 +36,11 @@ of rotting silently.
 | `decision_min.cube` | `ISolver`, storage+constructor, store/remember | `run examples/decision_min.cube --json` | `{"result":80,...}` |
 | `fibonacci.cube` | `ISolve`, real `while` (Turing-complete iteration) | `run examples/fibonacci.cube --json` | `{"result":55,...}` |
 | `ground_min.cube` | `ISolve`, real QUERY (not trace-only — see DRIFT §A3), LEN, ASK | `run examples/ground_min.cube --json` | `{"result":0,...}` (no `--knowledge`: QUERY finds nothing → gap) |
-| `gsm8k.cube` | **Aspirational / no longer compiles at all** — struct/map/typed surface; a `BinOp`/`StructLit`/`MapLit`/`MethodCall`/`Index` used as an operand is now a hard compile error in every mode (`docs/DRIFT.md` §C11), on top of map-index assigns (see header, `docs/DRIFT.md` "Bugs found" #1) | `run examples/gsm8k.cube --json` | compile error (exit 1, nothing on stdout); stderr names `BinOp`/`MapLit`/... — see `tests/examples_pinned.rs` |
+| `gsm8k.cube` | **Aspirational** — struct/map/typed surface. It did not compile from 2026-09-14 (its compound operands, `docs/DRIFT.md` §C11); since P6-4 (2026-11-13) it compiles, runs, and stops loudly on `steps.last()`, a method the VM has no function for (see header, `docs/DRIFT.md` "Bugs found" #1) | `run examples/gsm8k.cube --json` | `{"ok":false,"error":"CALL: function `last` not found ..."}` — see `tests/examples_pinned.rs` |
 | `loop_min.cube` | `ISolver`, real `while`, store/remember | `run examples/loop_min.cube --json` | `{"result":42,...}` |
 | `qc_decision.cube` | `ISolver`, the host-injects-registers pattern (see header WARNING) | `run examples/qc_decision.cube --json` | `{"ok":false,"error":"TypeMismatch: ..."}` (no registers injected on this plain invocation: a missing value never compares, P6-1) |
 | `recall_min.cube` | `ISolver`, STORE overwrite + RECALL (cosine cleanup) | `run examples/recall_min.cube --json` | `{"result":65,...}` |
-| `conversation_agent/conversation_agent.cube` | **Broken — no longer compiles at all** (previously failed only at runtime; now fails earlier and more honestly at compile time for the same C11 reason as `gsm8k.cube` — see header, `docs/DRIFT.md` "Bugs found" #2) | `run examples/conversation_agent/conversation_agent.cube --json` | compile error (exit 1, nothing on stdout); stderr names `BinOp`/... — see `tests/examples_pinned.rs` |
+| `conversation_agent/conversation_agent.cube` | **Broken — does not compile strict** (it failed at runtime, then at compile time on its compound operands, C11; those compile since P6-4, and strict now stops it on its two `event` declarations, which the VM has no bus for — see header, `docs/DRIFT.md` "Bugs found" #2) | `run examples/conversation_agent/conversation_agent.cube --json` | compile error (exit 1, nothing on stdout); stderr names `event ReplyGenerated` — see `tests/examples_pinned.rs` |
 | `conversation_agent/conversation_min.cube` | `ISolver`, the working minimal conversational shape | `run examples/conversation_agent/conversation_min.cube --json` | `{"result":10,...}` |
 | `vsa_bind_recover.cube` | `use vsa;`, real `bind`, `recover(reg, role)` — the actual CubbyLLM emitter surface (see `docs/DRIFT.md` §A8/§B2) | `run examples/vsa_bind_recover.cube --json` | `{"result":"cat","similarity":~0.52,...}` |
 | `call_recursion_min.cube` | Real intra-program `CALL`/`RETURN`, recursion | `run examples/call_recursion_min.cube --json` | `{"result":120,...}` (5!) |
@@ -67,8 +67,9 @@ of rotting silently.
   surface (`gsm8k.cube` is parsed — never compiled — by
   `cargo run --example parse_gsm8k`). Deleting them would silently lose that
   coverage; instead both carry a prominent header explaining exactly what
-  does and does not work, per `docs/DRIFT.md`. As of 2026-09-14 neither
-  compiles in ANY mode, including `--loose`: both use a `BinOp`/`StructLit`/
+  does and does not work, per `docs/DRIFT.md`. (Since P6-4, 2026-11-13, both compile
+  with `--loose` again: see the table above for where each stops now.) From 2026-09-14 neither
+  compiled in ANY mode, including `--loose`: both use a `BinOp`/`StructLit`/
   `MapLit`/`MethodCall`/`Index` expression as a call argument or `let`/
   `assign` RHS somewhere, which `compile_expr_operand` cannot encode
   (`docs/DRIFT.md` §C11) — a hard compile error unconditionally now, not
@@ -96,7 +97,7 @@ each stop is in `CUBELANG_FIXES.md` (P3).
 
 | Draft | Where it stops today (exit 1, nothing on stdout) |
 |---|---|
-| `drafts/bridge_mesh.cube` | strict compile: `implements` two interfaces that are declared nowhere (2:1, P3-8); a method call used as an operand (21:9 and 22:9, P3-9); its `io` block (line 8, P3-1) |
+| `drafts/bridge_mesh.cube` | strict compile: `implements` two interfaces that are declared nowhere (2:1, P3-8); its `io` block (line 8, P3-1); `vm`, read in `on_start` but declared nowhere (its method calls as operands compile since P6-4) |
 | `drafts/mowm_manager.cube` | parse error at 27:5, "expected 'function' or 'constructor', got At": `@pure` written as an attribute (P3-6) |
-| `drafts/mowm_spawner.cube` | strict compile: the same two interfaces (11:1, P3-8); method calls and compound expressions used as operands (P3-9); a field read whose base is not a variable (66:41) and `throw` (line 41), both P3-10 |
+| `drafts/mowm_spawner.cube` | strict compile: the same two interfaces (11:1, P3-8); `throw` (line 41, P3-10); `vm`, read in `spawn_child_node` but declared nowhere (its operands and the field read at 66:41 compile since P6-4) |
 | `drafts/orchestrator.cube` | parse error at 39:11, "expected identifier, got Star": the wildcard in `@hook(*.error)` (P3-2) |

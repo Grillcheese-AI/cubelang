@@ -1082,6 +1082,7 @@ impl Parser {
             TokenKind::If => self.parse_if_stmt(),
             TokenKind::For => self.parse_for_stmt(),
             TokenKind::While => self.parse_while_stmt(),
+            TokenKind::Break => { self.advance(); self.eat(&TokenKind::Semicolon); Ok(Stmt::Break) }
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Return => { self.advance(); let e = if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RBrace) { None } else { Some(self.parse_expr()?) }; self.eat(&TokenKind::Semicolon); Ok(Stmt::Return(e)) }
             TokenKind::Throw => { self.advance(); let e = self.parse_expr()?; self.eat(&TokenKind::Semicolon); Ok(Stmt::Throw(e)) }
@@ -1166,10 +1167,15 @@ impl Parser {
         let then_body = self.parse_stmt_block()?;
         self.expect(&TokenKind::RBrace)?;
         let else_body = if self.eat(&TokenKind::Else) {
-            self.expect(&TokenKind::LBrace)?;
-            let body = self.parse_stmt_block()?;
-            self.expect(&TokenKind::RBrace)?;
-            Some(body)
+            if self.at(&TokenKind::If) {
+                // P6-3: `else if (...) { }` is an `else` whose body is that one `if`
+                Some(vec![self.parse_if_stmt()?])
+            } else {
+                self.expect(&TokenKind::LBrace)?;
+                let body = self.parse_stmt_block()?;
+                self.expect(&TokenKind::RBrace)?;
+                Some(body)
+            }
         } else {
             None
         };
@@ -1805,6 +1811,7 @@ impl Parser {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::Slash => BinOp::Div,
                 TokenKind::Percent => BinOp::Mod,
+                TokenKind::SlashSlash => BinOp::IntDiv,
                 _ => break,
             };
             self.advance();

@@ -69,6 +69,7 @@ pub enum TokenKind {
     Else,
     For,
     While,
+    Break,          // P6-6
     Match,
     In,
     Of,
@@ -256,6 +257,7 @@ pub enum TokenKind {
     MinusEq,        // -=
     StarEq,         // *=
     SlashEq,        // /=
+    SlashSlash,     // //  (P6-5: whole-number division)
     AmpAmp,         // &&
     PipePipe,       // ||
 
