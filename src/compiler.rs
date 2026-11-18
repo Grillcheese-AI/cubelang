@@ -273,6 +273,10 @@ pub const CUBEBIN_MAGIC: &[u8; 4] = b"CUBE";
 /// `@restricted`, `@ratelimit`, `@cron` and declared types.
 /// v5 (P6-9): names and literals keyed by 8 bytes in the bytecode (operand tags 0x09..0x0D).
 pub const CUBEBIN_VERSION: u8 = 5;
+/// P6-5 (2026-11-14): the version a program is written as when it uses DIV's third operand (`//`, `%`). A reader
+/// that knows versions 1 to 5 refuses it by version; it would otherwise run DIV as true division and give 7 // 2 as
+/// 3.5, silently. A program that does not use it stays version 5, byte for byte.
+pub const CUBEBIN_VERSION_WHOLE_DIV: u8 = 6;
 
 /// The v4 contract trailer (see `CUBEBIN_VERSION`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -423,6 +427,9 @@ pub struct CompiledProgram {
     pub storage_defaults: Vec<(String, serde_json::Value)>,
     /// P6-9: the bytecode keys names by 2 bytes (a `.cubebin` before version 5). Everything compiled now keys by 8.
     pub narrow_keys: bool,
+    /// P6-5: some DIV carries the third operand (whole-number division or its remainder), so the program is written
+    /// as `.cubebin` version 6 (`CUBEBIN_VERSION_WHOLE_DIV`).
+    pub whole_div: bool,
 }
 
 impl CompiledProgram {
@@ -430,7 +437,7 @@ impl CompiledProgram {
     pub fn to_cubebin(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(CUBEBIN_MAGIC);
-        buf.push(CUBEBIN_VERSION);
+        buf.push(if self.whole_div { CUBEBIN_VERSION_WHOLE_DIV } else { CUBEBIN_VERSION });
         buf.push(1); // n_programs (single program per file for now)
 
         // Program name
@@ -513,7 +520,8 @@ impl CompiledProgram {
         // older files simply carry no params and fall back to `argN` binding.
         // v4: + the contract trailer (see `to_cubebin`).
         // v5 (P6-9): the same layout, names keyed by 8 bytes in the bytecode.
-        if !(1..=5).contains(&version) {
+        // v6 (P6-5): the v5 layout, and some DIV carries a third operand (`//`, `%`).
+        if !(1..=CUBEBIN_VERSION_WHOLE_DIV).contains(&version) {
             return Err(format!("unsupported .cubebin version: {}", version));
         }
 
@@ -635,7 +643,7 @@ impl CompiledProgram {
             storage_defaults = meta.storage_defaults;
         }
         Ok(CompiledProgram { name, implements, functions, storage_fields, symbol_names, used_modules, types, container,
-                             storage_defaults, narrow_keys: version < 5 })
+                             storage_defaults, narrow_keys: version < 5, whole_div: version >= CUBEBIN_VERSION_WHOLE_DIV })
     }
 
     /// Save to a `.cubebin` file.
@@ -826,6 +834,8 @@ pub struct Compiler {
     label_counter: u32,
     /// The end label of each enclosing `for` / `while`, innermost last: where `break` jumps (P6-6).
     loop_ends: Vec<String>,
+    /// P6-5: this program emitted a DIV with its third operand (see `CompiledProgram::whole_div`).
+    whole_div: bool,
     /// Strict mode: rejects non-executing constructs (P0-1). Errors accumulate
     /// in `strict_errors`; the public `compile_strict` API surfaces them.
     strict: bool,
@@ -952,6 +962,7 @@ impl Compiler {
             debug_lines: Vec::new(),
             label_counter: 0,
             loop_ends: Vec::new(),
+            whole_div: false,
             strict: false,
             strict_errors: Vec::new(),
             current_program: String::new(),
@@ -1090,6 +1101,7 @@ impl Compiler {
         // Reset per-program symbol collection so bindings don't leak across
         // programs compiled in the same pass.
         self.symbol_names.clear();
+        self.whole_div = false;
         let is_container = container.is_some();
         self.in_container = is_container;
         if !is_container {
@@ -1182,6 +1194,7 @@ impl Compiler {
             container,
             storage_defaults: std::mem::take(&mut self.storage_defaults),
             narrow_keys: false,
+            whole_div: std::mem::take(&mut self.whole_div),
         }
     }
 

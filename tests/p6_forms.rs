@@ -229,3 +229,44 @@ fn a_programs_own_function_wins_over_a_helper() {
         other => panic!("{:?}", other),
     }
 }
+
+// ── P6-5: a program that uses // or % cannot be read silently by an older VM ────────────────────────────────
+
+fn program(body: &str) -> compiler::CompiledProgram {
+    compiler::compile_strict(&source(body)).unwrap().pop().unwrap()
+}
+
+#[test]
+fn whole_number_division_writes_cubebin_version_6_and_reads_back() {
+    // an older reader knows versions 1 to 5 and refuses 6 by version; it would otherwise run DIV as true division
+    // and give 7 // 2 as 3.5, silently (Cowork, 2026-11-14)
+    let prog = program("create a: number; assign a = 7; let c = a // 2; return c;");
+    let bin = prog.to_cubebin();
+    assert_eq!(bin[4], compiler::CUBEBIN_VERSION_WHOLE_DIV);
+    assert_eq!(compiler::CUBEBIN_VERSION_WHOLE_DIV, 6);
+    let back = compiler::CompiledProgram::from_cubebin(&bin).expect("this build reads version 6");
+    assert!(back.whole_div);
+    let mut vm = VM::new();
+    vm.load(back);
+    match vm.call("P", "solve", vec![Value::Str("probe".into())]) {
+        ExecResult::Ok(v) | ExecResult::Return(v) => assert_eq!(v.as_i64(), 3),
+        other => panic!("{:?}", other),
+    }
+    assert_eq!(program("let c = 7 % 2; return c;").to_cubebin()[4], 6);
+}
+
+#[test]
+fn a_program_without_it_stays_version_5() {
+    let prog = program("create a: number; assign a = 7; let c = a / 2; div a, 2; return c;");
+    assert!(!prog.whole_div);
+    assert_eq!(prog.to_cubebin()[4], compiler::CUBEBIN_VERSION);
+    assert_eq!(compiler::CUBEBIN_VERSION, 5);
+}
+
+#[test]
+fn a_version_this_build_does_not_know_is_refused() {
+    let mut bin = program("return 1;").to_cubebin();
+    bin[4] = 7;
+    let err = compiler::CompiledProgram::from_cubebin(&bin).err().expect("version 7 is refused");
+    assert!(err.contains("unsupported .cubebin version: 7"), "{}", err);
+}

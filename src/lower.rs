@@ -53,7 +53,11 @@ impl Compiler {
                 let t = self.fresh_temp("expr");
                 self.emit_ins(op::ASSIGN, "expr", &t, &[lo]);
                 match mode {
-                    Some(m) => self.emit_ins(code, "expr", &t, &[ro, Expr::IntLit(m)]),
+                    Some(m) => {
+                        // the program is written as .cubebin v6, which an older reader refuses (P6-5)
+                        self.whole_div = true;
+                        self.emit_ins(code, "expr", &t, &[ro, Expr::IntLit(m)])
+                    }
                     None => self.emit_ins(code, "expr", &t, &[ro]),
                 }
                 Expr::Ident(t)

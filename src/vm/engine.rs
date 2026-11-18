@@ -4106,6 +4106,7 @@ mod vsa_opcode_wiring_tests {
             storage_defaults: Vec::new(),
             // hand-assembled with the 2-byte tags: a pre-v5 program (P6-9), which still decodes and runs
             narrow_keys: true,
+            whole_div: false,
         };
 
         let mut vm = VM::new();

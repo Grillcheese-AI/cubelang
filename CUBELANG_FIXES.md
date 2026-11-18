@@ -370,11 +370,15 @@ an index off by one can no longer make a wrong reply pass.
   *Done:* no new opcode. `a // b` and `a % b` compile to DIV with a **third operand**, an immediate: 1 = floor
   division, 2 = its remainder (Python's convention: `-7 // 2` is -4, `-7 % 2` is 1, `a == (a // b) * b + a % b`).
   DIV with two operands is unchanged (7 / 2 is 3.5). Numbers only (`TypeMismatch` otherwise); 0 is "division by
-  zero". **Sync note:** opcode-vsa-rs and the cubemind Python VM read DIV's operands 0 and 1 only; a program using
-  `//` or `%` run there would get true division. Neither runs CubeLang-compiled programs today; if one does, it reads
-  operand 2 as above.
+  zero". **Never silent on an older VM** (Cowork, 2026-11-14): a program that uses the third operand is written as
+  `.cubebin` **version 6** (`CUBEBIN_VERSION_WHOLE_DIV`); every reader before this one accepts 1 to 5 and refuses it
+  by version (checked: the shared VM's `b3b3360` build says "unsupported .cubebin version: 6"; it would otherwise run
+  `7 // 2` as 3.5). A program without `//` or `%` stays version 5, byte for byte. Pinned in `tests/p6_forms.rs`.
+  The other two VMs read no `.cubebin` at all (the cubemind Python VM runs opcode tuples, opcode-vsa-rs imports JSON);
+  if either ever reads one, it reads DIV's operand 2 as above or refuses version 6.
 - [x] **P6-6: `break`** in `for` and `while`. Test: a loop that stops at its fourth turn. *Done:* `break` is a
-  keyword; it leaves the innermost loop (a JMP to its end label); outside a loop it is a compile error.
+  keyword; it leaves the innermost loop (a JMP to its end label); outside a loop it is a compile error. (Noted, not a
+  blocker: that error's position reads `0:0` when no statement with a span came before it; `break` carries no span.)
 - [x] **P6-7: string helpers:** `starts_with`, `ends_with`, `upper`, `lower`, `contains`, and `+` for concatenation.
   Tests: a hit and a miss for each, in English and French (accents kept). *Done (`src/vm/strings.rs`):* called as
   `f(s, p)` or `s.f(p)`; the predicates give 1 or 0. They are the VM's last resort for a CALL: a program's own
@@ -411,6 +415,12 @@ an index off by one can no longer make a wrong reply pass.
   - **Line:** on CubbyLLM's timing programs, `3f37515` rebuilt in its own target directory and the fixed build timed in
     the same session: the fixed build no slower than `3f37515` by more than 10% at the median, with every P6 test green
     and no verdict changed. Then CubbyLLM 0072's time line is read again on it.
+
+- [ ] **P6-11: the same source compiles to the same `.cubebin`** (candidate, found by Code B on 2026-11-14; needs
+  Nick's yes). Today it does not: the type table is written in hash-map order, so `examples/decision_min.cube` gave
+  two different files over 16 compiles of `main`'s `b3b3360` build (10 and 6), the type aliases `Input` and `Output` in
+  either order. Fix: write the table (and any other map in the metadata) sorted. Test: one file compiled 20 times gives
+  one output.
 
 **Order:** P6-1 with P6-8 and P6-9, then P6-2, then P6-10 (before CubbyLLM 0069's latency part), then the rest in any order. Each probe program that fails today becomes a
 regression test with the value it should give. The global invariant holds.
