@@ -116,6 +116,10 @@ program GSM8K implements ISolverLearn {
             if (op == "*") {
                 self.pos = self.pos + 1;
                 mul t, factor(s);
+            } else if (op == "/" && self.pos + 1 < s.len() && s[self.pos + 1] == "/") {
+                self.pos = self.pos + 2;
+                let whole = t // factor(s);
+                assign t = whole;
             } else if (op == "/") {
                 self.pos = self.pos + 1;
                 div t, factor(s);
@@ -327,12 +331,23 @@ program GSM8K implements ISolverLearn {
         return 0;
     }
 
+    # a number starts at i: a digit, or a '.' right before a digit (".5")
+    function starts_number(s: str, i: number): number {
+        if (digit(s[i]) >= 0) {
+            return 1;
+        }
+        if (s[i] == "." && i + 1 < s.len() && digit(s[i + 1]) >= 0) {
+            return 1;
+        }
+        return 0;
+    }
+
     # the numbers the question states: how many, and the k-th
     function stated_count(question: str): number {
         let n = 0;
         let i = 0;
         while (i < question.len()) {
-            if (digit(question[i]) >= 0) {
+            if (starts_number(question, i) == 1) {
                 self.pos = i;
                 let v = number_at(question);
                 n = n + 1;
@@ -348,7 +363,7 @@ program GSM8K implements ISolverLearn {
         let n = 0;
         let i = 0;
         while (i < question.len()) {
-            if (digit(question[i]) >= 0) {
+            if (starts_number(question, i) == 1) {
                 self.pos = i;
                 let v = number_at(question);
                 if (n == k) {

@@ -216,6 +216,7 @@ fn gsm8k_reads_and_replays_a_gold_solution() {
     assert_eq!(gsm8k("verify", &[GOLD, "12.004"]), 1);
     assert_eq!(gsm8k("verify", &[GOLD, "13"]), 0);
     assert_eq!(gsm8k("solve", &["<<1,250*2=2,500>>2,500 #### 2,500"]), 2500);   // thousands commas
+    assert_eq!(gsm8k("solve", &["<<560//10=56>>56 then <<57//10=5>>5 #### 5"]), 5);   // whole-number division
     assert_eq!(gsm8k("verify", &["<<1,250*2=2,500>>2,500 #### 2,500", "2500"]), 1);
 }
 
@@ -225,6 +226,9 @@ fn gsm8k_names_a_wrong_answer_as_the_school_does() {
     for (wrong, kind) in [("12", 0), ("24", 1), ("-12", 2), ("0.2", 3), ("16", 4), ("7", 5), ("5;7", 5)] {
         assert_eq!(gsm8k("classify_error", &[GOLD, QUESTION, wrong]), kind, "{}", wrong);
     }
+    // a number written with a leading dot is read as it is written: ".5" is 0.5, so 12.5 is one number off
+    let q = "Sam has 12 pens and buys 3 boxes of 4 pens. Each pen costs $.5. Half of them are blue.";
+    assert_eq!(gsm8k("classify_error", &[GOLD, q, "12.5"]), 4);
 }
 
 #[test]
