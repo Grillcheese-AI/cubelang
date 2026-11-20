@@ -189,15 +189,42 @@ fn conversation_min_scores_a_generic_reply() {
 // since the failure happens before the VM ever starts -- hence `run_raw`
 // instead of `run_json` here.
 
+// gsm8k.cube in its intended shape (CubbyLLM 0078, 2026-11-19): a checker and teacher on a gold solution's
+// `<<expr=result>>` steps, read from text. A made-up problem here (no benchmark text in this repo).
+const GOLD: &str = "Sam has 12 pens and buys 3 boxes of 4. <<12+3*4=24>>24 pens. Half are blue: <<24/2=12>>12. #### 12";
+const QUESTION: &str = "Sam has 12 pens and buys 3 boxes of 4 pens. Half of them are blue. How many are blue?";
+
+fn gsm8k(function: &str, args: &[&str]) -> serde_json::Value {
+    let mut all = vec!["--fn", function];
+    for a in args {
+        all.push("--arg");
+        all.push(a);
+    }
+    let json = run_json("gsm8k.cube", &all);
+    assert_eq!(json["ok"], true, "{} {:?}: {}", function, args, json);
+    json["result"].clone()
+}
+
 #[test]
-fn gsm8k_compiles_since_p6_4_and_stops_at_run_time_on_a_method_it_calls() {
-    // Until P6-4 (2026-11-13) this file did not compile: its compound operands (C11). They are now computed into
-    // registers, so it compiles strict and runs -- and stops loudly, ok:false, on `steps.last()`, a method the VM has
-    // no function for. (The `match` assertion that lived here went on 2026-09-14: `match` runs, DRIFT.md C3/A7.)
-    let json = run_json("gsm8k.cube", &[]);
-    assert_eq!(json["ok"], false, "{}", json);
-    let err = json["error"].as_str().unwrap_or_default();
-    assert!(err.contains("function `last` not found"), "{}", json);
+fn gsm8k_reads_and_replays_a_gold_solution() {
+    assert_eq!(gsm8k("parse", &[GOLD]), 2);
+    assert_eq!(gsm8k("solve", &[GOLD]), 12);                       // precedence: 12+3*4 is 24, then 24/2
+    assert_eq!(gsm8k("steps_agree", &[GOLD]), 1);
+    assert_eq!(gsm8k("steps_agree", &["<<2+2=5>>5 #### 5"]), 0);   // an annotation slip is seen
+    assert_eq!(gsm8k("solve", &["<<(3+5)*2=16>>16 then <<7/2=3.5>>3.5 #### 3.5"]), 3.5);
+    assert_eq!(gsm8k("verify", &[GOLD, "12"]), 1);
+    assert_eq!(gsm8k("verify", &[GOLD, "12.004"]), 1);
+    assert_eq!(gsm8k("verify", &[GOLD, "13"]), 0);
+    assert_eq!(gsm8k("solve", &["<<1,250*2=2,500>>2,500 #### 2,500"]), 2500);   // thousands commas
+    assert_eq!(gsm8k("verify", &["<<1,250*2=2,500>>2,500 #### 2,500", "2500"]), 1);
+}
+
+#[test]
+fn gsm8k_names_a_wrong_answer_as_the_school_does() {
+    // 0 right, 1 stopped early, 2 reversed, 3 unit conversion, 4 one number off, 5 other
+    for (wrong, kind) in [("12", 0), ("24", 1), ("-12", 2), ("0.2", 3), ("16", 4), ("7", 5), ("5;7", 5)] {
+        assert_eq!(gsm8k("classify_error", &[GOLD, QUESTION, wrong]), kind, "{}", wrong);
+    }
 }
 
 #[test]

@@ -3,188 +3,466 @@
 # license: bsl-1.1
 # author: grillcheese research laboratory
 #
-# STATUS (see docs/DRIFT.md "Bugs found" #1 and #3): this file demonstrates
-# the INTENDED shape of an ISolverLearn arithmetic-reasoning program (structs,
-# typed maps, array<tuple<...>>, per-step register replay) but does NOT
-# compile under the current VM, in ANY mode, as of the 2026-09-14 fixes:
-#   - It never used real arithmetic/structs/maps as call arguments or
-#     `let`/`assign` RHS values safely -- `compile_expr_operand` cannot
-#     encode a `BinOp`/`StructLit`/`MapLit`/`MethodCall`/`Index` expression
-#     used that way (docs/DRIFT.md §C11), and that is now a HARD COMPILE
-#     ERROR IN EVERY MODE (previously a silent OP_NONE placeholder, which is
-#     how this file used to "compile clean" and silently return
-#     {"result":0} instead of a real GSM8K answer -- see "Bugs found" #1
-#     below, now fixed). `--loose` does not help: the C11 check runs
-#     unconditionally, not just under `--strict`.
-#   - On top of that, `cubelang run`/`compile`/`check` are now STRICT BY
-#     DEFAULT (no flag needed), so this file's `match` statement and its two
-#     map-index `assign`s (docs/DRIFT.md §C3/§C4) are ALSO reported.
-#   - the only harness that ever touches this file, examples/parse_gsm8k.rs
-#     (`cargo run --example parse_gsm8k`), only PARSES it -- it has never
-#     been compiled or run end-to-end by anything in this repo's own build.
-# Kept (not deleted, and NOT rewritten to "fix" its logic -- per the task
-# brief, it fails honestly now instead of running dishonestly) as a
-# forward-looking fixture for the struct/map/typed surface the parser
-# already accepts; treat its solve()/learn() bodies as aspirational, not as
-# a working reference for what compiles to real bytecode today.
+# A GSM8K checker and teacher in its intended shape (CubbyLLM order 0078, step 3): it reads a gold solution's
+# `<<48/2=24>>` steps from the answer's own text, replays each step's arithmetic in registers, verifies an answer
+# within 0.01 of the gold's `#### n`, and names the kind of a wrong answer the way CubbyLLM's school does
+# (`cubbyllm/reasoning/school.py`: stopped early, reversed, unit conversion, one number off, other), counting each
+# kind in `patterns`. It needs the gold's steps, so it is a checker and a teacher, never a test-time solver.
 #
-# Run (parse only):     cargo run --example parse_gsm8k
-# Run (fails to build): $CUBELANG_EXE run examples/gsm8k.cube --json
-# Expect:               a compile error naming "BinOp"/"MapLit"/"StructLit"/
-#                        "MethodCall"/"Index" (C11) plus, under the default
-#                        strict compile, "match" and "assign" violations too
-#                        -- see tests/examples_pinned.rs for the exact pin.
-
-struct ArithStep {
-    label: str;
-    lhs: f64;
-    ops: array<tuple<str, f64>>;
-    result: f64;
-}
-
-struct Problem {
-    question: str;
-    steps: array<ArithStep>;
-    answer: f64;
-}
-
-struct Solution {
-    result: f64;
-    registers: map<str, f64>;
-    bytecode: array<byte>;
-    confidence: f64;
-}
+# Everything is read from text, one character at a time (P6-2's string index, P6-3..P6-7's forms): a CLI argument
+# is a string, so a list of values is written "v1;v2;v3".
+#
+#   parse(raw)                  the number of `<<...>>` steps in the gold answer
+#   solve(raw)                  the last step's value, every step replayed (precedence, parentheses)
+#   steps_agree(raw)            1 when every step's replay equals the result it states (within 0.01)
+#   verify(raw, value)          1 when value (text) is the gold's `#### n` within 0.01
+#   classify_error(raw, question, wrong), learn(raw, question, wrong): the kind of a wrong answer (1 stopped early, 2 reversed, 3 unit conversion,
+#                               4 one number off, 5 other; 0 when it is right), counted in `patterns`;
+#                               `wrong` is "v1;...;vk": the wrong program's step values, its answer last
+#
+# Run: $CUBELANG_EXE run examples/gsm8k.cube --fn solve --arg "<the gold answer>" --json
 
 program GSM8K implements ISolverLearn {
 
-    type Input = Problem;
-    type Output = Solution;
-
     storage {
-        patterns: mutable map<str, function>;
-        success_count: mutable u64 = 0;
-        fail_count: mutable u64 = 0;
-    }
-
-    io {
-        inputs {
-            raw: str;
-        }
-        outputs {
-            solution: Solution;
-            bytecode: array<byte>;
-        }
+        patterns: mutable map<str, number>;
+        pos: mutable number = 0;
     }
 
     @system @once
     public function constructor() {
         self.patterns = {};
-        self.success_count = 0;
-        self.fail_count = 0;
     }
 
-    @external
-    public function parse(raw: str): Input {
-        let steps: array<ArithStep> = [];
-        let search = raw;
-
-        while search.contains("<<") {
-            let annotation = extract_annotation(search);
-            let expr = annotation.expr;
-            let result = annotation.result;
-            let rest = annotation.rest;
-            let label = extract_label(search, steps.length);
-            let parsed = parse_expression(expr);
-            let lhs = parsed.lhs;
-            let ops = parsed.ops;
-
-            steps.push(ArithStep {
-                label: label,
-                lhs: lhs,
-                ops: ops,
-                result: result,
-            });
-
-            search = rest;
+    # ---- reading numbers and characters ----------------------------------------------------------------------
+    function digit(c: str): number {
+        let ds = "0123456789";
+        let k = 0;
+        while (k < 10) {
+            if (c == ds[k]) {
+                return k;
+            }
+            k = k + 1;
         }
+        return -1;
+    }
 
-        let answer = parse_final_answer(raw);
-        return Problem { question: raw, steps: steps, answer: answer };
+    # a comma at i is a thousands separator: exactly three digits follow it, then no digit
+    function thousands(s: str, i: number): number {
+        if (i + 3 >= s.len() + 1) {
+            return 0;
+        }
+        if (digit(s[i + 1]) < 0 || digit(s[i + 2]) < 0 || digit(s[i + 3]) < 0) {
+            return 0;
+        }
+        if (i + 4 < s.len() && digit(s[i + 4]) >= 0) {
+            return 0;
+        }
+        return 1;
+    }
+
+    # the number starting at self.pos (digits, one '.', a comma before each three digits); self.pos moves past it
+    function number_at(s: str): number {
+        let v = 0;
+        let scale = 0;
+        let i = self.pos;
+        while (i < s.len()) {
+            let c = s[i];
+            let d = digit(c);
+            if (d >= 0) {
+                if (scale > 0) {
+                    v = v + d / scale;
+                    scale = scale * 10;
+                } else {
+                    v = v * 10 + d;
+                }
+            } else if (c == "." && scale == 0) {
+                scale = 10;
+            } else if (c == ",") {
+                if (scale > 0 || thousands(s, i) == 0) {
+                    break;
+                }
+            } else {
+                break;
+            }
+            i = i + 1;
+        }
+        self.pos = i;
+        return v;
+    }
+
+    # ---- an annotation's expression, by precedence ------------------------------------------------------------
+    function factor(s: str): number {
+        let c = s[self.pos];
+        if (c == "(") {
+            self.pos = self.pos + 1;
+            let v = expr_value(s);
+            self.pos = self.pos + 1;
+            return v;
+        }
+        if (c == "-") {
+            self.pos = self.pos + 1;
+            let n = factor(s);
+            return 0 - n;
+        }
+        return number_at(s);
+    }
+
+    function term(s: str): number {
+        create t: number;
+        assign t = factor(s);
+        while (self.pos < s.len()) {
+            let op = s[self.pos];
+            if (op == "*") {
+                self.pos = self.pos + 1;
+                mul t, factor(s);
+            } else if (op == "/") {
+                self.pos = self.pos + 1;
+                div t, factor(s);
+            } else {
+                break;
+            }
+        }
+        return t;
+    }
+
+    function expr_value(s: str): number {
+        create acc: number;
+        assign acc = term(s);
+        while (self.pos < s.len()) {
+            let op = s[self.pos];
+            if (op == "+") {
+                self.pos = self.pos + 1;
+                add acc, term(s);
+            } else if (op == "-") {
+                self.pos = self.pos + 1;
+                sub acc, term(s);
+            } else {
+                break;
+            }
+        }
+        return acc;
+    }
+
+    # the expression between `<<` and `=`, with its spaces taken out
+    function expr_text(raw: str, start: number): str {
+        let e = "";
+        let i = start;
+        while (i < raw.len() && raw[i] != "=") {
+            if (raw[i] != " ") {
+                e = e + raw[i];
+            }
+            i = i + 1;
+        }
+        return e;
+    }
+
+    function close(a: number, b: number): number {
+        let d = a - b;
+        if (d < 0) {
+            d = 0 - d;
+        }
+        if (d <= 0.01) {
+            return 1;
+        }
+        return 0;
+    }
+
+    # ---- the interface ------------------------------------------------------------------------------------------
+    @external
+    public function parse(raw: str): number {
+        let n = 0;
+        let i = 0;
+        while (i + 1 < raw.len()) {
+            if (raw[i] == "<" && raw[i + 1] == "<") {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    # every step replayed; its value, the last step's (0 with no step)
+    @external
+    public function solve(raw: str): number {
+        create last: number;
+        assign last = 0;
+        let i = 0;
+        while (i + 1 < raw.len()) {
+            if (raw[i] == "<" && raw[i + 1] == "<") {
+                let e = expr_text(raw, i + 2);
+                self.pos = 0;
+                assign last = expr_value(e);
+            }
+            i = i + 1;
+        }
+        return last;
     }
 
     @external
-    public function solve(input: Input): Output {
-        let regs: map<str, f64> = {};
-        let prev_result: f64 | null = null;
-
-        atomic {
-            for (let step of input.steps) {
-                let reg = step.label;
-                create reg : number;
-
-                if (prev_result != null && approx_eq(step.lhs, prev_result)) {
-                    pop reg;
-                } else {
-                    assign reg = step.lhs;
+    public function steps_agree(raw: str): number {
+        let i = 0;
+        while (i + 1 < raw.len()) {
+            if (raw[i] == "<" && raw[i + 1] == "<") {
+                let e = expr_text(raw, i + 2);
+                self.pos = 0;
+                let got = expr_value(e);
+                self.pos = i + 2 + e.len();
+                while (self.pos < raw.len() && raw[self.pos] != "=") {
+                    self.pos = self.pos + 1;
                 }
+                self.pos = self.pos + 1;
+                let stated = number_at(raw);
+                if (close(got, stated) == 0) {
+                    return 0;
+                }
+            }
+            i = i + 1;
+        }
+        return 1;
+    }
 
-                for (let op of step.ops) {
-                    match (op[0]) {
-                        "+" => add reg, op[1];
-                        "-" => sub reg, op[1];
-                        "*" => mul reg, op[1];
-                        "/" => div reg, op[1];
+    function gold(raw: str): number {
+        let i = 0;
+        while (i + 3 < raw.len()) {
+            if (raw[i] == "#" && raw[i + 1] == "#" && raw[i + 2] == "#" && raw[i + 3] == "#") {
+                self.pos = i + 4;
+                while (self.pos < raw.len() && raw[self.pos] == " ") {
+                    self.pos = self.pos + 1;
+                }
+                if (raw[self.pos] == "-") {
+                    self.pos = self.pos + 1;
+                    let n = number_at(raw);
+                    return 0 - n;
+                }
+                return number_at(raw);
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    # `value` is text, as every CLI argument is ("-12.5"); the gold read first, so self.pos is free after
+    @external
+    public function verify(raw: str, value: str): number {
+        let g = gold(raw);
+        self.pos = 0;
+        if (value.len() > 0 && value[0] == "-") {
+            self.pos = 1;
+            let n = number_at(value);
+            return close(0 - n, g);
+        }
+        let v = number_at(value);
+        return close(v, g);
+    }
+
+    # ---- a wrong answer's kind: school.py's classify_error, on the same values -------------------------------------
+    function eq(a: number, b: number): number {
+        let d = a - b;
+        if (d < 0) {
+            d = 0 - d;
+        }
+        let m = b;
+        if (m < 0) {
+            m = 0 - m;
+        }
+        if (m < 1) {
+            m = 1;
+        }
+        if (d <= 0.000001 * m) {
+            return 1;
+        }
+        return 0;
+    }
+
+    # the k-th value of "v1;v2;..." (k from 0), and how many there are
+    function count_values(list: str): number {
+        if (list.len() == 0) {
+            return 0;
+        }
+        let n = 1;
+        let i = 0;
+        while (i < list.len()) {
+            if (list[i] == ";") {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    function value_at(list: str, k: number): number {
+        let i = 0;
+        let seen = 0;
+        while (seen < k && i < list.len()) {
+            if (list[i] == ";") {
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        self.pos = i;
+        if (list[i] == "-") {
+            self.pos = i + 1;
+            let n = number_at(list);
+            return 0 - n;
+        }
+        return number_at(list);
+    }
+
+    # the k-th step's replayed value (k from 0)
+    function gold_step(raw: str, k: number): number {
+        let seen = 0;
+        let i = 0;
+        while (i + 1 < raw.len()) {
+            if (raw[i] == "<" && raw[i + 1] == "<") {
+                if (seen == k) {
+                    let e = expr_text(raw, i + 2);
+                    self.pos = 0;
+                    return expr_value(e);
+                }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    # the numbers the question states: how many, and the k-th
+    function stated_count(question: str): number {
+        let n = 0;
+        let i = 0;
+        while (i < question.len()) {
+            if (digit(question[i]) >= 0) {
+                self.pos = i;
+                let v = number_at(question);
+                n = n + 1;
+                i = self.pos;
+            } else {
+                i = i + 1;
+            }
+        }
+        return n;
+    }
+
+    function stated_at(question: str, k: number): number {
+        let n = 0;
+        let i = 0;
+        while (i < question.len()) {
+            if (digit(question[i]) >= 0) {
+                self.pos = i;
+                let v = number_at(question);
+                if (n == k) {
+                    return v;
+                }
+                n = n + 1;
+                i = self.pos;
+            } else {
+                i = i + 1;
+            }
+        }
+        return 0;
+    }
+
+    function kind(raw: str, question: str, wv: str, gold_v: number): number {
+        let nr = parse(raw);
+        let nw = count_values(wv);
+        let ns = stated_count(question);
+        let wrong = value_at(wv, nw - 1);
+        # stopped early: the answer is one of the right program's intermediate values
+        let k = 0;
+        while (k < nr - 1) {
+            if (eq(wrong, gold_step(raw, k)) == 1) {
+                return 1;
+            }
+            k = k + 1;
+        }
+        # reversed: the answer, or any of its steps, is a right value negated or inverted
+        let j = -1;
+        while (j < nw) {
+            let v = wrong;
+            if (j >= 0) {
+                v = value_at(wv, j);
+            }
+            k = 0;
+            while (k < nr) {
+                let r = gold_step(raw, k);
+                if (r != 0) {
+                    if (eq(v, 0 - r) == 1) {
+                        return 2;
+                    }
+                    if (v != 0 && eq(1 / v, r) == 1) {
+                        return 2;
                     }
                 }
-
-                sum reg;
-                push reg;
-
-                regs[reg] = eval(reg);
-                prev_result = step.result;
+                k = k + 1;
             }
-
-            let last = input.steps.last().label;
-            query last;
-            remember last;
-
-            commit;
+            j = j + 1;
         }
-
-        self.success_count += 1;
-
-        return Solution {
-            result: regs[input.steps[input.steps.length - 1].label],
-            registers: regs,
-            bytecode: emit_bytecode(),
-            confidence: 1.0,
-        };
+        if (gold_v != 0 && wrong != 0) {
+            let ratio = wrong / gold_v;
+            let fs = "60;24;7;12;100;1000;52;365;30;16;3600";
+            k = 0;
+            while (k < 11) {
+                let f = value_at(fs, k);
+                if (eq(ratio, f) == 1 || eq(ratio, 1 / f) == 1) {
+                    return 3;
+                }
+                k = k + 1;
+            }
+            let gap = wrong - gold_v;
+            if (gap < 0) {
+                gap = 0 - gap;
+            }
+            k = 0;
+            while (k < ns) {
+                let n = stated_at(question, k);
+                let an = n;
+                if (an < 0) {
+                    an = 0 - an;
+                }
+                if (n != 0 && (eq(gap, an) == 1 || eq(ratio, n) == 1 || eq(ratio, 1 / n) == 1)) {
+                    return 4;
+                }
+                k = k + 1;
+            }
+        }
+        return 5;
     }
 
+    # the kind of a wrong answer, 0 when it is right (the checker's call; nothing stored)
     @external
-    public pure function verify(input: Input, output: Output): bool {
-        return approx_eq(output.result, input.answer, 0.01);
+    public function classify_error(raw: str, question: str, wrong: str): number {
+        let g = gold_step(raw, parse(raw) - 1);
+        let w = value_at(wrong, count_values(wrong) - 1);
+        if (eq(w, g) == 1) {
+            return 0;
+        }
+        return kind(raw, question, wrong, g);
     }
 
     @internal
-    public mutable function learn(input: Input, expected: Output, actual: Output): void {
-        self.fail_count += 1;
-
-        let diff = expected.result - actual.result;
-        let key = classify_error(input, diff);
-
-        if (self.patterns.has(key)) {
-            self.patterns[key](input);
-            return;
+    public mutable function learn(raw: str, question: str, wrong: str): number {
+        let key = classify_error(raw, question, wrong);
+        if (key == 0) {
+            return 0;
         }
-
-        let handler = derive_handler(input, expected, actual);
-        self.patterns[key] = handler;
-
-        emit PatternLearned {
-            program: "GSM8K",
-            pattern: key,
-            total: self.patterns.size,
-        };
+        let names = "stopped early|reversed|unit conversion|one number off|other";
+        let name = "";
+        let seen = 1;
+        let i = 0;
+        while (i < names.len()) {
+            if (names[i] == "|") {
+                seen = seen + 1;
+            } else if (seen == key) {
+                name = name + names[i];
+            }
+            i = i + 1;
+        }
+        let had = 0;
+        if (self.patterns.has(name)) {
+            had = self.patterns[name];
+        }
+        self.patterns[name] = had + 1;
+        return key;
     }
 }
