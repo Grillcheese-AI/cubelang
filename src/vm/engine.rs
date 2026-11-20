@@ -1777,6 +1777,32 @@ impl VM {
                             self.trace_op(pc, &format!(
                                 "COMPARE {:?} ? {:?} (kind {}, str) → {}", x, y, kind, flag));
                         }
+                        // FIXED 2026-11-19 (CubbyLLM 0078): a decimal was compared as a whole number. Both sides went
+                        // through `as_i64`, which truncates a Float, so `0.678 <= 0.5` compared 0 with 0 and held, and
+                        // a Float of 0.5 was falsy; a literal against a literal is folded at compile time, which hid it.
+                        // Two whole numbers still compare exactly as i64; if either side is a Float both compare as f64.
+                        (Value::Float(_), _) | (_, Value::Float(_)) => {
+                            let a = va.as_f64();
+                            let b = vb.as_f64();
+                            flag = match kind {
+                                0 => a == b,
+                                1 => a != b,
+                                2 => a < b,
+                                3 => a <= b,
+                                4 => a > b,
+                                5 => a >= b,
+                                6 => a != 0.0, // truthiness
+                                _ => false,
+                            };
+                            cmp_word = match kind {
+                                0 | 1 => if a == b { "equal" }
+                                         else if a < b { "less" }
+                                         else { "greater" },
+                                _ => if flag { "true" } else { "false" },
+                            };
+                            self.trace_op(pc, &format!(
+                                "COMPARE {} ? {} (kind {}, f64) → {}", a, b, kind, flag));
+                        }
                         _ => {
                             let a = va.as_i64();
                             let b = vb.as_i64();
