@@ -457,6 +457,14 @@ them.
     `check` is a program, never a model: a checker that is a language model would be a model judging, which this VM
     exists to replace.
   - Its `on_start` loads `rules.mdx`, so `solver_box.cube` closes with P8.
+  - **Two worked problems as its regression tests** (Nick, 2026-11-25; each checked by hand):
+    - "Liam buys 2 dozen eggs. He uses 6 eggs for breakfast and gives half of the remaining eggs to his neighbor.
+      He then buys 10 more eggs and drops 3 on the way home. How many eggs does Liam have left?" Five operations:
+      2 x 12 = 24, 24 - 6 = 18, 18 / 2 = 9, 9 + 10 = 19, 19 - 3 = 16. Answer 16.
+    - "A shop has 120 kg of flour. It sells 25% in the morning, splits the rest in a 2:1 ratio between Bakery A and
+      Bakery B, and Bakery A adds 5,000 g from storage. How many grams does Bakery A have?" 120 kg = 120,000 g;
+      120,000 x 0.75 = 90,000; 90,000 / 3 = 30,000; 30,000 x 2 = 60,000; 60,000 + 5,000 = 65,000. Answer 65000.
+    - Between them: a conversion, "the rest", a percentage, a 2:1 split and a chain of five operations.
 - [ ] **P7-4 (to check first): units.** The sketch's guard matches units before an addition or a subtraction. Whether a
   `quantity` carries a unit today is to be read in the code; if it does not, units are their own item, and the guard
   checks steps and divisors only.
