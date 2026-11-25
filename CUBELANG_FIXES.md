@@ -425,6 +425,84 @@ an index off by one can no longer make a wrong reply pass.
 **Order:** P6-1 with P6-8 and P6-9, then P6-2, then P6-10 (before CubbyLLM 0069's latency part), then the rest in any order. Each probe program that fails today becomes a
 regression test with the value it should give. The global invariant holds.
 
+## P7 — The deployable and orchestrator contracts, and two programs that use them (Cowork, 2026-11-25; Nick's yes)
+
+Nick, 2026-11-25: "some interface still need implementation we should do it", with two programs sketched: `WordMath
+implements ISolver, IDeployable`, and a container `SolverBox implements IOrchestrator, IDeployable` that deploys it
+beside a checker and grants the checker `core.solve`. Today the registry holds four interfaces (`ISolve`, `ISolver`,
+`ISolverLearn`, `IAgent`; `src/vm/interfaces.rs`). `IDeployable` and `IOrchestrator` compile only with an in-file
+`interface` block (DRIFT A5 and A6, P3-8), though README's catalogue, the drafts and most of README's examples use
+them.
+
+- [ ] **P7-1: `IDeployable` in the registry,** with README's members: `constructor()` abstract and `@system @once`;
+  `destructor()` optional, `@system`; `on_extend(name: str, fn: function)` optional. `implements IDeployable` is
+  checked like the four: a missing constructor, or one without `@system @once`, is a compile error. An in-file block
+  of the same name is ignored as for the four, and strict says so. Regression: a program and a container that
+  implement it, and one that misses the constructor.
+- [ ] **P7-2: `IOrchestrator` in the registry:** `route(input: str): external_program` and
+  `dispatch(input: str): Output` abstract; `register`, `deregister` and `fallback` optional. Checked the same way.
+  Regression: `examples/drafts/orchestrator.cube` gets past P3-8 (its pin moves to its next stop), and a container
+  that omits `route` fails.
+- [ ] **P7-3: the two programs as examples,** `examples/word_math.cube` and `examples/solver_box.cube`, compiling
+  strict and running, written from Nick's sketch with what it leaves open filled in:
+  - **`parse`** reads the steps the host hands it (the placed numbers and one operation a step, as CubbyLLM's step
+    loop writes them), not free text: turning a word problem into steps is the programs seat's job, and the VM
+    checks what it proposes.
+  - **`solve`** runs one operation a register at a time (`create`, `assign`, `add`, `sub`, `mul`, `div`), after an
+    `@internal` guard called at its top: 2 to 8 steps, no zero divisor.
+  - **`verify` must not return `solve`'s own flag.** As sketched, `verify(task, res)` returns `res.ok`, which `solve`
+    set, so the solver grades itself. It re-runs the steps from `task` in fresh registers and compares the value, as
+    `gsm8k.cube`'s `verify` replays the gold's steps.
+  - **`SolverBox`** implements `route` and `dispatch` (the sketch has neither, so P7-2 rejects it as written). Its
+    `check` is a program, never a model: a checker that is a language model would be a model judging, which this VM
+    exists to replace.
+  - Its `on_start` loads `rules.mdx`, so `solver_box.cube` closes with P8.
+- [ ] **P7-4 (to check first): units.** The sketch's guard matches units before an addition or a subtraction. Whether a
+  `quantity` carries a unit today is to be read in the code; if it does not, units are their own item, and the guard
+  checks steps and divisors only.
+
+In plain words: a program says what it promises (a constructor that runs once, a router that picks a program), and
+the compiler holds it to that promise. Over a conventional framework, where an interface is a convention the code may
+not keep, here a program that does not keep it does not compile.
+
+---
+
+## P8 — mdx, executable natural language (Cowork, 2026-11-25; Nick's yes, from his `rules.mdx`)
+
+Nick's definition (2026-11-25): an `.mdx` file is pure Markdown with `{{variable}}` placeholders and no YAML front
+matter. Its variables' types and its bound tools are declared by the `.cube` program that loads and renders it, so the
+document stays plain Markdown. Today `mdx` is a type name the lexer and the parser know (`src/lexer.rs`,
+`src/types.rs`), and nothing loads or renders one.
+
+- [ ] **P8-1: `mdx.load(path)`** reads a `.mdx` file into an `mdx` value, its text as written and its placeholders
+  listed. Deny-by-default holds: a path is read only below a folder the program's container grants (`permissions`),
+  and a path outside it is a VM error, never an empty document.
+- [ ] **P8-2: `.render(map)`** returns a value whose `.text` has each `{{name}}` replaced by the map's value as text.
+  - A placeholder the map does not supply is an error.
+  - A key the document never uses is an error in strict, a warning otherwise.
+  - A value is inserted as text and never expanded again: a value holding `{{x}}` stays literal.
+  - Values are strings, numbers and booleans; a struct or a list is an error until it is turned into text.
+- [ ] **P8-3: tools.** A `tools:` key takes function references (`[WordMath.parse, WordMath.solve, WordMath.verify]`),
+  and `.bound_tools` returns their names and signatures from the program's declared types. Only `@external` functions
+  can be bound. A bound tool runs in this VM, under the caller's grants, when the model asks for it, and the model's
+  text is never taken as its result.
+- [ ] **P8-4: `llm.call` goes through the host, as ASK does** (`docs/ASK_SUSPEND.md`). The VM suspends with the rendered
+  text, the prompt and the bound tools' names, and the host answers with the model it runs (in CubbyLLM, Cubby's own
+  seat). The VM opens no connection itself (Nick, 2026-11-10: fetching goes through the host). What comes back is a
+  proposal: a tool call runs in the VM, and text is checked like any other proposal before anything is said.
+- [ ] **P8-5:** `examples/rules.mdx` (Nick's text of 2026-11-25) and `solver_box.cube` rendering it. Tests: a missing
+  placeholder, an unused key, `{{` inside a value, a path outside the grant, a tool that is not `@external`.
+
+In plain words: a prompt is a document with blanks, and the program that fills them says what each blank is and which
+of its functions a model may call. Over a conventional prompt template, where a missing variable becomes a blank in
+the prompt and a tool call runs with the host's rights, here a missing variable is an error and every tool runs in the
+VM under the container's grants.
+
+This file's global invariant holds for both: `cargo test` green, a regression test per fix, opcode byte values
+unchanged.
+
+---
+
 ## Notes
 - `examples/qc_decision.cube` stays compiling and passing `validate`: it is the guardrail for the executing half.
 - The tree holds 499 test functions (2026-11-11). The "96 tests" this file used to name was June's count.
